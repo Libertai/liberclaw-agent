@@ -29,8 +29,8 @@ def get_context_limit(model: str, configured_max: int) -> int:
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate for a list of chat messages.
 
-    Uses chars/4 heuristic plus per-message overhead.  Good enough for a
-    budget guard — doesn't need to be billing-precise.
+    Uses chars/3 heuristic plus per-message overhead.  Conservative ratio
+    because code, JSON, and tool calls tokenize at worse than chars/4.
     """
     total_chars = 0
     for msg in messages:
@@ -40,7 +40,7 @@ def estimate_tokens(messages: list[dict]) -> int:
             total_chars += len(json.dumps(msg["tool_calls"]))
         if msg.get("tool_call_id"):
             total_chars += len(msg["tool_call_id"])
-    return total_chars // 4 + 4 * len(messages)
+    return total_chars // 3 + 4 * len(messages)
 
 
 _COMPACTION_PROMPT = (
