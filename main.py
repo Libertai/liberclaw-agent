@@ -1,6 +1,7 @@
 """FastAPI application deployed to each agent VM."""
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -108,7 +109,8 @@ async def verify_auth(request: Request, call_next):
     if request.url.path == "/health":
         return await call_next(request)
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if not token or not secrets.compare_digest(token, settings.agent_secret):
+    token_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
+    if not token or not secrets.compare_digest(token_hash, settings.agent_secret_hash):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     return await call_next(request)
 

@@ -10,7 +10,7 @@ class AgentSettings(BaseSettings):
     system_prompt: str = "You are a helpful assistant."
     model: str = "hermes-3-8b-tee"
     libertai_api_key: str
-    agent_secret: str  # Shared secret for bot<->agent auth
+    agent_secret_hash: str  # SHA-256 hash of the shared secret
     port: int = 8080
     db_path: str = "agent.db"
     max_history: int = 100
