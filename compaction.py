@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Known model context window sizes (tokens).
 _MODEL_CONTEXT_SIZES = {
-    "qwen3-coder-next": 98_304,
+    "qwen3-coder-next": 200_000,
     "glm-4.7": 131_072,
 }
 _DEFAULT_CONTEXT_SIZE = 32_768
