@@ -38,6 +38,17 @@ class AgentDatabase:
                 source TEXT NOT NULL DEFAULT 'system',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS telegram_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id TEXT NOT NULL UNIQUE,
+                chat_id TEXT NOT NULL,
+                chat_type TEXT NOT NULL DEFAULT 'private',
+                display_name TEXT NOT NULL DEFAULT '',
+                username TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
         """)
 
     async def close(self) -> None:
@@ -217,3 +228,80 @@ class AgentDatabase:
             )
             await self.db.commit()
         return messages
+
+    # ── Telegram contacts ─────────────────────────────────────────────
+
+    def _contact_row_to_dict(self, row) -> dict:
+        return {
+            "telegram_id": row["telegram_id"],
+            "chat_id": row["chat_id"],
+            "chat_type": row["chat_type"],
+            "display_name": row["display_name"],
+            "username": row["username"],
+            "status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def get_telegram_contact(self, telegram_id: str) -> dict | None:
+        cursor = await self.db.execute(
+            "SELECT * FROM telegram_contacts WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+        return self._contact_row_to_dict(row) if row else None
+
+    async def upsert_telegram_contact(
+        self,
+        telegram_id: str,
+        chat_id: str,
+        chat_type: str,
+        display_name: str,
+        username: str | None,
+        status: str = "pending",
+    ) -> dict:
+        now = datetime.now(timezone.utc).isoformat()
+        await self.db.execute(
+            "INSERT INTO telegram_contacts "
+            "(telegram_id, chat_id, chat_type, display_name, username, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET "
+            "chat_id=excluded.chat_id, chat_type=excluded.chat_type, "
+            "display_name=excluded.display_name, username=excluded.username, "
+            "status=excluded.status, updated_at=excluded.updated_at",
+            (telegram_id, chat_id, chat_type, display_name, username, status, now, now),
+        )
+        await self.db.commit()
+        return (await self.get_telegram_contact(telegram_id))  # type: ignore[return-value]
+
+    async def list_telegram_contacts(self, status: str | None = None) -> list[dict]:
+        if status:
+            cursor = await self.db.execute(
+                "SELECT * FROM telegram_contacts WHERE status = ? ORDER BY created_at",
+                (status,),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT * FROM telegram_contacts ORDER BY created_at"
+            )
+        rows = await cursor.fetchall()
+        return [self._contact_row_to_dict(r) for r in rows]
+
+    async def update_telegram_contact_status(
+        self, telegram_id: str, status: str
+    ) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self.db.execute(
+            "UPDATE telegram_contacts SET status = ?, updated_at = ? WHERE telegram_id = ?",
+            (status, now, telegram_id),
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def delete_telegram_contact(self, telegram_id: str) -> bool:
+        cursor = await self.db.execute(
+            "DELETE FROM telegram_contacts WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0

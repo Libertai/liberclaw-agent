@@ -23,3 +23,5 @@ class AgentSettings(BaseSettings):
     compaction_keep_messages: int = 20  # recent messages to preserve during compaction
     compaction_threshold: float = 0.75  # trigger compaction at this fraction of context budget
     inference_timeout: int = 180  # seconds — timeout for inference in the SSE loop
+    telegram_bot_token: str = ""  # Empty = Telegram disabled
+    owner_telegram_id: str = ""  # Auto-allowed in contact list

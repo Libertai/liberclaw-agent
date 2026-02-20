@@ -22,6 +22,7 @@ from baal_agent.context import build_dynamic_context, build_static_system_prompt
 from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
+from baal_agent.telegram_bot import TelegramBot
 from baal_agent.tools import configure_tools, execute_tool, get_tool_definitions
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
 
 _heartbeat_task: asyncio.Task | None = None
+_telegram_bot: TelegramBot | None = None
+_telegram_bot_task: asyncio.Task | None = None
 
 
 # ── Subagent registry ─────────────────────────────────────────────────
@@ -101,11 +104,18 @@ def _prune_old_chat_runs():
         del _active_runs[chat_id]
 
 
+# ── Telegram callback ────────────────────────────────────────────────
+
+async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
+    """Callback for TelegramBot: run an agent turn and return the response text."""
+    return await _run_agent_turn(message, chat_id)
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _heartbeat_task
+    global _heartbeat_task, _telegram_bot, _telegram_bot_task
     await db.initialize()
     configure_tools(settings.workspace_path)
 
@@ -118,7 +128,32 @@ async def lifespan(app: FastAPI):
     if settings.heartbeat_interval > 0:
         _heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
+    # Start Telegram bot if configured
+    if settings.telegram_bot_token:
+        _telegram_bot = TelegramBot(
+            token=settings.telegram_bot_token,
+            owner_telegram_id=settings.owner_telegram_id,
+            db=db,
+            agent_turn_callback=_telegram_agent_turn,
+        )
+        try:
+            await _telegram_bot.start()
+            _telegram_bot_task = asyncio.create_task(_telegram_bot.poll_loop())
+            logger.info("Telegram bot started")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram bot: {e}")
+            _telegram_bot = None
+
     yield
+
+    if _telegram_bot_task and not _telegram_bot_task.done():
+        _telegram_bot_task.cancel()
+        try:
+            await _telegram_bot_task
+        except asyncio.CancelledError:
+            pass
+    if _telegram_bot:
+        await _telegram_bot.stop()
 
     if _heartbeat_task and not _heartbeat_task.done():
         _heartbeat_task.cancel()
@@ -948,3 +983,52 @@ async def stop_subagent(run_id: str):
     )
 
     return {"status": "ok", "run_id": run_id, "message": f"Subagent '{run.label}' cancelled"}
+
+
+# ── Telegram management endpoints ────────────────────────────────────
+
+
+@app.get("/telegram/status")
+async def telegram_status():
+    """Return Telegram bot connection status."""
+    if _telegram_bot and _telegram_bot.connected:
+        return {
+            "connected": True,
+            "bot_username": _telegram_bot.bot_username,
+            "bot_name": _telegram_bot.bot_name,
+        }
+    return {"connected": False, "bot_username": "", "bot_name": ""}
+
+
+@app.get("/telegram/contacts")
+async def telegram_contacts(status: str | None = None):
+    """List Telegram contacts, optionally filtered by status."""
+    contacts = await db.list_telegram_contacts(status=status)
+    return {"contacts": contacts}
+
+
+class TelegramContactUpdate(BaseModel):
+    status: str
+
+
+@app.patch("/telegram/contacts/{telegram_id}")
+async def update_telegram_contact(telegram_id: str, body: TelegramContactUpdate):
+    """Update a Telegram contact's status."""
+    if body.status not in ("allowed", "pending", "blocked"):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Invalid status: {body.status}. Must be allowed, pending, or blocked."},
+        )
+    updated = await db.update_telegram_contact_status(telegram_id, body.status)
+    if not updated:
+        return JSONResponse(status_code=404, content={"error": "Contact not found"})
+    return {"status": "ok", "telegram_id": telegram_id, "new_status": body.status}
+
+
+@app.delete("/telegram/contacts/{telegram_id}")
+async def delete_telegram_contact(telegram_id: str):
+    """Remove a Telegram contact."""
+    deleted = await db.delete_telegram_contact(telegram_id)
+    if not deleted:
+        return JSONResponse(status_code=404, content={"error": "Contact not found"})
+    return {"status": "ok", "telegram_id": telegram_id}
