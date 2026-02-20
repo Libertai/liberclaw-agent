@@ -6,20 +6,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-def build_system_prompt(
+def build_static_system_prompt(
     user_prompt: str,
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
 ) -> str:
-    """Assemble the full system prompt from identity, instructions, memory, and skills."""
-    workspace = Path(workspace_path)
+    """Assemble the static (cacheable) portion of the system prompt.
+
+    Excludes memory and skills content which changes between turns.
+    Those are injected via build_dynamic_context() near the end of the
+    message list so the KV cache prefix stays stable.
+    """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     sections = []
 
     # Identity block — date-only timestamp keeps the system prompt stable
-    # across turns within a day, enabling vLLM prefix caching.
+    # across turns within a day, enabling llama.cpp prefix caching.
     identity = (
         f"You are {agent_name}, a personal AI agent.\n"
         f"Current date: {today}\n"
@@ -33,16 +37,6 @@ def build_system_prompt(
     if user_prompt and user_prompt.strip():
         sections.append(f"## Instructions\n\n{user_prompt.strip()}")
 
-    # Memory context
-    memory = _load_memory(workspace)
-    if memory:
-        sections.append(f"## Memory\n\n{memory}")
-
-    # Skills summary
-    skills = _load_skills_summary(workspace)
-    if skills:
-        sections.append(f"## Available Skills\n\n{skills}")
-
     # Memory system instructions
     sections.append(
         "## Memory System\n\n"
@@ -55,6 +49,40 @@ def build_system_prompt(
     )
 
     return "\n\n---\n\n".join(sections)
+
+
+def build_dynamic_context(workspace_path: str) -> str:
+    """Load memory and skills content for injection near end of message list.
+
+    Kept separate from the static system prompt so the prefix tokens
+    stay identical across turns, preserving the llama.cpp KV cache.
+    """
+    workspace = Path(workspace_path)
+    sections = []
+
+    memory = _load_memory(workspace)
+    if memory:
+        sections.append(f"## Memory\n\n{memory}")
+
+    skills = _load_skills_summary(workspace)
+    if skills:
+        sections.append(f"## Available Skills\n\n{skills}")
+
+    return "\n\n---\n\n".join(sections) if sections else ""
+
+
+def build_system_prompt(
+    user_prompt: str,
+    agent_name: str,
+    workspace_path: str,
+    tool_names: list[str] | None = None,
+) -> str:
+    """Full system prompt (static + dynamic). Used for non-cached contexts."""
+    static = build_static_system_prompt(user_prompt, agent_name, workspace_path, tool_names)
+    dynamic = build_dynamic_context(workspace_path)
+    if dynamic:
+        return static + "\n\n---\n\n" + dynamic
+    return static
 
 
 def build_subagent_prompt(

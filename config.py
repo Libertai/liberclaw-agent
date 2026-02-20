@@ -21,4 +21,5 @@ class AgentSettings(BaseSettings):
     max_context_tokens: int = 0  # 0 = auto-detect from model name
     generation_reserve: int = 4096  # tokens reserved for model output
     compaction_keep_messages: int = 20  # recent messages to preserve during compaction
+    compaction_threshold: float = 0.75  # trigger compaction at this fraction of context budget
     inference_timeout: int = 180  # seconds — timeout for inference in the SSE loop

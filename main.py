@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from baal_agent.compaction import maybe_compact
 from baal_agent.config import AgentSettings
-from baal_agent.context import build_subagent_prompt, build_system_prompt
+from baal_agent.context import build_dynamic_context, build_static_system_prompt, build_subagent_prompt, build_system_prompt
 from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
@@ -180,24 +180,35 @@ async def _run_agent_turn(
     tools = get_tool_definitions(include_spawn=not restricted)
     tool_names = [t["function"]["name"] for t in tools]
 
-    if system_prompt_override is not None:
-        system_prompt = system_prompt_override
-        if "Available tools:" not in system_prompt:
-            system_prompt += f"\nAvailable tools: {', '.join(tool_names)}"
-    else:
-        system_prompt = build_system_prompt(
+    if store_history:
+        # Use static prompt + dynamic context injection for KV cache preservation.
+        # Dynamic content (memory/skills) is injected near the end of the message
+        # list so the prefix tokens stay identical across turns.
+        static_prompt = build_static_system_prompt(
             settings.system_prompt,
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
         )
-
-    if store_history:
+        dynamic_context = build_dynamic_context(settings.workspace_path)
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
-            db, inference, chat_id, system_prompt, settings.model, settings
+            db, inference, chat_id, static_prompt, settings.model, settings,
+            dynamic_context=dynamic_context,
         )
     else:
+        # Non-cached path (heartbeat, subagents): use combined prompt in a single message
+        if system_prompt_override is not None:
+            system_prompt = system_prompt_override
+            if "Available tools:" not in system_prompt:
+                system_prompt += f"\nAvailable tools: {', '.join(tool_names)}"
+        else:
+            system_prompt = build_system_prompt(
+                settings.system_prompt,
+                settings.agent_name,
+                settings.workspace_path,
+                tool_names=tool_names,
+            )
         messages = [{"role": "system", "content": system_prompt}]
         messages.append({"role": "user", "content": message})
 
@@ -503,16 +514,19 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
         tools = get_tool_definitions(include_spawn=True)
         tool_names = [t["function"]["name"] for t in tools]
 
-        system_prompt = build_system_prompt(
+        # Use static prompt + dynamic context injection for KV cache preservation
+        system_prompt = build_static_system_prompt(
             settings.system_prompt,
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
         )
+        dynamic_context = build_dynamic_context(settings.workspace_path)
 
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
-            db, inference, chat_id, system_prompt, settings.model, settings
+            db, inference, chat_id, system_prompt, settings.model, settings,
+            dynamic_context=dynamic_context,
         )
 
         inference_timeout = settings.inference_timeout

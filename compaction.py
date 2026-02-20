@@ -29,8 +29,9 @@ def get_context_limit(model: str, configured_max: int) -> int:
 def estimate_tokens(messages: list[dict]) -> int:
     """Rough token estimate for a list of chat messages.
 
-    Uses chars/3 heuristic plus per-message overhead.  Conservative ratio
-    because code, JSON, and tool calls tokenize at worse than chars/4.
+    Uses chars/2 heuristic plus per-message overhead.  Conservative ratio
+    because code, JSON, tool call IDs, and structured data tokenize at
+    significantly worse than chars/4 with BPE tokenizers.
     """
     total_chars = 0
     for msg in messages:
@@ -40,7 +41,7 @@ def estimate_tokens(messages: list[dict]) -> int:
             total_chars += len(json.dumps(msg["tool_calls"]))
         if msg.get("tool_call_id"):
             total_chars += len(msg["tool_call_id"])
-    return total_chars // 3 + 4 * len(messages)
+    return total_chars // 2 + 4 * len(messages)
 
 
 _COMPACTION_PROMPT = (
@@ -50,6 +51,28 @@ _COMPACTION_PROMPT = (
 )
 
 
+def _inject_dynamic_context(messages: list[dict], dynamic_context: str) -> list[dict]:
+    """Insert dynamic context (memory/skills) just before the last user message.
+
+    This keeps the prefix [system(static) + history] stable across turns
+    so the llama.cpp KV cache is preserved.
+    """
+    if not dynamic_context:
+        return messages
+
+    ctx_msg = {"role": "system", "content": dynamic_context}
+
+    # Find the last user message and insert before it
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i]["role"] == "user":
+            messages.insert(i, ctx_msg)
+            return messages
+
+    # No user message found — append at end
+    messages.append(ctx_msg)
+    return messages
+
+
 async def maybe_compact(
     db: AgentDatabase,
     inference: InferenceClient,
@@ -57,11 +80,14 @@ async def maybe_compact(
     system_prompt: str,
     model: str,
     settings: AgentSettings,
+    dynamic_context: str = "",
 ) -> list[dict]:
     """Build a messages list, compacting history if it exceeds the token budget.
 
-    Returns a ready-to-use messages list: [system_prompt] + history.
-    If the history exceeds the available token budget, older messages are
+    Returns a ready-to-use messages list with dynamic context (memory/skills)
+    injected near the end for KV cache preservation.
+
+    If the history exceeds the compaction threshold, older messages are
     summarized and replaced with a compact summary pair in the DB.
     """
     history = await db.get_history(chat_id, limit=settings.max_history)
@@ -69,20 +95,22 @@ async def maybe_compact(
     messages.extend(history)
 
     budget = get_context_limit(model, settings.max_context_tokens) - settings.generation_reserve
+    trigger = int(budget * settings.compaction_threshold)
     tokens = estimate_tokens(messages)
 
-    if tokens <= budget:
-        return messages
+    if tokens <= trigger:
+        return _inject_dynamic_context(messages, dynamic_context)
 
     logger.info(
-        f"Context for {chat_id} exceeds budget ({tokens} > {budget} tokens), compacting"
+        f"Context for {chat_id} exceeds threshold ({tokens} > {trigger} tokens, "
+        f"budget={budget}), compacting"
     )
 
     keep = settings.compaction_keep_messages
     if len(history) <= keep:
         # Even recent-only exceeds budget — just return what we have,
         # the model will do its best with truncated input.
-        return messages
+        return _inject_dynamic_context(messages, dynamic_context)
 
     old = history[:-keep]
     recent = history[-keep:]
@@ -92,6 +120,18 @@ async def maybe_compact(
     compaction_messages.extend(old)
     compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
 
+    # If the compaction request itself exceeds the context budget, iteratively
+    # halve the old messages until it fits (oldest are dropped).
+    compaction_tokens = estimate_tokens(compaction_messages)
+    while compaction_tokens > budget and len(old) > 2:
+        dropped = len(old) // 2
+        old = old[dropped:]
+        compaction_messages = [{"role": "system", "content": system_prompt}]
+        compaction_messages.extend(old)
+        compaction_messages.append({"role": "user", "content": _COMPACTION_PROMPT})
+        compaction_tokens = estimate_tokens(compaction_messages)
+        logger.info(f"Compaction request too large, dropped {dropped} oldest messages")
+
     try:
         summary_msg = await inference.chat(
             compaction_messages, model=model, tools=None
@@ -100,7 +140,7 @@ async def maybe_compact(
     except Exception as e:
         logger.error(f"Compaction inference failed: {e}")
         # Fall back to un-compacted messages rather than losing the conversation
-        return messages
+        return _inject_dynamic_context(messages, dynamic_context)
 
     await db.compact_history(
         chat_id, keep_recent=keep, summary=summary
@@ -116,4 +156,4 @@ async def maybe_compact(
         f"Compaction complete for {chat_id}: {tokens} -> {new_tokens} tokens "
         f"({len(old)} old messages summarized, {len(recent)} kept)"
     )
-    return result
+    return _inject_dynamic_context(result, dynamic_context)
