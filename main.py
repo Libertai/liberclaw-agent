@@ -70,6 +70,37 @@ def _prune_old_subagent_runs():
         del _subagent_runs[run_id]
 
 
+# ── Chat run registry ────────────────────────────────────────────────
+
+_RUN_RETENTION = 300  # keep completed runs for 5 minutes
+
+
+@dataclass
+class ChatRun:
+    chat_id: str
+    task: asyncio.Task
+    events: list[dict] = field(default_factory=list)
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    done: bool = False
+    created_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+    user_message: str = ""
+
+
+_active_runs: dict[str, ChatRun] = {}  # keyed by chat_id
+
+
+def _prune_old_chat_runs():
+    """Remove completed chat runs older than _RUN_RETENTION."""
+    cutoff = time.time() - _RUN_RETENTION
+    to_remove = [
+        chat_id for chat_id, run in _active_runs.items()
+        if run.done and run.completed_at is not None and run.completed_at < cutoff
+    ]
+    for chat_id in to_remove:
+        del _active_runs[chat_id]
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -95,6 +126,10 @@ async def lifespan(app: FastAPI):
             await _heartbeat_task
         except asyncio.CancelledError:
             pass
+    # Cancel all active chat runs
+    for run in _active_runs.values():
+        if not run.done and not run.task.done():
+            run.task.cancel()
     await db.close()
 
 
@@ -448,32 +483,6 @@ def _sse_keepalive() -> str:
     return f"data: {json.dumps({'type': 'keepalive'})}\n\n"
 
 
-async def _with_keepalive(coro, queue: asyncio.Queue):
-    """Run a coroutine while periodically pushing keepalive signals to a queue.
-
-    The queue is used to interleave keepalive comments with SSE data events
-    in the event_stream generator.  When the coroutine completes, the result
-    is placed on the queue as a ("result", value) tuple.  Exceptions are
-    placed as ("error", exc).
-    """
-    task = asyncio.create_task(coro)
-    while not task.done():
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=_KEEPALIVE_INTERVAL)
-        except asyncio.TimeoutError:
-            # Task still running — send keepalive
-            await queue.put(("keepalive", None))
-        except Exception:
-            # Task raised — will be handled below
-            break
-
-    try:
-        result = task.result()
-        await queue.put(("result", result))
-    except Exception as e:
-        await queue.put(("error", e))
-
-
 # ── Endpoints ─────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -481,196 +490,258 @@ class ChatRequest(BaseModel):
     chat_id: str
 
 
+async def _emit(run: ChatRun, data: dict):
+    """Append an SSE event to the run buffer and notify waiting readers."""
+    async with run.condition:
+        run.events.append(data)
+        run.condition.notify_all()
+
+
+async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
+    """Background agentic loop — emits SSE events to run.events buffer."""
+    try:
+        tools = get_tool_definitions(include_spawn=True)
+        tool_names = [t["function"]["name"] for t in tools]
+
+        system_prompt = build_system_prompt(
+            settings.system_prompt,
+            settings.agent_name,
+            settings.workspace_path,
+            tool_names=tool_names,
+        )
+
+        await db.add_message(chat_id, "user", message)
+        messages = await maybe_compact(
+            db, inference, chat_id, system_prompt, settings.model, settings
+        )
+
+        inference_timeout = settings.inference_timeout
+
+        for _iteration in range(settings.max_tool_iterations):
+            # Call inference with loop-level retry.
+            assistant_msg = None
+            last_inference_error = None
+
+            for _inf_attempt in range(_LOOP_INFERENCE_RETRIES + 1):
+                try:
+                    assistant_msg = await asyncio.wait_for(
+                        inference.chat(
+                            messages=messages, model=settings.model, tools=tools
+                        ),
+                        timeout=inference_timeout,
+                    )
+                    break  # success — exit retry loop
+                except Exception as e:
+                    last_inference_error = e
+                    if _is_retryable(e) and _inf_attempt < _LOOP_INFERENCE_RETRIES:
+                        logger.warning(
+                            f"Inference attempt {_inf_attempt + 1} failed "
+                            f"({type(e).__name__}), retrying in {_LOOP_RETRY_DELAY}s"
+                        )
+                        await _emit(run, {
+                            "type": "text",
+                            "content": "\n\n*[Inference error, retrying...]*\n\n",
+                        })
+                        await asyncio.sleep(_LOOP_RETRY_DELAY)
+                        continue
+                    else:
+                        break  # non-retryable or exhausted retries
+
+            if assistant_msg is None:
+                err_name = type(last_inference_error).__name__ if last_inference_error else "Unknown"
+                if isinstance(last_inference_error, asyncio.TimeoutError):
+                    msg = "The AI model took too long to respond. Please try again."
+                else:
+                    msg = f"Inference failed ({err_name}). Please try again."
+                logger.error(f"Inference failed after retries: {last_inference_error}")
+                await _emit(run, {"type": "error", "content": msg})
+                return
+
+            text_content = assistant_msg.content
+            tool_calls = assistant_msg.tool_calls
+
+            tc_for_db = None
+            if tool_calls:
+                tc_for_db = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ]
+
+            await db.add_message(
+                chat_id, "assistant", text_content, tool_calls=tc_for_db
+            )
+
+            assistant_dict: dict = {"role": "assistant"}
+            if text_content:
+                assistant_dict["content"] = text_content
+            if tc_for_db:
+                assistant_dict["tool_calls"] = tc_for_db
+            messages.append(assistant_dict)
+
+            if text_content:
+                await _emit(run, {"type": "text", "content": text_content})
+
+            if not tool_calls:
+                return
+
+            for tc in tool_calls:
+                name = tc.function.name
+                arguments = tc.function.arguments
+                await _emit(run, {"type": "tool_use", "name": name, "input": arguments})
+
+                if name == "spawn":
+                    coro = _handle_spawn(arguments, chat_id)
+                else:
+                    coro = execute_tool(name, arguments)
+
+                try:
+                    result = await coro
+                except Exception as tool_error:
+                    logger.error(
+                        f"Tool {name} raised: {tool_error}", exc_info=tool_error
+                    )
+                    result = f"Error executing {name}: {tool_error}"
+
+                # Detect send_file markers and emit file SSE event
+                if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
+                    parts = result.split(":", 2)
+                    rel_path = parts[1] if len(parts) > 1 else ""
+                    caption = parts[2] if len(parts) > 2 else ""
+                    await _emit(run, {"type": "file", "path": rel_path, "caption": caption})
+                    result = f"File sent to user: {rel_path}"
+
+                await db.add_message(
+                    chat_id, "tool", result, tool_call_id=tc.id
+                )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        await _emit(run, {"type": "text", "content": "(Reached maximum tool iterations)"})
+
+    except asyncio.CancelledError:
+        logger.info(f"Chat run cancelled for {chat_id}")
+        # Force-append without await — we may be in a cancelled state
+        run.events.append({"type": "error", "content": "Chat run was cancelled."})
+    except Exception as e:
+        logger.error(f"Chat run error for {chat_id}: {e}", exc_info=True)
+        try:
+            await _emit(run, {"type": "error", "content": str(e)})
+        except asyncio.CancelledError:
+            run.events.append({"type": "error", "content": str(e)})
+    finally:
+        # Always emit done and mark run as finished — force-append to avoid
+        # re-cancellation in the finally block leaving run.done=False forever
+        run.events.append({"type": "done"})
+        run.done = True
+        run.completed_at = time.time()
+        try:
+            async with run.condition:
+                run.condition.notify_all()
+        except asyncio.CancelledError:
+            pass  # readers will see done=True on their next condition check
+
+
+async def _read_run_events(run: ChatRun):
+    """Async generator that reads from a ChatRun's event buffer.
+
+    Yields SSE-formatted strings. Sends keepalives if no new events arrive
+    within _KEEPALIVE_INTERVAL. When the client disconnects the generator
+    is cancelled but the background task continues unaffected.
+    """
+    cursor = 0
+    while True:
+        # Wait for new events, done signal, or keepalive timeout
+        deadline = asyncio.get_running_loop().time() + _KEEPALIVE_INTERVAL
+        async with run.condition:
+            while cursor >= len(run.events) and not run.done:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.wait_for(
+                        run.condition.wait(), timeout=remaining
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+        # Yield any buffered events from cursor onward
+        while cursor < len(run.events):
+            yield _sse_event(run.events[cursor])
+            cursor += 1
+
+        # If the run is done and we've consumed everything, exit
+        if run.done and cursor >= len(run.events):
+            return
+
+        # No new events within the keepalive interval — send keepalive
+        if cursor >= len(run.events) and not run.done:
+            yield _sse_keepalive()
+
+
 @app.post("/chat")
 async def chat(req: ChatRequest):
     """Handle a proxied chat message with SSE streaming and tool use."""
+    _prune_old_chat_runs()
 
-    async def event_stream():
-        try:
-            tools = get_tool_definitions(include_spawn=True)
-            tool_names = [t["function"]["name"] for t in tools]
+    # Cancel any existing active run for this chat.
+    # The background task's finally block will set done=True and notify readers.
+    existing = _active_runs.get(req.chat_id)
+    if existing and not existing.done and not existing.task.done():
+        existing.task.cancel()
 
-            system_prompt = build_system_prompt(
-                settings.system_prompt,
-                settings.agent_name,
-                settings.workspace_path,
-                tool_names=tool_names,
-            )
+    # Create a new ChatRun
+    run = ChatRun(
+        chat_id=req.chat_id,
+        task=None,  # type: ignore — will be set immediately below
+        user_message=req.message,
+    )
+    run.task = asyncio.create_task(_run_chat_background(run, req.chat_id, req.message))
+    _active_runs[req.chat_id] = run
 
-            await db.add_message(req.chat_id, "user", req.message)
-            messages = await maybe_compact(
-                db, inference, req.chat_id, system_prompt, settings.model, settings
-            )
+    return StreamingResponse(_read_run_events(run), media_type="text/event-stream")
 
-            inference_timeout = settings.inference_timeout
 
-            for _iteration in range(settings.max_tool_iterations):
-                # Call inference with keepalive + loop-level retry.
-                assistant_msg = None
-                last_inference_error = None
+@app.get("/chat/{chat_id}/active")
+async def chat_active(chat_id: str):
+    """Check if there is an active (in-progress) chat run for this chat_id."""
+    run = _active_runs.get(chat_id)
+    if run and not run.done:
+        return {"active": True, "user_message": run.user_message}
+    return {"active": False, "user_message": ""}
 
-                for _inf_attempt in range(_LOOP_INFERENCE_RETRIES + 1):
-                    inference_coro = inference.chat(
-                        messages=messages, model=settings.model, tools=tools
-                    )
-                    inference_q: asyncio.Queue = asyncio.Queue()
-                    inference_keepalive = asyncio.create_task(
-                        _with_keepalive(inference_coro, inference_q)
-                    )
-                    try:
-                        while True:
-                            msg_type, msg_val = await asyncio.wait_for(
-                                inference_q.get(), timeout=inference_timeout
-                            )
-                            if msg_type == "keepalive":
-                                yield _sse_keepalive()
-                            elif msg_type == "result":
-                                assistant_msg = msg_val
-                                break
-                            elif msg_type == "error":
-                                raise msg_val
-                        break  # success — exit retry loop
-                    except Exception as e:
-                        last_inference_error = e
-                        if _is_retryable(e) and _inf_attempt < _LOOP_INFERENCE_RETRIES:
-                            logger.warning(
-                                f"Inference attempt {_inf_attempt + 1} failed "
-                                f"({type(e).__name__}), retrying in {_LOOP_RETRY_DELAY}s"
-                            )
-                            yield _sse_event({
-                                "type": "text",
-                                "content": "\n\n*[Inference error, retrying...]*\n\n",
-                            })
-                            await asyncio.sleep(_LOOP_RETRY_DELAY)
-                            continue
-                        else:
-                            break  # non-retryable or exhausted retries
-                    finally:
-                        inference_keepalive.cancel()
-                        try:
-                            await inference_keepalive
-                        except asyncio.CancelledError:
-                            pass
 
-                if assistant_msg is None:
-                    err_name = type(last_inference_error).__name__ if last_inference_error else "Unknown"
-                    if isinstance(last_inference_error, asyncio.TimeoutError):
-                        msg = "The AI model took too long to respond. Please try again."
-                    else:
-                        msg = f"Inference failed ({err_name}). Please try again."
-                    logger.error(f"Inference failed after retries: {last_inference_error}")
-                    yield _sse_event({"type": "error", "content": msg})
-                    yield _sse_event({"type": "done"})
-                    return
+@app.get("/chat/{chat_id}/stream")
+async def chat_stream(chat_id: str):
+    """Reconnect to an active chat run's SSE stream.
 
-                text_content = assistant_msg.content
-                tool_calls = assistant_msg.tool_calls
-
-                tc_for_db = None
-                if tool_calls:
-                    tc_for_db = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ]
-
-                await db.add_message(
-                    req.chat_id, "assistant", text_content, tool_calls=tc_for_db
-                )
-
-                assistant_dict: dict = {"role": "assistant"}
-                if text_content:
-                    assistant_dict["content"] = text_content
-                if tc_for_db:
-                    assistant_dict["tool_calls"] = tc_for_db
-                messages.append(assistant_dict)
-
-                if text_content:
-                    yield _sse_event({"type": "text", "content": text_content})
-
-                if not tool_calls:
-                    yield _sse_event({"type": "done"})
-                    return
-
-                for tc in tool_calls:
-                    name = tc.function.name
-                    arguments = tc.function.arguments
-                    yield _sse_event({"type": "tool_use", "name": name, "input": arguments})
-
-                    # Execute tool with keepalive to prevent proxy timeouts
-                    # during long-running operations (e.g., bash commands).
-                    keepalive_q: asyncio.Queue = asyncio.Queue()
-                    if name == "spawn":
-                        coro = _handle_spawn(arguments, req.chat_id)
-                    else:
-                        coro = execute_tool(name, arguments)
-
-                    keepalive_task = asyncio.create_task(
-                        _with_keepalive(coro, keepalive_q)
-                    )
-
-                    result = None
-                    tool_error = None
-                    while True:
-                        msg_type, msg_val = await keepalive_q.get()
-                        if msg_type == "keepalive":
-                            yield _sse_keepalive()
-                        elif msg_type == "result":
-                            result = msg_val
-                            break
-                        elif msg_type == "error":
-                            tool_error = msg_val
-                            break
-
-                    # Ensure the keepalive task is fully done
-                    await keepalive_task
-
-                    if tool_error is not None:
-                        logger.error(
-                            f"Tool {name} raised: {tool_error}", exc_info=tool_error
-                        )
-                        result = f"Error executing {name}: {tool_error}"
-
-                    # Detect send_file markers and emit file SSE event
-                    if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
-                        parts = result.split(":", 2)
-                        rel_path = parts[1] if len(parts) > 1 else ""
-                        caption = parts[2] if len(parts) > 2 else ""
-                        yield _sse_event({"type": "file", "path": rel_path, "caption": caption})
-                        result = f"File sent to user: {rel_path}"
-
-                    await db.add_message(
-                        req.chat_id, "tool", result, tool_call_id=tc.id
-                    )
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
-
-            yield _sse_event({"type": "text", "content": "(Reached maximum tool iterations)"})
+    If a run is still in progress, replays all buffered events then continues
+    streaming live. First event is a stream_meta with the original user_message.
+    If no active run exists, returns a single done event.
+    """
+    run = _active_runs.get(chat_id)
+    if run is None or run.done:
+        # No active run — just return done so the client knows
+        async def _done_stream():
             yield _sse_event({"type": "done"})
+        return StreamingResponse(_done_stream(), media_type="text/event-stream")
 
-        except asyncio.CancelledError:
-            # Client disconnected — log but don't try to yield (stream is dead)
-            logger.info(f"Client disconnected during chat stream for {req.chat_id}")
-            return
-        except Exception as e:
-            logger.error(f"Chat stream error: {e}", exc_info=True)
-            try:
-                yield _sse_event({"type": "error", "content": str(e)})
-                yield _sse_event({"type": "done"})
-            except Exception:
-                # If we can't even yield the error (broken pipe), just bail
-                logger.warning("Failed to send error event to client")
+    async def _reconnect_stream():
+        # Send metadata so the frontend knows which message is being processed
+        yield _sse_event({"type": "stream_meta", "user_message": run.user_message})
+        async for event in _read_run_events(run):
+            yield event
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(_reconnect_stream(), media_type="text/event-stream")
 
 
 @app.get("/chat/{chat_id}/history")
