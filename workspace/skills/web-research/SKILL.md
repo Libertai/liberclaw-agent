@@ -1,3 +1,7 @@
+---
+name: web-research
+description: Use the web_fetch tool to research topics from the internet.
+---
 # Web Research
 
 Use the web_fetch tool to research topics from the internet.

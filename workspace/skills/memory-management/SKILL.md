@@ -1,3 +1,7 @@
+---
+name: memory-management
+description: How to use the persistent memory system effectively.
+---
 # Memory Management
 
 How to use the persistent memory system effectively.

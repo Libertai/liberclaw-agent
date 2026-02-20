@@ -133,14 +133,50 @@ def _load_skills_summary(workspace: Path) -> str:
         skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             continue
-        # Extract first non-empty, non-heading line as description
-        description = ""
-        for line in skill_file.read_text().splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                description = stripped
-                break
-        name = skill_dir.name
+        name, description = _parse_skill_metadata(
+            skill_dir.name, skill_file.read_text()
+        )
         lines.append(f"- **{name}**: {description} (read `{skill_file}` for details)")
 
     return "\n".join(lines) if lines else ""
+
+
+def _parse_skill_metadata(dir_name: str, content: str) -> tuple[str, str]:
+    """Extract skill name and description from SKILL.md content.
+
+    Supports both agentskills.io format (YAML frontmatter with name/description)
+    and legacy format (# Title followed by first non-heading paragraph).
+    """
+    lines = content.splitlines()
+
+    # Detect YAML frontmatter (--- delimited block at the start)
+    if lines and lines[0].strip() == "---":
+        fm_name = ""
+        fm_description = ""
+        for i, line in enumerate(lines[1:], 1):
+            if line.strip() == "---":
+                # End of frontmatter — use parsed values if we got a description
+                if fm_description:
+                    return fm_name or dir_name, fm_description
+                # No description in frontmatter, fall through to legacy parsing
+                # but skip past the frontmatter block
+                return _parse_legacy_description(dir_name, lines[i + 1 :])
+            stripped = line.strip()
+            if stripped.startswith("name:"):
+                fm_name = stripped[5:].strip().strip("\"'")
+            elif stripped.startswith("description:"):
+                fm_description = stripped[12:].strip().strip("\"'")
+
+    # No frontmatter — legacy format
+    return _parse_legacy_description(dir_name, lines)
+
+
+def _parse_legacy_description(
+    dir_name: str, lines: list[str]
+) -> tuple[str, str]:
+    """Extract description as the first non-empty, non-heading line."""
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return dir_name, stripped
+    return dir_name, ""
