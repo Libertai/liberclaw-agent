@@ -108,7 +108,8 @@ def _prune_old_chat_runs():
 
 async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
     """Callback for TelegramBot: run an agent turn and return the response text."""
-    return await _run_agent_turn(message, chat_id)
+    from baal_agent.telegram_bot import TELEGRAM_CHANNEL_HINT
+    return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────
@@ -197,6 +198,7 @@ async def _run_agent_turn(
     store_history: bool = True,
     file_events: list[dict] | None = None,
     system_prompt_override: str | None = None,
+    channel_hint: str | None = None,
 ) -> str | None:
     """Run a single agentic turn (message -> tool loop -> response).
 
@@ -208,6 +210,8 @@ async def _run_agent_turn(
         store_history: Whether to persist messages to DB.
         file_events: Optional accumulator for send_file events (heartbeat/subagent).
         system_prompt_override: If set, use this instead of building the default prompt.
+        channel_hint: Optional formatting hint appended to the system prompt
+            (e.g. Telegram formatting constraints).
 
     Returns:
         The final text response, or None if no text was generated.
@@ -227,6 +231,8 @@ async def _run_agent_turn(
             tool_names=tool_names,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
+        if channel_hint:
+            dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
             db, inference, chat_id, static_prompt, settings.model, settings,
