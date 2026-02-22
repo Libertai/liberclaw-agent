@@ -107,9 +107,31 @@ def _prune_old_chat_runs():
 # ── Telegram callback ────────────────────────────────────────────────
 
 async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
-    """Callback for TelegramBot: run an agent turn and return the response text."""
+    """Callback for TelegramBot: run an agent turn and return the response text.
+
+    Registers a ChatRun in _active_runs so cancel_chat_run() works for /stop.
+    """
     from baal_agent.telegram_bot import TELEGRAM_CHANNEL_HINT
-    return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
+
+    # Register in _active_runs so /stop can cancel this turn
+    run = ChatRun(
+        chat_id=chat_id,
+        task=None,  # type: ignore — set below
+        user_message=message,
+    )
+
+    async def _do_turn():
+        return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
+
+    run.task = asyncio.create_task(_do_turn())
+    _active_runs[chat_id] = run
+
+    try:
+        result = await run.task
+    finally:
+        run.done = True
+        run.completed_at = time.time()
+    return result
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────
@@ -744,7 +766,6 @@ async def _read_run_events(run: ChatRun):
             yield _sse_keepalive()
 
 
-@app.post("/chat")
 def cancel_chat_run(chat_id: str) -> bool:
     """Cancel an active chat run. Returns True if something was cancelled."""
     existing = _active_runs.get(chat_id)
@@ -754,6 +775,7 @@ def cancel_chat_run(chat_id: str) -> bool:
     return False
 
 
+@app.post("/chat")
 async def chat(req: ChatRequest):
     """Handle a proxied chat message with SSE streaming and tool use."""
     _prune_old_chat_runs()
