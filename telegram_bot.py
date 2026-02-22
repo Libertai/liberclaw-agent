@@ -130,18 +130,17 @@ class TelegramBot:
     async def _send_message(self, chat_id: str | int, text: str, **kwargs) -> dict:
         """Send a message with HTML formatting, falling back to plain text on error."""
         html_text = _markdown_to_telegram_html(text)
-        html_chunks = [html_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(html_text), MAX_MESSAGE_LENGTH)]
-        plain_chunks = [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+        chunks = [html_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(html_text), MAX_MESSAGE_LENGTH)]
         result = {}
-        for i, chunk in enumerate(html_chunks):
+        for chunk in chunks:
             try:
                 result = await self._api(
                     "sendMessage", chat_id=chat_id, text=chunk,
                     parse_mode="HTML", **kwargs,
                 )
             except Exception:
-                # HTML parsing failed — fall back to plain text for this chunk
-                plain = plain_chunks[i] if i < len(plain_chunks) else chunk
+                # HTML parsing failed — strip tags and retry as plain text
+                plain = re.sub(r"<[^>]+>", "", chunk)
                 try:
                     result = await self._api(
                         "sendMessage", chat_id=chat_id, text=plain, **kwargs,
