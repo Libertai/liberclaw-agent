@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://api.telegram.org/bot{token}"
 POLL_TIMEOUT = 30  # long-polling timeout in seconds
 MAX_MESSAGE_LENGTH = 4096
+AGENT_TURN_TIMEOUT = 120  # max seconds for a single agent turn via Telegram
+TYPING_REFRESH_INTERVAL = 4  # Telegram typing indicator expires after ~5s
+MAX_QUEUED_MESSAGES = 3  # drop messages beyond this when chat is busy
 
 
 class TelegramBot:
@@ -26,17 +29,21 @@ class TelegramBot:
         owner_telegram_id: str,
         db: AgentDatabase,
         agent_turn_callback: Callable[[str, str], Awaitable[str | None]],
+        cancel_run_callback: Callable[[str], bool] | None = None,
     ) -> None:
         self.token = token
         self.owner_telegram_id = owner_telegram_id
         self.db = db
         self._agent_turn = agent_turn_callback
+        self._cancel_run = cancel_run_callback or (lambda chat_id: False)
         self._base_url = API_BASE.format(token=token)
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(POLL_TIMEOUT + 10))
         self._bot_id: int | None = None
         self._bot_username: str = ""
         self._bot_name: str = ""
         self._running = False
+        self._chat_locks: dict[str, asyncio.Lock] = {}  # per-chat serialization
+        self._chat_queue_depth: dict[str, int] = {}  # track queued messages per chat
 
     # ── Telegram API helpers ──────────────────────────────────────────
 
@@ -132,6 +139,62 @@ class TelegramBot:
     def connected(self) -> bool:
         return self._bot_id is not None
 
+    # ── Agent turn with typing indicator ─────────────────────────────
+
+    async def _run_agent_with_typing(
+        self, chat_id: str, tg_chat_id: str, text: str
+    ) -> None:
+        """Run an agent turn with a persistent typing indicator and timeout.
+
+        - Refreshes the typing indicator every few seconds so the user
+          sees activity during long tool loops / inference calls.
+        - Enforces a wall-clock timeout to prevent infinite hangs.
+        - Serialization (per-chat lock) is handled by the caller.
+        """
+        typing_task: asyncio.Task | None = None
+
+        async def _keep_typing():
+            """Refresh typing indicator until cancelled."""
+            try:
+                while True:
+                    await self._send_typing(chat_id)
+                    await asyncio.sleep(TYPING_REFRESH_INTERVAL)
+            except asyncio.CancelledError:
+                return
+
+        try:
+            # Start persistent typing indicator
+            typing_task = asyncio.create_task(_keep_typing())
+
+            # Run the agent turn with a timeout
+            response = await asyncio.wait_for(
+                self._agent_turn(text, tg_chat_id),
+                timeout=AGENT_TURN_TIMEOUT,
+            )
+
+            if response:
+                await self._send_message(chat_id, response)
+            else:
+                await self._send_message(chat_id, "(No response generated)")
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Agent turn timed out for {tg_chat_id} after {AGENT_TURN_TIMEOUT}s"
+            )
+            await self._send_message(
+                chat_id,
+                "Sorry, the response took too long. Please try again.",
+            )
+        except Exception as e:
+            logger.error(f"Agent turn error for {tg_chat_id}: {e}", exc_info=True)
+            await self._send_message(
+                chat_id,
+                "Sorry, an error occurred processing your message.",
+            )
+        finally:
+            if typing_task and not typing_task.done():
+                typing_task.cancel()
+
     # ── Update handling ───────────────────────────────────────────────
 
     async def _handle_update(self, update: dict) -> None:
@@ -210,17 +273,49 @@ class TelegramBot:
                 return
 
             if status == "allowed":
-                await self._send_typing(chat_id)
                 tg_chat_id = f"tg:{chat_id}"
-                try:
-                    response = await self._agent_turn(text, tg_chat_id)
-                    if response:
-                        await self._send_message(chat_id, response)
+
+                # Handle /stop command — cancel active run and clear queue
+                if text.strip().lower() in ("/stop", "/stop@" + self._bot_username.lower()):
+                    cancelled = False
+                    lock = self._chat_locks.get(tg_chat_id)
+                    if lock and lock.locked():
+                        # Cancel queued messages by maxing out depth
+                        self._chat_queue_depth[tg_chat_id] = MAX_QUEUED_MESSAGES + 1
+                        cancelled = True
+                    # Cancel the active agent turn
+                    if self._cancel_run(tg_chat_id):
+                        cancelled = True
+                    if cancelled:
+                        await self._send_message(chat_id, "⏹ Stopped. What's next?")
                     else:
-                        await self._send_message(chat_id, "(No response generated)")
-                except Exception as e:
-                    logger.error(f"Agent turn error for tg:{chat_id}: {e}")
-                    await self._send_message(chat_id, "Sorry, an error occurred processing your message.")
+                        await self._send_message(chat_id, "Nothing running right now.")
+                    # Reset queue depth so new messages flow through
+                    self._chat_queue_depth.pop(tg_chat_id, None)
+                    return
+
+                # Serialize messages per chat to prevent concurrent turns
+                # from corrupting history or producing duplicate responses
+                lock = self._chat_locks.setdefault(tg_chat_id, asyncio.Lock())
+
+                if lock.locked():
+                    # Backpressure: drop if too many messages queued
+                    depth = self._chat_queue_depth.get(tg_chat_id, 0)
+                    if depth >= MAX_QUEUED_MESSAGES:
+                        logger.warning(f"Chat {tg_chat_id} queue full ({depth}), dropping message")
+                        return
+                    logger.info(f"Chat {tg_chat_id} is busy, queuing message ({depth + 1})")
+
+                self._chat_queue_depth[tg_chat_id] = self._chat_queue_depth.get(tg_chat_id, 0) + 1
+                try:
+                    async with lock:
+                        await self._run_agent_with_typing(chat_id, tg_chat_id, text)
+                finally:
+                    self._chat_queue_depth[tg_chat_id] = max(0, self._chat_queue_depth.get(tg_chat_id, 1) - 1)
+                    # Clean up locks for idle chats
+                    if not lock.locked() and self._chat_queue_depth.get(tg_chat_id, 0) == 0:
+                        self._chat_locks.pop(tg_chat_id, None)
+                        self._chat_queue_depth.pop(tg_chat_id, None)
 
         except Exception as e:
             logger.error(f"Telegram update handling error: {e}", exc_info=True)

@@ -135,6 +135,7 @@ async def lifespan(app: FastAPI):
             owner_telegram_id=settings.owner_telegram_id,
             db=db,
             agent_turn_callback=_telegram_agent_turn,
+            cancel_run_callback=cancel_chat_run,
         )
         try:
             await _telegram_bot.start()
@@ -738,6 +739,15 @@ async def _read_run_events(run: ChatRun):
 
 
 @app.post("/chat")
+def cancel_chat_run(chat_id: str) -> bool:
+    """Cancel an active chat run. Returns True if something was cancelled."""
+    existing = _active_runs.get(chat_id)
+    if existing and not existing.done and not existing.task.done():
+        existing.task.cancel()
+        return True
+    return False
+
+
 async def chat(req: ChatRequest):
     """Handle a proxied chat message with SSE streaming and tool use."""
     _prune_old_chat_runs()
