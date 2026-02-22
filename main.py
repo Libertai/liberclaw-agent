@@ -107,8 +107,31 @@ def _prune_old_chat_runs():
 # ── Telegram callback ────────────────────────────────────────────────
 
 async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
-    """Callback for TelegramBot: run an agent turn and return the response text."""
-    return await _run_agent_turn(message, chat_id)
+    """Callback for TelegramBot: run an agent turn and return the response text.
+
+    Registers a ChatRun in _active_runs so cancel_chat_run() works for /stop.
+    """
+    from baal_agent.telegram_bot import TELEGRAM_CHANNEL_HINT
+
+    # Register in _active_runs so /stop can cancel this turn
+    run = ChatRun(
+        chat_id=chat_id,
+        task=None,  # type: ignore — set below
+        user_message=message,
+    )
+
+    async def _do_turn():
+        return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
+
+    run.task = asyncio.create_task(_do_turn())
+    _active_runs[chat_id] = run
+
+    try:
+        result = await run.task
+    finally:
+        run.done = True
+        run.completed_at = time.time()
+    return result
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────
@@ -135,6 +158,7 @@ async def lifespan(app: FastAPI):
             owner_telegram_id=settings.owner_telegram_id,
             db=db,
             agent_turn_callback=_telegram_agent_turn,
+            cancel_run_callback=cancel_chat_run,
         )
         try:
             await _telegram_bot.start()
@@ -196,6 +220,7 @@ async def _run_agent_turn(
     store_history: bool = True,
     file_events: list[dict] | None = None,
     system_prompt_override: str | None = None,
+    channel_hint: str | None = None,
 ) -> str | None:
     """Run a single agentic turn (message -> tool loop -> response).
 
@@ -207,6 +232,8 @@ async def _run_agent_turn(
         store_history: Whether to persist messages to DB.
         file_events: Optional accumulator for send_file events (heartbeat/subagent).
         system_prompt_override: If set, use this instead of building the default prompt.
+        channel_hint: Optional formatting hint appended to the system prompt
+            (e.g. Telegram formatting constraints).
 
     Returns:
         The final text response, or None if no text was generated.
@@ -226,6 +253,8 @@ async def _run_agent_turn(
             tool_names=tool_names,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
+        if channel_hint:
+            dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
             db, inference, chat_id, static_prompt, settings.model, settings,
@@ -735,6 +764,15 @@ async def _read_run_events(run: ChatRun):
         # No new events within the keepalive interval — send keepalive
         if cursor >= len(run.events) and not run.done:
             yield _sse_keepalive()
+
+
+def cancel_chat_run(chat_id: str) -> bool:
+    """Cancel an active chat run. Returns True if something was cancelled."""
+    existing = _active_runs.get(chat_id)
+    if existing and not existing.done and not existing.task.done():
+        existing.task.cancel()
+        return True
+    return False
 
 
 @app.post("/chat")
