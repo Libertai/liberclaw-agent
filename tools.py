@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 
 import httpx
@@ -203,30 +205,57 @@ TOOL_DEFINITIONS = [
             },
         },
     },
-]
-
-# Optional web_search tool — only registered if BRAVE_API_KEY is set
-_WEB_SEARCH_DEF = {
-    "type": "function",
-    "function": {
-        "name": "web_search",
-        "description": "Search the web using Brave Search. Returns titles, URLs, and snippets.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query.",
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web using LibertAI Search. Returns titles, URLs, and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query.",
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of results (1-10, default 5).",
+                    },
                 },
-                "count": {
-                    "type": "integer",
-                    "description": "Number of results (1-10, default 5).",
-                },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
-}
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate an image from a text prompt using LibertAI's image generation API. "
+                "Max size 1024x1024. Dimensions must be multiples of 16. "
+                "Steps: 8 default (fast), use 14 for text readability or high quality."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Text description of the image to generate.",
+                    },
+                    "size": {
+                        "type": "string",
+                        "description": 'Image dimensions as "WxH", e.g. "1024x1024" (default). Max 1024 per side. Must be multiples of 16.',
+                    },
+                    "steps": {
+                        "type": "integer",
+                        "description": "Generation steps. Default 8 (fast). Use 14 for text readability or high quality output.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+]
 
 # Spawn tool — added dynamically in main.py (not available to subagents)
 SPAWN_TOOL_DEF = {
@@ -263,9 +292,6 @@ SPAWN_TOOL_DEF = {
         },
     },
 }
-
-if os.environ.get("BRAVE_API_KEY"):
-    TOOL_DEFINITIONS.append(_WEB_SEARCH_DEF)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -464,28 +490,97 @@ async def _exec_web_fetch(args: dict) -> str:
 async def _exec_web_search(args: dict) -> str:
     query = args["query"]
     count = min(args.get("count", 5), 10)
-    api_key = os.environ.get("BRAVE_API_KEY", "")
+    api_key = os.environ.get("LIBERTAI_API_KEY", "")
     if not api_key:
-        return "[error: BRAVE_API_KEY not configured]"
+        return "[error: LIBERTAI_API_KEY not configured]"
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": count},
-                headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+            resp = await client.post(
+                "https://search.libertai.io/search",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "query": query,
+                    "engines": ["google", "bing", "duckduckgo"],
+                    "max_results": count,
+                },
             )
             resp.raise_for_status()
             data = resp.json()
-            results = data.get("web", {}).get("results", [])
+            results = data.get("results", [])
             if not results:
                 return "(no results found)"
             lines = []
             for r in results:
                 title = r.get("title", "")
                 url = r.get("url", "")
-                snippet = r.get("description", "")
+                snippet = r.get("snippet", "")
                 lines.append(f"**{title}**\n{url}\n{snippet}\n")
+            # Note any engine failures
+            meta = data.get("meta", {})
+            failed = meta.get("engines_failed", [])
+            if failed:
+                lines.append(f"(engines failed: {', '.join(failed)})")
             return "\n".join(lines)
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+async def _exec_generate_image(args: dict) -> str:
+    prompt = args.get("prompt")
+    if not prompt:
+        return "[error: missing required 'prompt' parameter]"
+    api_key = os.environ.get("LIBERTAI_API_KEY", "")
+    if not api_key:
+        return "[error: LIBERTAI_API_KEY not configured]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+
+    # Parse and validate size
+    size_str = args.get("size", "1024x1024")
+    try:
+        w, h = size_str.lower().split("x")
+        w, h = int(w), int(h)
+    except (ValueError, AttributeError):
+        return f"[error: invalid size format '{size_str}', expected 'WxH' e.g. '1024x1024']"
+    w = min(w, 1024)
+    h = min(h, 1024)
+    w = max(16, (w // 16) * 16)
+    h = max(16, (h // 16) * 16)
+    size = f"{w}x{h}"
+
+    steps = args.get("steps", 8)
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                "https://api.libertai.io/v1/images/generations",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": "z-image-turbo",
+                    "prompt": prompt,
+                    "size": size,
+                    "n": 1,
+                    "steps": steps,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            b64_data = data["data"][0]["b64_json"]
+            image_bytes = base64.b64decode(b64_data)
+
+        # Save to workspace/images/
+        images_dir = Path(_workspace_path) / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{uuid.uuid4()}.png"
+        image_path = images_dir / filename
+        image_path.write_bytes(image_bytes)
+
+        rel_path = f"images/{filename}"
+        return f"__SEND_FILE__:{rel_path}:{prompt}"
+    except httpx.HTTPStatusError as e:
+        return f"[error: HTTP {e.response.status_code} from image API]"
+    except (KeyError, IndexError):
+        return "[error: unexpected response format from image API]"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -522,6 +617,7 @@ TOOL_HANDLERS: dict[str, callable] = {
     "list_dir": _exec_list_dir,
     "web_fetch": _exec_web_fetch,
     "web_search": _exec_web_search,
+    "generate_image": _exec_generate_image,
     "send_file": _exec_send_file,
 }
 

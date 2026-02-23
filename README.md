@@ -18,7 +18,8 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 | `edit_file` | Find-and-replace (first occurrence) |
 | `list_dir` | List directory contents |
 | `web_fetch` | Fetch URLs, strip HTML, truncate large responses |
-| `web_search` | Brave Search API (requires `BRAVE_API_KEY`) |
+| `web_search` | LibertAI Search (always available) |
+| `generate_image` | Generate images from text prompts via LibertAI |
 | `send_file` | Send workspace files back to the user |
 | `spawn` | Launch background subagents for parallel work |
 
@@ -82,7 +83,6 @@ All settings via environment variables:
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
 | `INFERENCE_TIMEOUT` | `180` | Seconds before inference timeout |
-| `BRAVE_API_KEY` | — | Enables `web_search` tool |
 
 ## License
 
