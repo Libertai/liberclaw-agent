@@ -11,6 +11,7 @@ def build_static_system_prompt(
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
+    heartbeat_interval: int = 0,
 ) -> str:
     """Assemble the static (cacheable) portion of the system prompt.
 
@@ -48,6 +49,20 @@ def build_static_system_prompt(
         "- Read skill files for detailed instructions when a skill is relevant"
     )
 
+    # Heartbeat system (only when enabled)
+    if heartbeat_interval > 0:
+        interval_min = max(1, heartbeat_interval // 60)
+        sections.append(
+            "## Heartbeat System\n\n"
+            f"Every {interval_min} minutes, your heartbeat runs automatically. "
+            f"It reads `{workspace_path}/HEARTBEAT.md` and follows the checklist there.\n\n"
+            "- To enable: create HEARTBEAT.md with a short checklist of periodic tasks\n"
+            "- Keep it small (it becomes part of your prompt each cycle)\n"
+            "- If nothing needs attention, reply with just: HEARTBEAT_OK\n"
+            "- You can update HEARTBEAT.md yourself to adjust what gets checked\n"
+            "- Results are stored in your heartbeat history"
+        )
+
     return "\n\n---\n\n".join(sections)
 
 
@@ -76,9 +91,13 @@ def build_system_prompt(
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
+    heartbeat_interval: int = 0,
 ) -> str:
     """Full system prompt (static + dynamic). Used for non-cached contexts."""
-    static = build_static_system_prompt(user_prompt, agent_name, workspace_path, tool_names)
+    static = build_static_system_prompt(
+        user_prompt, agent_name, workspace_path, tool_names,
+        heartbeat_interval=heartbeat_interval,
+    )
     dynamic = build_dynamic_context(workspace_path)
     if dynamic:
         return static + "\n\n---\n\n" + dynamic

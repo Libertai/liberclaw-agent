@@ -31,7 +31,7 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 - **Memory**: Persistent file-based memory at `workspace/memory/MEMORY.md` (long-term) and daily notes
 - **Skills**: Markdown skill files at `workspace/skills/*/SKILL.md` — summaries are injected into context, full content loaded on demand
 - **Subagents**: Spawn background workers for parallel tasks with their own tool sets (no further spawning)
-- **Heartbeat**: Periodic check of `HEARTBEAT.md` for autonomous task execution
+- **Heartbeat**: Periodic check of `workspace/HEARTBEAT.md` for autonomous task execution (configurable interval, results stored in chat history)
 - **Security**: Bearer token auth, workspace path sandboxing, bash command deny patterns, sensitive file protection
 
 ## API
@@ -78,7 +78,7 @@ All settings via environment variables:
 | `LIBERTAI_API_KEY` | — | API key for inference |
 | `AGENT_SECRET` | — | Bearer token for auth |
 | `WORKSPACE_PATH` | `/opt/baal-agent/workspace` | Root directory for files |
-| `OWNER_CHAT_ID` | — | Chat ID for heartbeat delivery |
+| `OWNER_CHAT_ID` | — | Chat ID for subagent pending message delivery |
 | `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks (0 to disable) |
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |

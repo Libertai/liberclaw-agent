@@ -251,6 +251,7 @@ async def _run_agent_turn(
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
+            heartbeat_interval=settings.heartbeat_interval,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
         if channel_hint:
@@ -272,6 +273,7 @@ async def _run_agent_turn(
                 settings.agent_name,
                 settings.workspace_path,
                 tool_names=tool_names,
+                heartbeat_interval=settings.heartbeat_interval,
             )
         messages = [{"role": "system", "content": system_prompt}]
         messages.append({"role": "user", "content": message})
@@ -507,24 +509,16 @@ async def _heartbeat_loop():
                 "Read HEARTBEAT.md and follow any instructions or tasks listed there. "
                 "If nothing needs attention, reply with just: HEARTBEAT_OK",
                 chat_id="__heartbeat__",
-                store_history=False,
+                store_history=True,
                 file_events=files,
             )
 
-            if result and "HEARTBEAT_OK" not in result.upper().replace("_", ""):
-                if settings.owner_chat_id:
-                    await db.add_pending(
-                        settings.owner_chat_id,
-                        f"[Heartbeat] {result}",
-                        source="heartbeat",
-                    )
-            if settings.owner_chat_id:
-                for fe in files:
-                    await db.add_pending(
-                        settings.owner_chat_id,
-                        json.dumps({"type": "file", "path": fe["path"], "caption": fe["caption"]}),
-                        source="heartbeat_file",
-                    )
+            if result:
+                is_ok = "HEARTBEAT_OK" in result.upper().replace("_", "")
+                if is_ok:
+                    logger.debug("Heartbeat: nothing to report")
+                else:
+                    logger.info(f"Heartbeat produced output ({len(result)} chars)")
         except Exception as e:
             logger.error(f"Heartbeat error: {e}")
 
@@ -584,6 +578,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
+            heartbeat_interval=settings.heartbeat_interval,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
 
