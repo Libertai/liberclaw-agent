@@ -64,7 +64,7 @@ def _inject_dynamic_context(messages: list[dict], dynamic_context: str) -> list[
     if not dynamic_context:
         return messages
 
-    ctx_msg = {"role": "system", "content": dynamic_context}
+    ctx_msg = {"role": "user", "content": f"[Context update]\n\n{dynamic_context}"}
 
     # Find the last user message and insert before it
     for i in range(len(messages) - 1, -1, -1):
