@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 # Known model context window sizes (tokens).
 _MODEL_CONTEXT_SIZES = {
+    "qwen3-coder-next": 200_000,
+    "glm-4.7": 200_000,
+    "hermes-3-8b-tee": 200_000,
     "claw-flash": 200_000,
     "claw-core": 200_000,
     "deep-claw": 200_000,
