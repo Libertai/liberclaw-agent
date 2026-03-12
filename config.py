@@ -8,7 +8,7 @@ class AgentSettings(BaseSettings):
 
     agent_name: str = "Agent"
     system_prompt: str = "You are a helpful assistant."
-    model: str = "hermes-3-8b-tee"
+    model: str = "claw-core"
     libertai_api_key: str
     agent_secret_hash: str  # SHA-256 hash of the shared secret
     port: int = 8080

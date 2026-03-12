@@ -13,10 +13,11 @@ logger = logging.getLogger(__name__)
 
 # Known model context window sizes (tokens).
 _MODEL_CONTEXT_SIZES = {
-    "qwen3-coder-next": 131_072,
-    "glm-4.7": 131_072,
+    "claw-flash": 200_000,
+    "claw-core": 200_000,
+    "deep-claw": 200_000,
 }
-_DEFAULT_CONTEXT_SIZE = 32_768
+_DEFAULT_CONTEXT_SIZE = 200_000
 
 
 def get_context_limit(model: str, configured_max: int) -> int:
