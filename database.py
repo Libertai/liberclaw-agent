@@ -27,6 +27,7 @@ class AgentDatabase:
                 content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
+                compacted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_messages_chat
@@ -77,6 +78,15 @@ class AgentDatabase:
         await self._db.execute(
             "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
         )
+
+        # Migration: add compacted column to existing databases
+        cursor = await self._db.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "compacted" not in columns:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0"
+            )
+
         await self._db.commit()
 
     async def close(self) -> None:
@@ -111,7 +121,8 @@ class AgentDatabase:
     async def get_history(self, chat_id: str, limit: int = 50) -> list[dict]:
         cursor = await self.db.execute(
             "SELECT role, content, tool_calls, tool_call_id "
-            "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+            "FROM messages WHERE chat_id = ? AND compacted = 0 "
+            "ORDER BY created_at DESC LIMIT ?",
             (chat_id, limit),
         )
         rows = await cursor.fetchall()
@@ -130,24 +141,28 @@ class AgentDatabase:
     async def compact_history(
         self, chat_id: str, keep_recent: int, summary: str
     ) -> None:
-        """Replace old messages with a summary pair, keeping recent messages.
+        """Mark old messages as compacted and insert a summary pair.
 
-        1. Find the cutoff timestamp (the keep_recent-th most recent message)
-        2. Delete all messages older than that cutoff
+        Original messages are preserved for full-text search but excluded
+        from get_history() so they don't consume the context window.
+
+        1. Find the cutoff timestamp (the keep_recent-th most recent active message)
+        2. Mark all active messages older than that cutoff as compacted
         3. Insert a user+assistant summary pair just before the cutoff
         """
-        # Count total
+        # Count active (non-compacted) messages
         cursor = await self.db.execute(
-            "SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ?", (chat_id,)
+            "SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ? AND compacted = 0",
+            (chat_id,),
         )
         row = await cursor.fetchone()
         total = row["cnt"] if row else 0
         if total <= keep_recent:
             return
 
-        # Find the cutoff: the created_at of the (keep_recent)-th most recent message
+        # Find the cutoff: the created_at of the (keep_recent)-th most recent active message
         cursor = await self.db.execute(
-            "SELECT created_at FROM messages WHERE chat_id = ? "
+            "SELECT created_at FROM messages WHERE chat_id = ? AND compacted = 0 "
             "ORDER BY created_at DESC LIMIT 1 OFFSET ?",
             (chat_id, keep_recent - 1),
         )
@@ -156,15 +171,17 @@ class AgentDatabase:
             return
         cutoff = cutoff_row["created_at"]
 
-        # Delete old messages (strictly before the cutoff)
+        # Mark old messages as compacted (preserve for FTS search)
         await self.db.execute(
-            "DELETE FROM messages WHERE chat_id = ? AND created_at < ?",
+            "UPDATE messages SET compacted = 1 "
+            "WHERE chat_id = ? AND compacted = 0 AND created_at < ?",
             (chat_id, cutoff),
         )
 
-        # Find the earliest remaining message's timestamp to place summary before it
+        # Find the earliest remaining active message's timestamp to place summary before it
         cursor = await self.db.execute(
-            "SELECT MIN(created_at) as earliest FROM messages WHERE chat_id = ?",
+            "SELECT MIN(created_at) as earliest FROM messages "
+            "WHERE chat_id = ? AND compacted = 0",
             (chat_id,),
         )
         earliest_row = await cursor.fetchone()
