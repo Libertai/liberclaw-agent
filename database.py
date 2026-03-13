@@ -51,6 +51,34 @@ class AgentDatabase:
             );
         """)
 
+        # FTS5 full-text search index over message content
+        await self._db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                content=messages,
+                content_rowid=id
+            )
+        """)
+        await self._db.executescript("""
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert
+            AFTER INSERT ON messages WHEN new.content IS NOT NULL AND new.content != ''
+            BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete
+            AFTER DELETE ON messages WHEN old.content IS NOT NULL AND old.content != ''
+            BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                    VALUES('delete', old.id, old.content);
+            END;
+        """)
+        # Rebuild FTS index to catch any messages added before FTS was enabled
+        await self._db.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+        )
+        await self._db.commit()
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -180,6 +208,46 @@ class AgentDatabase:
         await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
         await self.db.commit()
         return count
+
+    # ── Full-text search ─────────────────────────────────────────────
+
+    async def search_history(
+        self, query: str, *, chat_id: str | None = None, limit: int = 20
+    ) -> list[dict]:
+        """Full-text search across conversation history using FTS5.
+
+        Returns matching messages with snippets highlighting the matched terms.
+        """
+        if chat_id:
+            cursor = await self.db.execute(
+                "SELECT m.chat_id, m.role, m.created_at, "
+                "  snippet(messages_fts, 0, '>>>', '<<<', '...', 64) as snippet "
+                "FROM messages_fts "
+                "JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ? AND m.chat_id = ? "
+                "ORDER BY rank LIMIT ?",
+                (query, chat_id, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT m.chat_id, m.role, m.created_at, "
+                "  snippet(messages_fts, 0, '>>>', '<<<', '...', 64) as snippet "
+                "FROM messages_fts "
+                "JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (query, limit),
+            )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "chat_id": r["chat_id"],
+                "role": r["role"],
+                "created_at": r["created_at"],
+                "snippet": r["snippet"],
+            }
+            for r in rows
+        ]
 
     # ── Pending messages ──────────────────────────────────────────────
 

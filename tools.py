@@ -21,12 +21,14 @@ MAX_WEB_CONTENT = 50_000
 # ── Workspace configuration ──────────────────────────────────────────
 
 _workspace_path: str | None = None
+_db = None  # AgentDatabase instance, set via configure_tools
 
 
-def configure_tools(workspace_path: str) -> None:
-    """Set the workspace root for file-tool boundary checks."""
-    global _workspace_path
+def configure_tools(workspace_path: str, db=None) -> None:
+    """Set the workspace root and optional database for tool boundary checks."""
+    global _workspace_path, _db
     _workspace_path = workspace_path
+    _db = db
 
 # ── Bash safety guards ────────────────────────────────────────────────
 
@@ -202,6 +204,38 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_history",
+            "description": (
+                "Search your past conversation history using full-text search. "
+                "Use this to recall what was discussed about a topic, find details "
+                "from previous conversations, or check if something was mentioned before."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            'Search query. Supports FTS5 syntax: words, "exact phrases", '
+                            "OR, NOT, prefix*."
+                        ),
+                    },
+                    "chat_id": {
+                        "type": "string",
+                        "description": "Optional: limit search to a specific conversation.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 20, max 50).",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
@@ -487,6 +521,28 @@ async def _exec_web_fetch(args: dict) -> str:
         return f"[error: {e}]"
 
 
+async def _exec_search_history(args: dict) -> str:
+    query = args.get("query", "")
+    if not query:
+        return "[error: missing required 'query' parameter]"
+    if _db is None:
+        return "[error: conversation search not available]"
+    chat_id = args.get("chat_id")
+    limit = min(args.get("limit", 20), 50)
+    try:
+        results = await _db.search_history(query, chat_id=chat_id, limit=limit)
+    except Exception as e:
+        return f"[error: search failed: {e}]"
+    if not results:
+        return "(no matching messages found)"
+    lines = []
+    for r in results:
+        lines.append(f"[{r['created_at']}] ({r['role']}, chat: {r['chat_id']}):")
+        lines.append(r["snippet"])
+        lines.append("")
+    return _truncate("\n".join(lines))
+
+
 async def _exec_web_search(args: dict) -> str:
     query = args["query"]
     count = min(args.get("count", 5), 10)
@@ -616,6 +672,7 @@ TOOL_HANDLERS: dict[str, callable] = {
     "edit_file": _exec_edit_file,
     "list_dir": _exec_list_dir,
     "web_fetch": _exec_web_fetch,
+    "search_history": _exec_search_history,
     "web_search": _exec_web_search,
     "generate_image": _exec_generate_image,
     "send_file": _exec_send_file,

@@ -49,6 +49,16 @@ def build_static_system_prompt(
         "- Read skill files for detailed instructions when a skill is relevant"
     )
 
+    # Skill creation nudge
+    sections.append(
+        "## Skill Creation\n\n"
+        "When you solve a complex or multi-step problem that could come up again, "
+        "save it as a reusable skill by writing a SKILL.md file to "
+        f"`{workspace_path}/skills/<name>/SKILL.md`. Use YAML frontmatter with "
+        "`name` and `description` fields, then document the approach and key steps. "
+        "Only do this for genuinely reusable procedures, not one-off tasks."
+    )
+
     # Heartbeat system (only when enabled)
     if heartbeat_interval > 0:
         interval_min = max(1, heartbeat_interval // 60)

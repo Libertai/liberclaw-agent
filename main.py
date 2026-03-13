@@ -140,7 +140,7 @@ async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
 async def lifespan(app: FastAPI):
     global _heartbeat_task, _telegram_bot, _telegram_bot_task
     await db.initialize()
-    configure_tools(settings.workspace_path)
+    configure_tools(settings.workspace_path, db=db)
 
     # Ensure workspace directories exist
     workspace = Path(settings.workspace_path)
