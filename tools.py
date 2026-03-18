@@ -24,7 +24,7 @@ from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
 
-_IMAGE_AWARE_TOOLS = {"read_file", "web_fetch"}
+_IMAGE_AWARE_TOOLS = {"read_file", "read_pdf", "web_fetch"}
 
 # ── Workspace configuration ──────────────────────────────────────────
 
@@ -109,6 +109,31 @@ TOOL_DEFINITIONS = [
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of lines to read.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_pdf",
+            "description": (
+                "Read a PDF file by rendering pages as images for visual analysis. "
+                "Returns one or more pages as images so you can see and read the content. "
+                "Use this instead of read_file for PDF files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to the PDF file.",
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": 'Page(s) to read. Examples: "1", "1-3", "2,5,8". Defaults to "1". Max 5 pages per call.',
                     },
                 },
                 "required": ["path"],
@@ -420,6 +445,9 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
             if image_callback:
                 image_callback(blocks)
             return f"[Read image: {path}]"
+        # PDF: redirect to read_pdf
+        if resolved.suffix.lower() == ".pdf":
+            return f"[This is a PDF file. Use the read_pdf tool to read it: read_pdf(path=\"{path}\")]"
         with open(resolved, "r", errors="replace") as f:
             lines = f.readlines()
         start = max(0, offset - 1)
@@ -432,6 +460,80 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         return f"[error: file not found: {path}]"
     except Exception as e:
         return f"[error: {e}]"
+
+
+def _parse_page_ranges(spec: str, max_page: int) -> list[int]:
+    """Parse a page spec like '1', '1-3', '2,5,8' into a sorted list of 0-based indices."""
+    pages = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            start, end = part.split("-", 1)
+            start = max(1, int(start))
+            end = min(max_page, int(end))
+            pages.update(range(start - 1, end))
+        else:
+            p = int(part)
+            if 1 <= p <= max_page:
+                pages.add(p - 1)
+    return sorted(pages)
+
+
+MAX_PDF_PAGES_PER_CALL = 5
+
+
+async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
+    path = args["path"]
+    page_spec = args.get("pages", "1")
+    try:
+        if _workspace_path:
+            resolved = validate_workspace_path(path, _workspace_path, must_exist=True)
+        else:
+            resolved = Path(path)
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+    except FileNotFoundError:
+        return f"[error: file not found: {path}]"
+
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return "[error: PDF support not available (pymupdf not installed)]"
+
+    try:
+        doc = fitz.open(str(resolved))
+        total_pages = len(doc)
+        if total_pages == 0:
+            doc.close()
+            return "[error: PDF has no pages]"
+
+        page_indices = _parse_page_ranges(page_spec, total_pages)
+        if not page_indices:
+            doc.close()
+            return f"[error: no valid pages in '{page_spec}' (PDF has {total_pages} pages)]"
+        if len(page_indices) > MAX_PDF_PAGES_PER_CALL:
+            page_indices = page_indices[:MAX_PDF_PAGES_PER_CALL]
+
+        blocks: list[dict] = []
+        for idx in page_indices:
+            page = doc[idx]
+            # Render at 2x for readability (144 DPI)
+            pix = page.get_pixmap(dpi=144)
+            img_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(img_bytes).decode("ascii")
+            data_uri = f"data:image/png;base64,{b64}"
+            blocks.append({"type": "text", "text": f"[PDF page {idx + 1}/{total_pages}: {path}]"})
+            blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
+
+        doc.close()
+
+        if image_callback:
+            image_callback(blocks)
+
+        rendered = [str(i + 1) for i in page_indices]
+        return f"[Read PDF: {path} — page(s) {', '.join(rendered)} of {total_pages}]"
+    except Exception as e:
+        return f"[error reading PDF: {e}]"
 
 
 async def _exec_write_file(args: dict) -> str:
@@ -696,6 +798,7 @@ async def _exec_send_file(args: dict) -> str:
 TOOL_HANDLERS: dict[str, callable] = {
     "bash": _exec_bash,
     "read_file": _exec_read_file,
+    "read_pdf": _exec_read_pdf,
     "write_file": _exec_write_file,
     "edit_file": _exec_edit_file,
     "list_dir": _exec_list_dir,
