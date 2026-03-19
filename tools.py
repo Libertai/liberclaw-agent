@@ -120,9 +120,9 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "read_pdf",
             "description": (
-                "Read a PDF file by rendering pages as images for visual analysis. "
-                "Returns one or more pages as images so you can see and read the content. "
-                "Use this instead of read_file for PDF files."
+                "Read a PDF file. In text mode (default), extracts text from pages — fast and lightweight, "
+                "good for most documents. In image mode, renders pages as images for visual analysis — "
+                "use when layout, diagrams, or tables matter. Use this instead of read_file for PDF files."
             ),
             "parameters": {
                 "type": "object",
@@ -133,7 +133,12 @@ TOOL_DEFINITIONS = [
                     },
                     "pages": {
                         "type": "string",
-                        "description": 'Page(s) to read. Examples: "1", "1-3", "2,5,8". Defaults to "1". Max 3 pages per call.',
+                        "description": 'Page(s) to read. Examples: "1", "1-3", "2,5,8". Defaults to "1". Max 3 pages per call in image mode, 20 in text mode.',
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["text", "image"],
+                        "description": 'Reading mode. "text" (default) extracts text content. "image" renders pages visually.',
                     },
                 },
                 "required": ["path"],
@@ -479,12 +484,14 @@ def _parse_page_ranges(spec: str, max_page: int) -> list[int]:
     return sorted(pages)
 
 
-MAX_PDF_PAGES_PER_CALL = 3
+MAX_PDF_PAGES_IMAGE = 3
+MAX_PDF_PAGES_TEXT = 20
 
 
 async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
     path = args["path"]
     page_spec = args.get("pages", "1")
+    mode = args.get("mode", "text")
     try:
         if _workspace_path:
             resolved = validate_workspace_path(path, _workspace_path, must_exist=True)
@@ -507,34 +514,47 @@ async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
             doc.close()
             return "[error: PDF has no pages]"
 
+        max_pages = MAX_PDF_PAGES_IMAGE if mode == "image" else MAX_PDF_PAGES_TEXT
         page_indices = _parse_page_ranges(page_spec, total_pages)
         if not page_indices:
             doc.close()
             return f"[error: no valid pages in '{page_spec}' (PDF has {total_pages} pages)]"
-        if len(page_indices) > MAX_PDF_PAGES_PER_CALL:
-            page_indices = page_indices[:MAX_PDF_PAGES_PER_CALL]
+        if len(page_indices) > max_pages:
+            page_indices = page_indices[:max_pages]
 
-        blocks: list[dict] = []
-        for idx in page_indices:
-            page = doc[idx]
-            # Render at 150 DPI then resize to max 1024px and compress as JPEG
-            pix = page.get_pixmap(dpi=150)
-            img_bytes = pix.tobytes("png")
-            from baal_agent.image_utils import resize_image_bytes
-            resized = resize_image_bytes(img_bytes, max_dim=1024)
-            mime = "image/jpeg" if resized is not img_bytes else "image/png"
-            b64 = base64.b64encode(resized).decode("ascii")
-            data_uri = f"data:{mime};base64,{b64}"
-            blocks.append({"type": "text", "text": f"[PDF page {idx + 1}/{total_pages}: {path}]"})
-            blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
+        if mode == "image":
+            blocks: list[dict] = []
+            for idx in page_indices:
+                page = doc[idx]
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("png")
+                from baal_agent.image_utils import resize_image_bytes
+                resized = resize_image_bytes(img_bytes, max_dim=1024)
+                mime = "image/jpeg" if resized is not img_bytes else "image/png"
+                b64 = base64.b64encode(resized).decode("ascii")
+                data_uri = f"data:{mime};base64,{b64}"
+                blocks.append({"type": "text", "text": f"[PDF page {idx + 1}/{total_pages}: {path}]"})
+                blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
 
-        doc.close()
+            doc.close()
 
-        if image_callback:
-            image_callback(blocks)
+            if image_callback:
+                image_callback(blocks)
 
-        rendered = [str(i + 1) for i in page_indices]
-        return f"[Read PDF: {path} — page(s) {', '.join(rendered)} of {total_pages}]"
+            rendered = [str(i + 1) for i in page_indices]
+            return f"[Read PDF: {path} — page(s) {', '.join(rendered)} of {total_pages}]"
+        else:
+            # Text extraction mode
+            parts = []
+            for idx in page_indices:
+                page = doc[idx]
+                text = page.get_text()
+                header = f"── Page {idx + 1}/{total_pages} ──"
+                parts.append(f"{header}\n{text.strip()}" if text.strip() else f"{header}\n(no text content)")
+
+            doc.close()
+            result = f"[PDF: {path} — {total_pages} pages total]\n\n" + "\n\n".join(parts)
+            return _truncate(result)
     except Exception as e:
         return f"[error reading PDF: {e}]"
 
