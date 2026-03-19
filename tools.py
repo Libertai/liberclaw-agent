@@ -133,7 +133,7 @@ TOOL_DEFINITIONS = [
                     },
                     "pages": {
                         "type": "string",
-                        "description": 'Page(s) to read. Examples: "1", "1-3", "2,5,8". Defaults to "1". Max 5 pages per call.',
+                        "description": 'Page(s) to read. Examples: "1", "1-3", "2,5,8". Defaults to "1". Max 3 pages per call.',
                     },
                 },
                 "required": ["path"],
@@ -479,7 +479,7 @@ def _parse_page_ranges(spec: str, max_page: int) -> list[int]:
     return sorted(pages)
 
 
-MAX_PDF_PAGES_PER_CALL = 5
+MAX_PDF_PAGES_PER_CALL = 3
 
 
 async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
@@ -517,11 +517,14 @@ async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
         blocks: list[dict] = []
         for idx in page_indices:
             page = doc[idx]
-            # Render at 2x for readability (144 DPI)
-            pix = page.get_pixmap(dpi=144)
+            # Render at 150 DPI then resize to max 1024px and compress as JPEG
+            pix = page.get_pixmap(dpi=150)
             img_bytes = pix.tobytes("png")
-            b64 = base64.b64encode(img_bytes).decode("ascii")
-            data_uri = f"data:image/png;base64,{b64}"
+            from baal_agent.image_utils import resize_image_bytes
+            resized = resize_image_bytes(img_bytes, max_dim=1024)
+            mime = "image/jpeg" if resized is not img_bytes else "image/png"
+            b64 = base64.b64encode(resized).decode("ascii")
+            data_uri = f"data:{mime};base64,{b64}"
             blocks.append({"type": "text", "text": f"[PDF page {idx + 1}/{total_pages}: {path}]"})
             blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
 
