@@ -94,7 +94,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file and return its contents with line numbers. For image files (png, jpg, gif, webp, bmp), returns the image visually so you can see it.",
+            "description": "Read a file and return its contents with line numbers. For image files (png, jpg, gif, webp, bmp), returns the image visually so you can see it. Binary files are detected and return metadata with inspection hints.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -401,6 +401,96 @@ def _strip_html(text: str) -> str:
     return text.strip()
 
 
+_BINARY_MIME_PREFIXES = (
+    "application/octet-stream", "application/zip", "application/gzip",
+    "application/x-tar", "application/pdf", "application/x-executable",
+    "application/x-sharedlib", "application/java-archive",
+    "application/vnd.", "audio/", "video/", "font/",
+)
+
+
+def _save_binary_download(content: bytes, url: str, content_type: str) -> str:
+    """Save binary content to workspace/downloads/ and return a description."""
+    ct_display = content_type.split(";")[0].strip() if content_type else "unknown"
+    if _workspace_path:
+        downloads_dir = Path(_workspace_path) / "downloads"
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        url_path = urlparse(url).path
+        filename = Path(url_path).name if Path(url_path).name else f"download_{uuid.uuid4().hex[:8]}"
+        filepath = downloads_dir / filename
+        filepath.write_bytes(content)
+        return (
+            f"[Binary file downloaded: downloads/{filename} "
+            f"({len(content):,} bytes, type: {ct_display})]\n"
+            "Use read_file, bash, or other tools to inspect it."
+        )
+    return f"[Binary content ({len(content):,} bytes, type: {ct_display}). Cannot display as text.]"
+
+
+# ── Binary detection ─────────────────────────────────────────────────
+
+_BINARY_EXTENSIONS = frozenset({
+    # Archives
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+    # Java / compiled / object
+    ".jar", ".war", ".class", ".o", ".so", ".dylib", ".dll", ".exe",
+    ".pyc", ".pyo", ".wasm",
+    # Databases
+    ".db", ".sqlite", ".sqlite3",
+    # Office / documents (zip-based)
+    ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub",
+    # Packages
+    ".apk", ".ipa", ".deb", ".rpm",
+    # Raw binary
+    ".bin", ".dat",
+    # Media (non-image — images handled by is_image())
+    ".ico", ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac", ".ogg",
+    ".mkv", ".wmv", ".aac", ".m4a",
+    # Fonts
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+})
+
+
+def _is_binary(path: Path) -> bool:
+    """Detect whether a file is binary.
+
+    Checks extension against a known set first, then reads the first 8KB
+    and looks for null bytes or a high ratio of non-text bytes.  This
+    catches domain-specific binary formats (e.g. .mxl, .mdb) that aren't
+    in the extension list.
+    """
+    if path.suffix.lower() in _BINARY_EXTENSIONS:
+        return True
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(8192)
+    except OSError:
+        return False
+    if not chunk:
+        return False
+    if b"\x00" in chunk:
+        return True
+    # Count non-text bytes (excluding tab=0x09, newline=0x0A, CR=0x0D)
+    non_text = sum(1 for b in chunk if b < 0x09 or (0x0E <= b <= 0x1F))
+    return (non_text / len(chunk)) > 0.10
+
+
+def _binary_file_message(path: Path) -> str:
+    """Build an informative message when a binary file is detected."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    ext = path.suffix.lower() or "(no extension)"
+    return (
+        f"[Binary file: {path.name} ({size:,} bytes, extension: {ext})]\n"
+        "This is a binary file and cannot be displayed as text.\n"
+        f"To inspect it, use bash: file {path}, xxd {path} | head, or strings {path}\n"
+        "To work with binary formats, install tools you need with: "
+        "apt-get install -y <package> or pip install <package>"
+    )
+
+
 # ── Tool executors ────────────────────────────────────────────────────
 
 async def _exec_bash(args: dict) -> str:
@@ -417,7 +507,23 @@ async def _exec_bash(args: dict) -> str:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        out = stdout.decode("utf-8", errors="replace")
+        # Check for binary output before decoding
+        if b"\x00" in stdout and len(stdout) > 64:
+            out = (
+                f"[binary output detected ({len(stdout):,} bytes) — not displayed to avoid chat corruption]\n"
+                "Hint: redirect binary output to a file instead, or use tools like xxd/hexdump."
+            )
+        else:
+            out = stdout.decode("utf-8", errors="replace")
+            # Secondary check: excessive replacement chars indicate binary data
+            if len(out) > 200:
+                replacement_count = out.count("\ufffd")
+                if replacement_count > 0 and replacement_count / len(out) > 0.05:
+                    out = (
+                        out[:200]
+                        + f"\n\n[truncated: output contains binary data "
+                        f"({replacement_count} invalid bytes in {len(out)} chars)]"
+                    )
         err = stderr.decode("utf-8", errors="replace")
         code = proc.returncode or 0
         parts = []
@@ -453,6 +559,9 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         # PDF: redirect to read_pdf
         if resolved.suffix.lower() == ".pdf":
             return f"[This is a PDF file. Use the read_pdf tool to read it: read_pdf(path=\"{path}\")]"
+        # Binary detection — after image/PDF checks
+        if _is_binary(resolved):
+            return _binary_file_message(resolved)
         with open(resolved, "r", errors="replace") as f:
             lines = f.readlines()
         start = max(0, offset - 1)
@@ -596,6 +705,8 @@ async def _exec_edit_file(args: dict) -> str:
             resolved = validate_workspace_path(path, _workspace_path, must_exist=True)
         else:
             resolved = Path(path)
+        if _is_binary(resolved):
+            return f"[error: {path} is a binary file and cannot be edited as text]"
         with open(resolved, "r") as f:
             content = f.read()
         if old_string not in content:
@@ -656,23 +767,11 @@ async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
                 if image_callback:
                     image_callback(blocks)
                 return f"[Fetched image: {url}]"
-            # Binary content: download to workspace so tools like read_pdf can handle it
-            _BINARY_TYPES = ("application/pdf", "application/octet-stream",
-                             "application/zip", "audio/", "video/", "font/")
-            _MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024  # 20 MB
-            if any(t in content_type for t in _BINARY_TYPES):
-                if len(resp.content) > _MAX_DOWNLOAD_SIZE:
-                    return f"[error: file too large ({len(resp.content)} bytes, max {_MAX_DOWNLOAD_SIZE // 1024 // 1024}MB)]"
-                import os
-                from pathlib import Path
-                ext = url.rsplit(".", 1)[-1].split("?")[0][:10] if "." in url else "bin"
-                filename = f"downloaded.{ext}"
-                ws = os.environ.get("WORKSPACE_PATH", "/workspace")
-                dl_path = Path(ws) / filename
-                dl_path.parent.mkdir(parents=True, exist_ok=True)
-                dl_path.write_bytes(resp.content)
-                hint = "Use read_pdf to read it." if ext == "pdf" else ""
-                return f"[Downloaded binary file ({content_type.split(';')[0]}, {len(resp.content)} bytes) to {filename}. {hint}]"
+            # Binary content detection by MIME type or content sniff
+            if any(content_type.startswith(p) for p in _BINARY_MIME_PREFIXES) or (
+                b"\x00" in resp.content[:8192]
+            ):
+                return _save_binary_download(resp.content, url, content_type)
             text = resp.text
             if "json" in content_type:
                 try:

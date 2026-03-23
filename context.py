@@ -54,7 +54,13 @@ def build_static_system_prompt(
         "## Files & Images\n\n"
         "When the user sends a file or mentions an uploaded file, use `read_file` to examine it. "
         "This works for images too: `read_file` on an image file (png, jpg, gif, webp, bmp) "
-        "lets you see the image contents. Never say you can't see an image without trying `read_file` first."
+        "lets you see the image contents. Never say you can't see an image without trying `read_file` first.\n\n"
+        "Binary files (executables, archives, databases, media, etc.) are detected automatically. "
+        "You cannot read them as text, but you can inspect them using bash commands like "
+        "`file <path>`, `xxd <path> | head`, or `strings <path>`. "
+        "You can install any tools or libraries you need with `apt-get install -y <package>` or `pip install <package>`.\n\n"
+        "`web_fetch` downloads binary files to the `downloads/` directory in your workspace. "
+        "Use `read_file`, `bash`, or specialized tools to work with downloaded files."
     )
 
     # Skill creation nudge
