@@ -424,10 +424,13 @@ def _save_binary_download(content: bytes, url: str, content_type: str) -> str:
         filename = Path(url_path).name if Path(url_path).name else f"download_{uuid.uuid4().hex[:8]}"
         filepath = downloads_dir / filename
         filepath.write_bytes(content)
+        hint = "Use read_pdf to read it." if filepath.suffix.lower() == ".pdf" else (
+            "Use read_file, bash, or other tools to inspect it."
+        )
         return (
             f"[Binary file downloaded: downloads/{filename} "
             f"({len(content):,} bytes, type: {ct_display})]\n"
-            "Use read_file, bash, or other tools to inspect it."
+            f"{hint}"
         )
     return f"[Binary content ({len(content):,} bytes, type: {ct_display}). Cannot display as text.]"
 
