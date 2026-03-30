@@ -20,8 +20,12 @@ class AgentSettings(BaseSettings):
     heartbeat_interval: int = 1800  # seconds (0 = disabled)
     max_context_tokens: int = 0  # 0 = auto-detect from model name
     generation_reserve: int = 4096  # tokens reserved for model output
-    compaction_keep_messages: int = 20  # recent messages to preserve during compaction
+    compaction_keep_messages: int = 20  # max recent messages to preserve during compaction
+    compaction_keep_min: int = 6  # minimum messages to keep even under extreme context pressure
     compaction_threshold: float = 0.75  # trigger compaction at this fraction of context budget
+    compaction_flush_enabled: bool = True  # run memory flush before compaction
+    auto_skill_threshold: int = 5  # tool calls to trigger skill nudge (0 = disabled)
     inference_timeout: int = 180  # seconds — timeout for inference in the SSE loop
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
+    pii_redaction_enabled: bool = True  # redact PII from tool outputs
