@@ -122,12 +122,16 @@ def _prune_old_chat_runs():
 
 # ── Telegram callback ────────────────────────────────────────────────
 
-async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str | None:
-    """Callback for TelegramBot: run an agent turn and return the response text.
+async def _telegram_agent_turn(
+    message: str | list[dict], chat_id: str
+) -> tuple[str | None, list[dict]]:
+    """Callback for TelegramBot: run an agent turn and return (text, file_events).
 
     Registers a ChatRun in _active_runs so cancel_chat_run() works for /stop.
     """
     from baal_agent.telegram_bot import TELEGRAM_CHANNEL_HINT
+
+    file_events: list[dict] = []
 
     # Register in _active_runs so /stop can cancel this turn
     run = ChatRun(
@@ -137,7 +141,10 @@ async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str |
     )
 
     async def _do_turn():
-        return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
+        return await _run_agent_turn(
+            message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT,
+            file_events=file_events,
+        )
 
     run.task = asyncio.create_task(_do_turn())
     _active_runs[chat_id] = run
@@ -147,7 +154,7 @@ async def _telegram_agent_turn(message: str | list[dict], chat_id: str) -> str |
     finally:
         run.done = True
         run.completed_at = time.time()
-    return result
+    return result, file_events
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────

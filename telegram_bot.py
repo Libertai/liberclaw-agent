@@ -103,7 +103,7 @@ class TelegramBot:
         token: str,
         owner_telegram_id: str,
         db: AgentDatabase,
-        agent_turn_callback: Callable[[str | list[dict], str], Awaitable[str | None]],
+        agent_turn_callback: Callable[[str | list[dict], str], Awaitable[tuple[str | None, list[dict]]]],
         cancel_run_callback: Callable[[str], bool] | None = None,
         workspace_path: str = "/tmp/workspace",
     ) -> None:
@@ -154,6 +154,69 @@ class TelegramBot:
                 except Exception as e:
                     logger.error(f"Failed to send message to {chat_id}: {e}")
         return result
+
+    async def _send_local_file(
+        self, chat_id: str | int, rel_path: str, caption: str = ""
+    ) -> None:
+        """Send a file from the agent workspace to Telegram."""
+        workspace = Path(self._workspace_path)
+        file_path = (workspace / rel_path).resolve()
+        # Security: ensure path is within workspace
+        try:
+            file_path.relative_to(workspace.resolve())
+        except ValueError:
+            logger.warning(f"Refusing to send file outside workspace: {rel_path}")
+            return
+        if not file_path.is_file():
+            logger.warning(f"File not found for Telegram send: {file_path}")
+            return
+
+        filename = file_path.name
+        file_bytes = file_path.read_bytes()
+        tg_caption = _markdown_to_telegram_html(caption) if caption else None
+
+        try:
+            if is_image(str(file_path)) and len(file_bytes) <= 10 * 1024 * 1024:
+                data = {"chat_id": str(chat_id), "parse_mode": "HTML"}
+                if tg_caption:
+                    data["caption"] = tg_caption
+                resp = await self._client.post(
+                    f"{self._base_url}/sendPhoto",
+                    data=data,
+                    files={"photo": (filename, file_bytes)},
+                )
+            else:
+                data = {"chat_id": str(chat_id), "parse_mode": "HTML"}
+                if tg_caption:
+                    data["caption"] = tg_caption
+                resp = await self._client.post(
+                    f"{self._base_url}/sendDocument",
+                    data=data,
+                    files={"document": (filename, file_bytes)},
+                )
+            result = resp.json()
+            if not result.get("ok"):
+                # Retry caption without HTML if it failed
+                if tg_caption:
+                    plain_caption = re.sub(r"<[^>]+>", "", tg_caption)
+                    data["caption"] = plain_caption
+                    del data["parse_mode"]
+                    if is_image(str(file_path)) and len(file_bytes) <= 10 * 1024 * 1024:
+                        resp = await self._client.post(
+                            f"{self._base_url}/sendPhoto",
+                            data=data,
+                            files={"photo": (filename, file_bytes)},
+                        )
+                    else:
+                        resp = await self._client.post(
+                            f"{self._base_url}/sendDocument",
+                            data=data,
+                            files={"document": (filename, file_bytes)},
+                        )
+                else:
+                    logger.error(f"Telegram sendPhoto/Document failed: {result}")
+        except Exception as e:
+            logger.error(f"Failed to send file {rel_path} to {chat_id}: {e}")
 
     async def _send_typing(self, chat_id: str | int) -> None:
         try:
@@ -274,14 +337,20 @@ class TelegramBot:
             typing_task = asyncio.create_task(_keep_typing())
 
             # Run the agent turn with a timeout
-            response = await asyncio.wait_for(
+            response, file_events = await asyncio.wait_for(
                 self._agent_turn(text, tg_chat_id),
                 timeout=AGENT_TURN_TIMEOUT,
             )
 
+            # Send any generated files (images, documents)
+            for fev in file_events:
+                await self._send_local_file(
+                    chat_id, fev.get("path", ""), fev.get("caption", ""),
+                )
+
             if response:
                 await self._send_message(chat_id, response)
-            else:
+            elif not file_events:
                 await self._send_message(chat_id, "(No response generated)")
 
         except asyncio.TimeoutError:
