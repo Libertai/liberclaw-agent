@@ -232,7 +232,7 @@ app = FastAPI(title=f"Baal Agent: {settings.agent_name}", lifespan=lifespan)
 
 # ── Auth middleware ────────────────────────────────────────────────────
 
-PUBLIC_PREFIXES = ("/dl/", "/assets/", "/static/")
+PUBLIC_PREFIXES = ("/dl/", "/assets/")
 PUBLIC_PATHS = {"/health", "/", "/index.html", "/favicon.ico", "/manifest.json"}
 
 
@@ -1257,7 +1257,7 @@ async def info():
     return {
         "agent_name": settings.agent_name,
         "model": settings.model,
-        "system_prompt": settings.system_prompt,
+        "has_system_prompt": bool(settings.system_prompt),
         "capabilities": ["vision"],
         "tools": [t["function"]["name"] for t in get_tool_definitions(include_spawn=True)],
         "heartbeat_interval": settings.heartbeat_interval,
