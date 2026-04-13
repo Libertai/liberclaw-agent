@@ -27,6 +27,7 @@ class AgentDatabase:
                 content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
+                compacted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_messages_chat
@@ -51,6 +52,33 @@ class AgentDatabase:
             );
         """)
 
+        # FTS5 full-text search index over message content
+        await self._db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                content=messages,
+                content_rowid=id
+            )
+        """)
+        # Drop old triggers — multimodal content needs application-level FTS management
+        # (the trigger-based approach can't handle JSON content vs text-only FTS entries)
+        await self._db.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+        await self._db.execute("DROP TRIGGER IF EXISTS messages_fts_delete")
+        # Rebuild FTS index to catch any messages added before FTS was enabled
+        await self._db.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+        )
+
+        # Migration: add compacted column to existing databases
+        cursor = await self._db.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "compacted" not in columns:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0"
+            )
+
+        await self._db.commit()
+
     async def close(self) -> None:
         if self._db is not None:
             await self._db.close()
@@ -66,24 +94,36 @@ class AgentDatabase:
         self,
         chat_id: str,
         role: str,
-        content: str | None,
+        content: str | list[dict] | None,
         *,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
     ) -> None:
+        from baal_agent.image_utils import extract_text_from_content
+
         now = datetime.now(timezone.utc).isoformat()
         tc_json = json.dumps(tool_calls) if tool_calls else None
-        await self.db.execute(
+        # Serialize list content to JSON for storage
+        stored = json.dumps(content) if isinstance(content, list) else content
+        cursor = await self.db.execute(
             "INSERT INTO messages (chat_id, role, content, tool_calls, tool_call_id, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, role, content, tc_json, tool_call_id, now),
+            (chat_id, role, stored, tc_json, tool_call_id, now),
         )
+        # Manually insert text-only version into FTS index
+        text = extract_text_from_content(content)
+        if text:
+            await self.db.execute(
+                "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
+                (cursor.lastrowid, text),
+            )
         await self.db.commit()
 
     async def get_history(self, chat_id: str, limit: int = 50) -> list[dict]:
         cursor = await self.db.execute(
             "SELECT role, content, tool_calls, tool_call_id "
-            "FROM messages WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?",
+            "FROM messages WHERE chat_id = ? AND compacted = 0 "
+            "ORDER BY created_at DESC LIMIT ?",
             (chat_id, limit),
         )
         rows = await cursor.fetchall()
@@ -91,7 +131,15 @@ class AgentDatabase:
         for r in reversed(rows):
             msg: dict = {"role": r["role"]}
             if r["content"] is not None:
-                msg["content"] = r["content"]
+                content = r["content"]
+                # Deserialize multimodal content stored as JSON list
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        content = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                msg["content"] = content
             if r["tool_calls"]:
                 msg["tool_calls"] = json.loads(r["tool_calls"])
             if r["tool_call_id"]:
@@ -102,24 +150,28 @@ class AgentDatabase:
     async def compact_history(
         self, chat_id: str, keep_recent: int, summary: str
     ) -> None:
-        """Replace old messages with a summary pair, keeping recent messages.
+        """Mark old messages as compacted and insert a summary pair.
 
-        1. Find the cutoff timestamp (the keep_recent-th most recent message)
-        2. Delete all messages older than that cutoff
+        Original messages are preserved for full-text search but excluded
+        from get_history() so they don't consume the context window.
+
+        1. Find the cutoff timestamp (the keep_recent-th most recent active message)
+        2. Mark all active messages older than that cutoff as compacted
         3. Insert a user+assistant summary pair just before the cutoff
         """
-        # Count total
+        # Count active (non-compacted) messages
         cursor = await self.db.execute(
-            "SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ?", (chat_id,)
+            "SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ? AND compacted = 0",
+            (chat_id,),
         )
         row = await cursor.fetchone()
         total = row["cnt"] if row else 0
         if total <= keep_recent:
             return
 
-        # Find the cutoff: the created_at of the (keep_recent)-th most recent message
+        # Find the cutoff: the created_at of the (keep_recent)-th most recent active message
         cursor = await self.db.execute(
-            "SELECT created_at FROM messages WHERE chat_id = ? "
+            "SELECT created_at FROM messages WHERE chat_id = ? AND compacted = 0 "
             "ORDER BY created_at DESC LIMIT 1 OFFSET ?",
             (chat_id, keep_recent - 1),
         )
@@ -128,15 +180,17 @@ class AgentDatabase:
             return
         cutoff = cutoff_row["created_at"]
 
-        # Delete old messages (strictly before the cutoff)
+        # Mark old messages as compacted (preserve for FTS search)
         await self.db.execute(
-            "DELETE FROM messages WHERE chat_id = ? AND created_at < ?",
+            "UPDATE messages SET compacted = 1 "
+            "WHERE chat_id = ? AND compacted = 0 AND created_at < ?",
             (chat_id, cutoff),
         )
 
-        # Find the earliest remaining message's timestamp to place summary before it
+        # Find the earliest remaining active message's timestamp to place summary before it
         cursor = await self.db.execute(
-            "SELECT MIN(created_at) as earliest FROM messages WHERE chat_id = ?",
+            "SELECT MIN(created_at) as earliest FROM messages "
+            "WHERE chat_id = ? AND compacted = 0",
             (chat_id,),
         )
         earliest_row = await cursor.fetchone()
@@ -178,8 +232,50 @@ class AgentDatabase:
         row = await cursor.fetchone()
         count = row["cnt"] if row else 0
         await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        # Rebuild FTS index to remove stale entries from deleted messages
+        await self.db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         await self.db.commit()
         return count
+
+    # ── Full-text search ─────────────────────────────────────────────
+
+    async def search_history(
+        self, query: str, *, chat_id: str | None = None, limit: int = 20
+    ) -> list[dict]:
+        """Full-text search across conversation history using FTS5.
+
+        Returns matching messages with snippets highlighting the matched terms.
+        """
+        if chat_id:
+            cursor = await self.db.execute(
+                "SELECT m.chat_id, m.role, m.created_at, "
+                "  snippet(messages_fts, 0, '>>>', '<<<', '...', 64) as snippet "
+                "FROM messages_fts "
+                "JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ? AND m.chat_id = ? "
+                "ORDER BY rank LIMIT ?",
+                (query, chat_id, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT m.chat_id, m.role, m.created_at, "
+                "  snippet(messages_fts, 0, '>>>', '<<<', '...', 64) as snippet "
+                "FROM messages_fts "
+                "JOIN messages m ON m.id = messages_fts.rowid "
+                "WHERE messages_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (query, limit),
+            )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "chat_id": r["chat_id"],
+                "role": r["role"],
+                "created_at": r["created_at"],
+                "snippet": r["snippet"],
+            }
+            for r in rows
+        ]
 
     # ── Pending messages ──────────────────────────────────────────────
 

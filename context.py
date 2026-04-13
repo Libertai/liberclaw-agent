@@ -11,6 +11,7 @@ def build_static_system_prompt(
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
+    heartbeat_interval: int = 0,
 ) -> str:
     """Assemble the static (cacheable) portion of the system prompt.
 
@@ -43,10 +44,72 @@ def build_static_system_prompt(
         "You have persistent memory. To remember things across conversations:\n"
         f"- Long-term: Write to `{workspace_path}/memory/MEMORY.md` using write_file or edit_file\n"
         f"- Daily notes: Write to `{workspace_path}/memory/{today}.md`\n"
-        "- Save user preferences, project context, and important facts to MEMORY.md\n"
+        f"- User profile: Write to `{workspace_path}/memory/USER.md`\n"
+        "- Save project context and important facts to MEMORY.md\n"
         "- Save session-specific notes to daily files\n"
-        "- Read skill files for detailed instructions when a skill is relevant"
+        "- Read skill files for detailed instructions when a skill is relevant\n\n"
+        "### User Profile (USER.md)\n\n"
+        "Create and maintain USER.md to remember who you're working with. Update it "
+        "when you learn new things about the user. Include:\n"
+        "- Communication style preferences (concise vs detailed, formal vs casual)\n"
+        "- Technical expertise level and domains\n"
+        "- Timezone and locale\n"
+        "- Preferred languages, frameworks, or tools\n"
+        "- Any stated preferences or recurring requests\n\n"
+        "Project context files (CONTEXT.md, AGENTS.md, .hermes.md, CLAUDE.md) "
+        "in the workspace root are automatically loaded into your context if present."
     )
+
+    # File and image handling
+    sections.append(
+        "## Files & Images\n\n"
+        "When the user sends a file or mentions an uploaded file, use `read_file` to examine it. "
+        "This works for images too: `read_file` on an image file (png, jpg, gif, webp, bmp) "
+        "lets you see the image contents. Never say you can't see an image without trying `read_file` first.\n\n"
+        "Binary files (executables, archives, databases, media, etc.) are detected automatically. "
+        "You cannot read them as text, but you can inspect them using bash commands like "
+        "`file <path>`, `xxd <path> | head`, or `strings <path>`. "
+        "You can install any tools or libraries you need with `apt-get install -y <package>` or `pip install <package>`.\n\n"
+        "`web_fetch` downloads binary files to the `downloads/` directory in your workspace. "
+        "Use `read_file`, `bash`, or specialized tools to work with downloaded files."
+    )
+
+    # Skill creation nudge
+    sections.append(
+        "## Skill Creation\n\n"
+        "When you solve a complex or multi-step problem that could come up again, "
+        "save it as a reusable skill by writing a SKILL.md file to "
+        f"`{workspace_path}/skills/<name>/SKILL.md`. Use YAML frontmatter with "
+        "`name` and `description` fields, then document the approach and key steps. "
+        "Only do this for genuinely reusable procedures, not one-off tasks."
+    )
+
+    # Scheduling system
+    sections.append(
+        "## Cron Scheduler\n\n"
+        "You have a cron scheduler that runs jobs defined in "
+        f"`{workspace_path}/cron.json`. Each job has an id, schedule (standard "
+        "5-field cron expression: minute hour day-of-month month day-of-week), "
+        "task (message sent to you), and enabled flag.\n\n"
+        "Example cron.json:\n"
+        '```json\n[\n  {"id": "daily-check", "schedule": "0 9 * * *", '
+        '"task": "Check GitHub PRs", "enabled": true}\n]\n```\n\n'
+        "- Create/edit cron.json with your file tools to self-schedule recurring tasks\n"
+        "- Supports: `*`, ranges (`1-5`), lists (`1,3,5`), steps (`*/5`)\n"
+        "- Jobs run at most once per minute; disabled jobs are skipped\n"
+        "- Each job runs as a separate conversation (chat_id: `__cron_<id>__`)"
+    )
+    # Legacy heartbeat fallback (only when enabled and no cron.json)
+    if heartbeat_interval > 0:
+        interval_min = max(1, heartbeat_interval // 60)
+        sections.append(
+            "## Legacy Heartbeat\n\n"
+            f"If no `cron.json` exists, a legacy heartbeat checks "
+            f"`{workspace_path}/HEARTBEAT.md` every {interval_min} minutes.\n\n"
+            "- Create HEARTBEAT.md with a checklist of periodic tasks\n"
+            "- If nothing needs attention, reply with just: HEARTBEAT_OK\n"
+            "- Prefer using cron.json for new scheduled tasks"
+        )
 
     return "\n\n---\n\n".join(sections)
 
@@ -60,6 +123,11 @@ def build_dynamic_context(workspace_path: str) -> str:
     workspace = Path(workspace_path)
     sections = []
 
+    # User profile (loaded before memory for prominence)
+    user_profile = _load_user_profile(workspace)
+    if user_profile:
+        sections.append(f"## User Profile\n\n{user_profile}")
+
     memory = _load_memory(workspace)
     if memory:
         sections.append(f"## Memory\n\n{memory}")
@@ -67,6 +135,10 @@ def build_dynamic_context(workspace_path: str) -> str:
     skills = _load_skills_summary(workspace)
     if skills:
         sections.append(f"## Available Skills\n\n{skills}")
+
+    context_files = _load_context_files(workspace)
+    if context_files:
+        sections.append(f"## Project Context\n\n{context_files}")
 
     return "\n\n---\n\n".join(sections) if sections else ""
 
@@ -76,9 +148,13 @@ def build_system_prompt(
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
+    heartbeat_interval: int = 0,
 ) -> str:
     """Full system prompt (static + dynamic). Used for non-cached contexts."""
-    static = build_static_system_prompt(user_prompt, agent_name, workspace_path, tool_names)
+    static = build_static_system_prompt(
+        user_prompt, agent_name, workspace_path, tool_names,
+        heartbeat_interval=heartbeat_interval,
+    )
     dynamic = build_dynamic_context(workspace_path)
     if dynamic:
         return static + "\n\n---\n\n" + dynamic
@@ -126,24 +202,84 @@ def build_subagent_prompt(
     return "\n\n---\n\n".join(sections)
 
 
+def _load_user_profile(workspace: Path) -> str:
+    """Load workspace/memory/USER.md if it exists."""
+    user_file = workspace / "memory" / "USER.md"
+    try:
+        if user_file.exists():
+            content = user_file.read_text().strip()
+            if content:
+                return content
+    except (OSError, UnicodeDecodeError):
+        pass  # Corrupted or unreadable file — skip silently
+    return ""
+
+
+_CONTEXT_FILENAMES = ("CONTEXT.md", "AGENTS.md", ".hermes.md", "CLAUDE.md")
+_CONTEXT_MAX_CHARS = 20_000
+
+
+def _load_context_files(workspace: Path) -> str:
+    """Scan workspace root for project context files.
+
+    Checks for files in priority order and loads ALL that exist,
+    enforcing a total size limit to avoid bloating the context.
+    """
+    parts: list[str] = []
+    total = 0
+
+    for filename in _CONTEXT_FILENAMES:
+        path = workspace / filename
+        if not path.exists():
+            continue
+        try:
+            content = path.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            continue  # Skip unreadable files
+        if not content:
+            continue
+
+        header = f"### {filename}"
+        entry = f"{header}\n\n{content}"
+
+        if total + len(entry) > _CONTEXT_MAX_CHARS:
+            remaining = _CONTEXT_MAX_CHARS - total
+            if remaining > len(header) + 50:
+                truncated = entry[:remaining]
+                truncated += f"\n\n... (truncated — {filename} exceeded context limit)"
+                parts.append(truncated)
+            break
+
+        parts.append(entry)
+        total += len(entry)
+
+    return "\n\n".join(parts)
+
+
 def _load_memory(workspace: Path) -> str:
     """Load MEMORY.md and today's daily notes."""
     parts = []
 
     # Long-term memory
     memory_file = workspace / "memory" / "MEMORY.md"
-    if memory_file.exists():
-        content = memory_file.read_text().strip()
-        if content:
-            parts.append(f"### Long-term Memory\n\n{content}")
+    try:
+        if memory_file.exists():
+            content = memory_file.read_text().strip()
+            if content:
+                parts.append(f"### Long-term Memory\n\n{content}")
+    except (OSError, UnicodeDecodeError):
+        pass
 
     # Today's daily notes
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_file = workspace / "memory" / f"{today}.md"
-    if daily_file.exists():
-        content = daily_file.read_text().strip()
-        if content:
-            parts.append(f"### Today's Notes ({today})\n\n{content}")
+    try:
+        if daily_file.exists():
+            content = daily_file.read_text().strip()
+            if content:
+                parts.append(f"### Today's Notes ({today})\n\n{content}")
+    except (OSError, UnicodeDecodeError):
+        pass
 
     return "\n\n".join(parts)
 
@@ -161,8 +297,12 @@ def _load_skills_summary(workspace: Path) -> str:
         skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             continue
+        try:
+            skill_content = skill_file.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
         name, description = _parse_skill_metadata(
-            skill_dir.name, skill_file.read_text()
+            skill_dir.name, skill_content
         )
         lines.append(f"- **{name}**: {description} (read `{skill_file}` for details)")
 

@@ -1,7 +1,9 @@
 """FastAPI application deployed to each agent VM."""
 
 import asyncio
+import base64
 import hashlib
+import hmac as _hmac
 import json
 import logging
 import secrets
@@ -12,9 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from baal_agent.compaction import maybe_compact
 from baal_agent.config import AgentSettings
@@ -23,7 +27,20 @@ from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
 from baal_agent.telegram_bot import TelegramBot
-from baal_agent.tools import configure_tools, execute_tool, get_tool_definitions
+from baal_agent.plugins import PluginManager
+from baal_agent.scheduler import CronScheduler
+from baal_agent.tools import (
+    configure_tools,
+    execute_tool,
+    get_tool_definitions,
+    shutdown_code_executor,
+    shutdown_mcp,
+    shutdown_processes,
+    shutdown_shell,
+    start_code_executor,
+    start_mcp,
+    start_shell,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +48,8 @@ settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
 
-_heartbeat_task: asyncio.Task | None = None
+_scheduler: CronScheduler | None = None
+_plugin_manager: PluginManager | None = None
 _telegram_bot: TelegramBot | None = None
 _telegram_bot_task: asyncio.Task | None = None
 
@@ -87,7 +105,7 @@ class ChatRun:
     done: bool = False
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
-    user_message: str = ""
+    user_message: str | list[dict] = ""
 
 
 _active_runs: dict[str, ChatRun] = {}  # keyed by chat_id
@@ -106,12 +124,16 @@ def _prune_old_chat_runs():
 
 # ── Telegram callback ────────────────────────────────────────────────
 
-async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
-    """Callback for TelegramBot: run an agent turn and return the response text.
+async def _telegram_agent_turn(
+    message: str | list[dict], chat_id: str
+) -> tuple[str | None, list[dict]]:
+    """Callback for TelegramBot: run an agent turn and return (text, file_events).
 
     Registers a ChatRun in _active_runs so cancel_chat_run() works for /stop.
     """
     from baal_agent.telegram_bot import TELEGRAM_CHANNEL_HINT
+
+    file_events: list[dict] = []
 
     # Register in _active_runs so /stop can cancel this turn
     run = ChatRun(
@@ -121,7 +143,10 @@ async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
     )
 
     async def _do_turn():
-        return await _run_agent_turn(message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT)
+        return await _run_agent_turn(
+            message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT,
+            file_events=file_events,
+        )
 
     run.task = asyncio.create_task(_do_turn())
     _active_runs[chat_id] = run
@@ -131,25 +156,34 @@ async def _telegram_agent_turn(message: str, chat_id: str) -> str | None:
     finally:
         run.done = True
         run.completed_at = time.time()
-    return result
+    return result, file_events
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _heartbeat_task, _telegram_bot, _telegram_bot_task
+    global _scheduler, _plugin_manager, _telegram_bot, _telegram_bot_task
     await db.initialize()
-    configure_tools(settings.workspace_path)
+    configure_tools(settings.workspace_path, db=db, inference=inference, model=settings.model)
+    await start_shell()
+    await start_code_executor()
+    await start_mcp(settings.mcp_servers)
 
     # Ensure workspace directories exist
     workspace = Path(settings.workspace_path)
     (workspace / "memory").mkdir(parents=True, exist_ok=True)
     (workspace / "skills").mkdir(parents=True, exist_ok=True)
 
-    # Start heartbeat if configured
-    if settings.heartbeat_interval > 0:
-        _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    # Load plugins from workspace/plugins/
+    _plugin_manager = PluginManager(settings.workspace_path)
+    _plugin_manager.load_plugins()
+
+    # Start cron scheduler (replaces old heartbeat loop).
+    # It reads workspace/cron.json every tick and falls back to the legacy
+    # HEARTBEAT.md behaviour when no cron.json exists.
+    _scheduler = CronScheduler(settings.workspace_path, heartbeat_interval=settings.heartbeat_interval)
+    await _scheduler.start(_run_cron_job)
 
     # Start Telegram bot if configured
     if settings.telegram_bot_token:
@@ -159,6 +193,7 @@ async def lifespan(app: FastAPI):
             db=db,
             agent_turn_callback=_telegram_agent_turn,
             cancel_run_callback=cancel_chat_run,
+            workspace_path=settings.workspace_path,
         )
         try:
             await _telegram_bot.start()
@@ -179,16 +214,16 @@ async def lifespan(app: FastAPI):
     if _telegram_bot:
         await _telegram_bot.stop()
 
-    if _heartbeat_task and not _heartbeat_task.done():
-        _heartbeat_task.cancel()
-        try:
-            await _heartbeat_task
-        except asyncio.CancelledError:
-            pass
+    if _scheduler:
+        await _scheduler.stop()
     # Cancel all active chat runs
     for run in _active_runs.values():
         if not run.done and not run.task.done():
             run.task.cancel()
+    await shutdown_mcp()
+    await shutdown_processes()
+    await shutdown_code_executor()
+    await shutdown_shell()
     await db.close()
 
 
@@ -197,10 +232,17 @@ app = FastAPI(title=f"Baal Agent: {settings.agent_name}", lifespan=lifespan)
 
 # ── Auth middleware ────────────────────────────────────────────────────
 
+PUBLIC_PREFIXES = ("/dl/", "/assets/", "/static/")
+PUBLIC_PATHS = {"/health", "/", "/index.html", "/favicon.ico", "/manifest.json"}
+
+
 @app.middleware("http")
 async def verify_auth(request: Request, call_next):
-    """Reject requests without a valid Bearer token (except /health)."""
-    if request.url.path == "/health":
+    """Reject requests without a valid Bearer token, except public paths."""
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    path = request.url.path
+    if path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES):
         return await call_next(request)
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     token_hash = hashlib.sha256(token.encode()).hexdigest() if token else ""
@@ -209,10 +251,24 @@ async def verify_auth(request: Request, call_next):
     return await call_next(request)
 
 
+# ── CORS (registered last so it wraps auth as the outermost layer) ─────
+
+if settings.local_ui_enabled:
+    _cors_origins = [o.strip() for o in settings.local_ui_cors_origins.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins or ["*"],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "DELETE", "PUT", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        expose_headers=["Content-Type"],
+    )
+
+
 # ── Core agentic loop ─────────────────────────────────────────────────
 
 async def _run_agent_turn(
-    message: str,
+    message: str | list[dict],
     chat_id: str,
     *,
     restricted: bool = False,
@@ -241,6 +297,10 @@ async def _run_agent_turn(
     iterations = max_iterations or settings.max_tool_iterations
     tools = get_tool_definitions(include_spawn=not restricted)
     tool_names = [t["function"]["name"] for t in tools]
+    pending_images: list[dict] = []
+
+    def _stash_images(blocks: list[dict]):
+        pending_images.extend(blocks)
 
     if store_history:
         # Use static prompt + dynamic context injection for KV cache preservation.
@@ -251,6 +311,7 @@ async def _run_agent_turn(
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
+            heartbeat_interval=settings.heartbeat_interval,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
         if channel_hint:
@@ -272,11 +333,13 @@ async def _run_agent_turn(
                 settings.agent_name,
                 settings.workspace_path,
                 tool_names=tool_names,
+                heartbeat_interval=settings.heartbeat_interval,
             )
         messages = [{"role": "system", "content": system_prompt}]
         messages.append({"role": "user", "content": message})
 
     final_text = None
+    total_tool_calls = 0
 
     for _iteration in range(iterations):
         assistant_msg = await inference.chat(
@@ -288,6 +351,7 @@ async def _run_agent_turn(
 
         tc_for_db = None
         if tool_calls:
+            total_tool_calls += len(tool_calls)
             tc_for_db = [
                 {
                     "id": tc.id,
@@ -314,17 +378,49 @@ async def _run_agent_turn(
             final_text = text_content
 
         if not tool_calls:
+            # Auto-skill nudge (Task 1.4): if the turn used many tools,
+            # ask the agent to consider saving the procedure as a skill.
+            skill_text = await _maybe_skill_nudge(
+                total_tool_calls, messages, chat_id, store_history, tools,
+            )
+            if skill_text:
+                final_text = skill_text
             return final_text
 
-        for tc in tool_calls:
-            name = tc.function.name
+        # Execute tool calls concurrently
+        async def _exec_tool(tc):
+            tool_name = tc.function.name
             arguments = tc.function.arguments
 
-            # Handle spawn tool specially
-            if name == "spawn" and not restricted:
+            # Plugin pre_tool hook
+            if _plugin_manager is not None:
+                arguments = await _plugin_manager.fire_modify(
+                    "pre_tool", arguments, tool_name,
+                )
+
+            if tool_name == "spawn" and not restricted:
                 result = await _handle_spawn(arguments, chat_id)
             else:
-                result = await execute_tool(name, arguments)
+                result = await execute_tool(
+                    tool_name, arguments,
+                    image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                )
+
+            # Plugin post_tool hook
+            if _plugin_manager is not None:
+                result = await _plugin_manager.fire_modify(
+                    "post_tool", result, tool_name,
+                )
+
+            return result
+
+        results = await asyncio.gather(
+            *[_exec_tool(tc) for tc in tool_calls], return_exceptions=True
+        )
+
+        for tc, result in zip(tool_calls, results):
+            if isinstance(result, BaseException):
+                result = f"Error executing {tc.function.name}: {result}"
 
             # Detect send_file markers and accumulate for callers
             if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -343,7 +439,100 @@ async def _run_agent_turn(
                 "content": result,
             })
 
+        # Inject any images collected from tool results as a user message
+        if pending_images:
+            messages.append({"role": "user", "content": list(pending_images)})
+            pending_images.clear()
+
     return final_text
+
+
+# ── Auto-skill nudge ─────────────────────────────────────────────────
+
+async def _maybe_skill_nudge(
+    total_tool_calls: int,
+    messages: list[dict],
+    chat_id: str,
+    store_history: bool,
+    tools: list[dict],
+) -> str | None:
+    """If the turn used many tools, nudge the agent to consider saving a skill.
+
+    Runs one additional inference iteration so the agent can decide whether
+    to create a skill file. Returns the agent's text response if any.
+    """
+    threshold = settings.auto_skill_threshold
+    if threshold <= 0 or total_tool_calls < threshold:
+        return None
+
+    nudge = (
+        f"[System] You completed a complex task with {total_tool_calls} tool calls. "
+        f"If this procedure might be useful again, consider saving it as a skill at "
+        f"workspace/skills/<name>/SKILL.md with YAML frontmatter (name, description)."
+    )
+
+    if store_history:
+        await db.add_message(chat_id, "user", nudge)
+    messages.append({"role": "user", "content": nudge})
+
+    try:
+        response = await inference.chat(
+            messages=messages, model=settings.model, tools=tools
+        )
+
+        text = response.content
+        tool_calls = response.tool_calls
+
+        tc_for_db = None
+        if tool_calls:
+            tc_for_db = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in tool_calls
+            ]
+
+        if store_history:
+            await db.add_message(chat_id, "assistant", text, tool_calls=tc_for_db)
+
+        # Append assistant message (with tool_calls) to messages list so
+        # subsequent tool result messages have the correct conversation structure
+        if tool_calls:
+            assistant_dict: dict = {"role": "assistant"}
+            if text:
+                assistant_dict["content"] = text
+            assistant_dict["tool_calls"] = tc_for_db
+            messages.append(assistant_dict)
+
+        # Execute any tool calls (the agent may write a skill file)
+        if tool_calls:
+            for tc in tool_calls:
+                result = await execute_tool(
+                    tc.function.name, tc.function.arguments,
+                    pii_redaction=settings.pii_redaction_enabled,
+                )
+                if store_history:
+                    await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+            # Let the model see the tool results and produce a final response
+            try:
+                final = await inference.chat(messages=messages, model=settings.model, tools=None)
+                if final.content and store_history:
+                    await db.add_message(chat_id, "assistant", final.content)
+                return final.content
+            except Exception:
+                pass  # If follow-up fails, return the original text
+
+        return text
+    except Exception as e:
+        logger.warning(f"Auto-skill nudge inference failed: {e}")
+        return None
 
 
 # ── Spawn / subagent ──────────────────────────────────────────────────
@@ -470,63 +659,25 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         )
 
 
-# ── Heartbeat ─────────────────────────────────────────────────────────
+# ── Cron job callback ────────────────────────────────────────────────
 
-def _is_heartbeat_empty(content: str) -> bool:
-    """Check if heartbeat file has no actionable content."""
-    for line in content.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("<!--") and stripped.endswith("-->"):
-            continue
-        # Unchecked checkbox counts as actionable
-        if stripped.startswith("- [ ]"):
-            return False
-        # Any non-header, non-comment text is actionable
-        return False
-    return True
-
-
-async def _heartbeat_loop():
-    """Periodic heartbeat — check HEARTBEAT.md and run tasks."""
-    while True:
-        await asyncio.sleep(settings.heartbeat_interval)
-        try:
-            heartbeat_file = Path(settings.workspace_path) / "HEARTBEAT.md"
-            if not heartbeat_file.exists():
-                continue
-            content = heartbeat_file.read_text()
-            if _is_heartbeat_empty(content):
-                continue
-
-            files: list[dict] = []
-            result = await _run_agent_turn(
-                "Read HEARTBEAT.md and follow any instructions or tasks listed there. "
-                "If nothing needs attention, reply with just: HEARTBEAT_OK",
-                chat_id="__heartbeat__",
-                store_history=False,
-                file_events=files,
-            )
-
-            if result and "HEARTBEAT_OK" not in result.upper().replace("_", ""):
-                if settings.owner_chat_id:
-                    await db.add_pending(
-                        settings.owner_chat_id,
-                        f"[Heartbeat] {result}",
-                        source="heartbeat",
-                    )
-            if settings.owner_chat_id:
-                for fe in files:
-                    await db.add_pending(
-                        settings.owner_chat_id,
-                        json.dumps({"type": "file", "path": fe["path"], "caption": fe["caption"]}),
-                        source="heartbeat_file",
-                    )
-        except Exception as e:
-            logger.error(f"Heartbeat error: {e}")
+async def _run_cron_job(task: str, job_id: str):
+    """Callback invoked by the CronScheduler for each due job."""
+    chat_id = f"__cron_{job_id}__"
+    files: list[dict] = []
+    try:
+        result = await _run_agent_turn(
+            task,
+            chat_id=chat_id,
+            store_history=True,
+            file_events=files,
+        )
+        if result:
+            logger.info(f"Cron job {job_id!r} produced output ({len(result)} chars)")
+        else:
+            logger.debug(f"Cron job {job_id!r}: no output")
+    except Exception as e:
+        logger.error(f"Cron job {job_id!r} failed: {e}")
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────
@@ -561,8 +712,33 @@ def _sse_keepalive() -> str:
 # ── Endpoints ─────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str | list[dict]
     chat_id: str
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, v):
+        if isinstance(v, str):
+            if not v.strip():
+                raise ValueError("message must not be empty")
+            return v
+        # list[dict] — validate structure
+        if not v:
+            raise ValueError("message list must not be empty")
+        has_text = False
+        image_count = 0
+        for item in v:
+            if not isinstance(item, dict) or "type" not in item:
+                raise ValueError("each content block must have a 'type' field")
+            if item["type"] == "text":
+                has_text = True
+            elif item["type"] == "image_url":
+                image_count += 1
+        if not has_text:
+            raise ValueError("message must contain at least one text block")
+        if image_count > 10:
+            raise ValueError("message must not contain more than 10 images")
+        return v
 
 
 async def _emit(run: ChatRun, data: dict):
@@ -572,11 +748,20 @@ async def _emit(run: ChatRun, data: dict):
         run.condition.notify_all()
 
 
-async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
+async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[dict]):
     """Background agentic loop — emits SSE events to run.events buffer."""
     try:
+        # Reload plugins so newly created plugins take effect immediately
+        if _plugin_manager is not None:
+            _plugin_manager.load_plugins()
+            await _plugin_manager.fire("on_session_start", chat_id)
+
         tools = get_tool_definitions(include_spawn=True)
         tool_names = [t["function"]["name"] for t in tools]
+        pending_images: list[dict] = []
+
+        def _stash_images(blocks: list[dict]):
+            pending_images.extend(blocks)
 
         # Use static prompt + dynamic context injection for KV cache preservation
         system_prompt = build_static_system_prompt(
@@ -584,6 +769,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
             settings.agent_name,
             settings.workspace_path,
             tool_names=tool_names,
+            heartbeat_interval=settings.heartbeat_interval,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
 
@@ -594,6 +780,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
         )
 
         inference_timeout = settings.inference_timeout
+        total_tool_calls = 0
 
         for _iteration in range(settings.max_tool_iterations):
             # Call inference with loop-level retry.
@@ -640,6 +827,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
 
             tc_for_db = None
             if tool_calls:
+                total_tool_calls += len(tool_calls)
                 tc_for_db = [
                     {
                         "id": tc.id,
@@ -667,25 +855,57 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
                 await _emit(run, {"type": "text", "content": text_content})
 
             if not tool_calls:
+                # Auto-skill nudge for SSE path
+                skill_text = await _maybe_skill_nudge(
+                    total_tool_calls, messages, chat_id,
+                    store_history=True, tools=tools,
+                )
+                if skill_text:
+                    await _emit(run, {"type": "text", "content": skill_text})
                 return
 
+            # Emit tool_use SSE events for all tools before execution
             for tc in tool_calls:
-                name = tc.function.name
+                await _emit(run, {"type": "tool_use", "name": tc.function.name, "input": tc.function.arguments})
+
+            # Execute tool calls concurrently
+            async def _exec_tool_sse(tc):
+                tool_name = tc.function.name
                 arguments = tc.function.arguments
-                await _emit(run, {"type": "tool_use", "name": name, "input": arguments})
 
-                if name == "spawn":
-                    coro = _handle_spawn(arguments, chat_id)
-                else:
-                    coro = execute_tool(name, arguments)
-
-                try:
-                    result = await coro
-                except Exception as tool_error:
-                    logger.error(
-                        f"Tool {name} raised: {tool_error}", exc_info=tool_error
+                # Plugin pre_tool hook: may modify arguments
+                if _plugin_manager is not None:
+                    arguments = await _plugin_manager.fire_modify(
+                        "pre_tool", arguments, tool_name,
                     )
-                    result = f"Error executing {name}: {tool_error}"
+
+                if tool_name == "spawn":
+                    result = await _handle_spawn(arguments, chat_id)
+                else:
+                    result = await execute_tool(
+                        tool_name, arguments,
+                        image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                    )
+
+                # Plugin post_tool hook: may modify result
+                if _plugin_manager is not None:
+                    result = await _plugin_manager.fire_modify(
+                        "post_tool", result, tool_name,
+                    )
+
+                return result
+
+            results = await asyncio.gather(
+                *[_exec_tool_sse(tc) for tc in tool_calls], return_exceptions=True
+            )
+
+            # Process results in original order
+            for tc, result in zip(tool_calls, results):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        f"Tool {tc.function.name} raised: {result}", exc_info=result
+                    )
+                    result = f"Error executing {tc.function.name}: {result}"
 
                 # Detect send_file markers and emit file SSE event
                 if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -704,6 +924,11 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
                     "content": result,
                 })
 
+            # Inject any images collected from tool results as a user message
+            if pending_images:
+                messages.append({"role": "user", "content": list(pending_images)})
+                pending_images.clear()
+
         await _emit(run, {"type": "text", "content": "(Reached maximum tool iterations)"})
 
     except asyncio.CancelledError:
@@ -717,6 +942,12 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str):
         except asyncio.CancelledError:
             run.events.append({"type": "error", "content": str(e)})
     finally:
+        # Fire session end hook (best-effort)
+        if _plugin_manager is not None:
+            try:
+                await _plugin_manager.fire("on_session_end", chat_id)
+            except Exception:
+                pass  # never let plugin errors block cleanup
         # Always emit done and mark run as finished — force-append to avoid
         # re-cancellation in the finally block leaving run.done=False forever
         run.events.append({"type": "done"})
@@ -887,6 +1118,74 @@ async def serve_file(file_path: str):
         return JSONResponse(status_code=403, content={"error": str(e)})
 
 
+# ── Direct download tokens ──────────────────────────────────────────
+# Short-lived HMAC tokens that let users download files directly from
+# the VM without proxying through the LiberClaw API.
+
+_DOWNLOAD_TOKEN_TTL = 300  # 5 minutes
+
+
+def _sign_download_token(file_path: str, expires: int) -> str:
+    """Create an HMAC-SHA256 signature for a download token."""
+    msg = f"{file_path}\n{expires}".encode()
+    return _hmac.new(
+        settings.agent_secret_hash.encode(), msg, hashlib.sha256
+    ).hexdigest()
+
+
+@app.post("/files/token")
+async def create_download_token(request: Request):
+    """Generate a short-lived download token for a file (requires auth)."""
+    body = await request.json()
+    file_path = body.get("path", "")
+    if not file_path:
+        return JSONResponse(status_code=400, content={"error": "path is required"})
+    # Validate the file exists and is safe to serve
+    try:
+        validate_workspace_path(
+            file_path, settings.workspace_path, must_exist=True, reject_sensitive=True
+        )
+    except PathSecurityError as e:
+        return JSONResponse(status_code=403, content={"error": str(e)})
+    expires = int(time.time()) + _DOWNLOAD_TOKEN_TTL
+    sig = _sign_download_token(file_path, expires)
+    token = f"{file_path}:{expires}:{sig}"
+    url_token = base64.urlsafe_b64encode(token.encode()).decode()
+    return {"token": url_token, "expires_in": _DOWNLOAD_TOKEN_TTL}
+
+
+@app.get("/dl/{token}")
+async def direct_download(token: str):
+    """Serve a file using a short-lived signed token (no auth required)."""
+    try:
+        decoded = base64.urlsafe_b64decode(token).decode()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    parts = decoded.rsplit(":", 2)
+    if len(parts) != 3:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    file_path, expires_str, sig = parts
+    try:
+        expires = int(expires_str)
+    except ValueError:
+        return JSONResponse(status_code=400, content={"error": "invalid token"})
+    if time.time() > expires:
+        return JSONResponse(status_code=410, content={"error": "token expired"})
+    expected_sig = _sign_download_token(file_path, expires)
+    if not _hmac.compare_digest(sig, expected_sig):
+        return JSONResponse(status_code=403, content={"error": "invalid signature"})
+    try:
+        resolved = validate_workspace_path(
+            file_path, settings.workspace_path, must_exist=True, reject_sensitive=True
+        )
+        # Sanitize filename for Content-Disposition header
+        import re as _re
+        safe_name = _re.sub(r'[^\w\-. ]', '', resolved.name).strip() or "download"
+        return FileResponse(resolved, filename=safe_name)
+    except PathSecurityError:
+        return JSONResponse(status_code=403, content={"error": "access denied"})
+
+
 @app.get("/workspace/tree")
 async def workspace_tree(max_depth: int = 5):
     """Return recursive workspace file tree."""
@@ -926,22 +1225,43 @@ async def upload_file(
         return JSONResponse(status_code=403, content={"error": str(e)})
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_file = target_dir / file.filename
+    if not file.filename:
+        return JSONResponse(status_code=400, content={"error": "filename is required"})
+    safe_filename = Path(file.filename).name
+    target_file = target_dir / safe_filename
 
     content = await file.read()
     if len(content) > MAX_SEND_FILE_SIZE:
         return JSONResponse(status_code=413, content={"error": "File too large (50MB max)"})
 
+    # Validate final path is within workspace
+    try:
+        target_file.resolve().relative_to(workspace_root)
+    except ValueError:
+        return JSONResponse(status_code=403, content={"error": "Invalid filename"})
+
     target_file.write_bytes(content)
     rel = str(target_file.relative_to(workspace_root))
-    return {"path": rel, "size": len(content), "name": file.filename}
+    return {"path": rel, "size": len(content), "name": safe_filename}
 
 
 @app.get("/health")
 async def health():
     from baal_agent import AGENT_VERSION
 
-    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION}
+    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": ["vision"]}
+
+
+@app.get("/info")
+async def info():
+    return {
+        "agent_name": settings.agent_name,
+        "model": settings.model,
+        "system_prompt": settings.system_prompt,
+        "capabilities": ["vision"],
+        "tools": [t["function"]["name"] for t in get_tool_definitions(include_spawn=True)],
+        "heartbeat_interval": settings.heartbeat_interval,
+    }
 
 
 # ── Subagent management endpoints ─────────────────────────────────────
@@ -1070,3 +1390,15 @@ async def delete_telegram_contact(telegram_id: str):
     if not deleted:
         return JSONResponse(status_code=404, content={"error": "Contact not found"})
     return {"status": "ok", "telegram_id": telegram_id}
+
+
+# ── Local web UI static mount (must be last, after all API routes) ─────
+
+if settings.local_ui_enabled:
+    _dist_dir = (
+        Path(settings.local_ui_dist_path)
+        if settings.local_ui_dist_path
+        else Path(__file__).parent / "webui" / "dist"
+    )
+    if _dist_dir.is_dir():
+        app.mount("/", StaticFiles(directory=str(_dist_dir), html=True), name="webui")

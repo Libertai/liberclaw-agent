@@ -31,7 +31,7 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 - **Memory**: Persistent file-based memory at `workspace/memory/MEMORY.md` (long-term) and daily notes
 - **Skills**: Markdown skill files at `workspace/skills/*/SKILL.md` — summaries are injected into context, full content loaded on demand
 - **Subagents**: Spawn background workers for parallel tasks with their own tool sets (no further spawning)
-- **Heartbeat**: Periodic check of `HEARTBEAT.md` for autonomous task execution
+- **Heartbeat**: Periodic check of `workspace/HEARTBEAT.md` for autonomous task execution (configurable interval, results stored in chat history)
 - **Security**: Bearer token auth, workspace path sandboxing, bash command deny patterns, sensitive file protection
 
 ## API
@@ -66,6 +66,41 @@ WORKSPACE_PATH=/tmp/agent-workspace \
   uvicorn baal_agent.main:app --port 8080
 ```
 
+## Local Web UI
+
+The agent serves a browser chat UI at `/` (provided `sites/agent-ui/` has been built). Users point their browser at the agent's HTTPS URL (for LiberClaw-deployed agents) or `http://localhost:8080` (for standalone installs) and log in with their `AGENT_SECRET`.
+
+LiberClaw users can click the "Open direct chat" button on the agent detail screen to open the UI in a new tab with the token pre-filled in the URL fragment (`https://<agent-fqdn>/#token=<secret>&chat=<chat_id>`). The fragment is scrubbed by the SPA's bootstrap code before React mounts, so the secret never reaches server logs.
+
+### Building the SPA
+
+The SPA is built from `sites/agent-ui/` (in the parent repo) into `src/baal_agent/webui/dist/`. For standalone installs:
+
+```bash
+cd /path/to/baal
+cd sites/agent-ui
+npm install
+npm run build
+```
+
+For LiberClaw-orchestrated deploys, the build runs automatically as a pre-deploy hook (see `src/liberclaw/services/agent_manager.py:ensure_agent_ui_built`). The deployer tars the entire `baal_agent` package over SSH, so anything in `src/baal_agent/webui/dist/` ships with the agent automatically — no deployer changes needed.
+
+### Local UI environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOCAL_UI_ENABLED` | `True` | Whether to mount the SPA and CORS at all |
+| `LOCAL_UI_CORS_ORIGINS` | `*` | Comma-separated list of allowed origins |
+| `LOCAL_UI_DIST_PATH` | *(empty)* | Absolute path to the built SPA; empty falls back to `<package>/webui/dist` |
+
+### Versioning
+
+`AGENT_VERSION` in `baal_agent/__init__.py` is bumped whenever a feature requires server-side support — new endpoints, auth changes, API shape changes, etc. LiberClaw checks this value via `/health` to decide whether to offer features like direct chat.
+
+**When bumping `AGENT_VERSION`, also update `MIN_DIRECT_CHAT_VERSION` in `src/liberclaw/routers/agents.py` to match** — otherwise LiberClaw will refuse to offer direct chat against agents at the new version.
+
+Old agents (version < 4) do not have the `/info` endpoint, CORS, or the static SPA mount. The LiberClaw frontend handles this by showing an "Update your agent" modal instead of breaking.
+
 ## Configuration
 
 All settings via environment variables:
@@ -78,11 +113,11 @@ All settings via environment variables:
 | `LIBERTAI_API_KEY` | — | API key for inference |
 | `AGENT_SECRET` | — | Bearer token for auth |
 | `WORKSPACE_PATH` | `/opt/baal-agent/workspace` | Root directory for files |
-| `OWNER_CHAT_ID` | — | Chat ID for heartbeat delivery |
+| `OWNER_CHAT_ID` | — | Chat ID for subagent pending message delivery |
 | `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks (0 to disable) |
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
-| `INFERENCE_TIMEOUT` | `180` | Seconds before inference timeout |
+| `INFERENCE_TIMEOUT` | `300` | Seconds before inference timeout |
 
 ## License
 

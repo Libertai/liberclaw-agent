@@ -28,7 +28,7 @@ class InferenceClient:
         self.client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
-            timeout=180.0,  # per-request timeout for the HTTP call
+            timeout=300.0,  # per-request timeout for the HTTP call
             max_retries=0,  # we handle retries ourselves for better logging
         )
 

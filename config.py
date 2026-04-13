@@ -8,7 +8,7 @@ class AgentSettings(BaseSettings):
 
     agent_name: str = "Agent"
     system_prompt: str = "You are a helpful assistant."
-    model: str = "hermes-3-8b-tee"
+    model: str = "claw-core"
     libertai_api_key: str
     agent_secret_hash: str  # SHA-256 hash of the shared secret
     port: int = 8080
@@ -16,12 +16,20 @@ class AgentSettings(BaseSettings):
     max_history: int = 100
     max_tool_iterations: int = 50
     workspace_path: str = "/opt/baal-agent/workspace"
-    owner_chat_id: str = ""  # Telegram chat ID for heartbeat delivery
-    heartbeat_interval: int = 1800  # 30 minutes
+    owner_chat_id: str = ""  # Telegram chat ID for subagent pending message delivery
+    heartbeat_interval: int = 1800  # seconds (0 = disabled)
     max_context_tokens: int = 0  # 0 = auto-detect from model name
     generation_reserve: int = 4096  # tokens reserved for model output
-    compaction_keep_messages: int = 20  # recent messages to preserve during compaction
+    compaction_keep_messages: int = 20  # max recent messages to preserve during compaction
+    compaction_keep_min: int = 6  # minimum messages to keep even under extreme context pressure
     compaction_threshold: float = 0.75  # trigger compaction at this fraction of context budget
-    inference_timeout: int = 180  # seconds — timeout for inference in the SSE loop
+    compaction_flush_enabled: bool = True  # run memory flush before compaction
+    auto_skill_threshold: int = 5  # tool calls to trigger skill nudge (0 = disabled)
+    inference_timeout: int = 300  # seconds — timeout for inference in the SSE loop
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
+    pii_redaction_enabled: bool = True  # redact PII from tool outputs
+    mcp_servers: str = ""  # JSON: [{"name": "...", "transport": "stdio", "command": "...", "args": [...], "env": {...}}]
+    local_ui_enabled: bool = True
+    local_ui_cors_origins: str = "*"  # comma-separated
+    local_ui_dist_path: str = ""  # empty = <package>/webui/dist
