@@ -33,3 +33,4 @@ class AgentSettings(BaseSettings):
     local_ui_enabled: bool = True
     local_ui_cors_origins: str = "*"  # comma-separated
     local_ui_dist_path: str = ""  # empty = <package>/webui/dist
+    agent_fqdn: str = ""  # set by the deployer, used in the system prompt; empty = standalone/local

@@ -312,6 +312,7 @@ async def _run_agent_turn(
             settings.workspace_path,
             tool_names=tool_names,
             heartbeat_interval=settings.heartbeat_interval,
+            fqdn=settings.agent_fqdn,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
         if channel_hint:
@@ -334,6 +335,7 @@ async def _run_agent_turn(
                 settings.workspace_path,
                 tool_names=tool_names,
                 heartbeat_interval=settings.heartbeat_interval,
+                fqdn=settings.agent_fqdn,
             )
         messages = [{"role": "system", "content": system_prompt}]
         messages.append({"role": "user", "content": message})
@@ -770,6 +772,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
             settings.workspace_path,
             tool_names=tool_names,
             heartbeat_interval=settings.heartbeat_interval,
+            fqdn=settings.agent_fqdn,
         )
         dynamic_context = build_dynamic_context(settings.workspace_path)
 

@@ -12,6 +12,7 @@ def build_static_system_prompt(
     workspace_path: str,
     tool_names: list[str] | None = None,
     heartbeat_interval: int = 0,
+    fqdn: str = "",
 ) -> str:
     """Assemble the static (cacheable) portion of the system prompt.
 
@@ -30,6 +31,8 @@ def build_static_system_prompt(
         f"Current date: {today}\n"
         f"Workspace: {workspace_path}"
     )
+    if fqdn:
+        identity += f"\nYour public HTTPS URL: https://{fqdn}"
     if tool_names:
         identity += f"\nAvailable tools: {', '.join(tool_names)}"
     sections.append(identity)
@@ -54,22 +57,28 @@ def build_static_system_prompt(
         "`read_file`/`write_file`/`edit_file` are workspace-scoped; use `bash` for paths "
         "outside it.\n"
         "- **Own your network identity.** You have outbound internet and a public "
-        "IPv6 address. Your VM has its own FQDN that DNS-resolves to that IPv6, with "
-        "Caddy running locally as a reverse proxy. The top-level `/etc/caddy/Caddyfile` "
-        "is owned by the deployer and will be **overwritten on every redeploy** — do "
-        "not edit it. To expose additional services as **path prefixes on your own "
-        "HTTPS domain**, drop a snippet into `/etc/caddy/conf.d/` (survives redeploys). "
-        "The Caddyfile imports `/etc/caddy/conf.d/*.caddy` into the site block before "
-        "the default `reverse_proxy localhost:8080`, so your handlers match first. "
-        "Example — create `/etc/caddy/conf.d/myapp.caddy`:\n"
+        "IPv6 address. Your VM has its own FQDN (shown at the top of this prompt as "
+        "\"Your public HTTPS URL\") that DNS-resolves to that IPv6, with Caddy running "
+        "locally as a reverse proxy. The top-level `/etc/caddy/Caddyfile` is owned by "
+        "the deployer and will be **overwritten on every redeploy** — do not edit it. "
+        "To expose additional services as **path prefixes on your own HTTPS domain**, "
+        "drop a snippet into `/etc/caddy/conf.d/` (survives redeploys). The Caddyfile "
+        "imports `/etc/caddy/conf.d/*.caddy` into the site block before the default "
+        "`reverse_proxy localhost:8080`, so your handlers match first. Example — "
+        "create `/etc/caddy/conf.d/myapp.caddy` with **site-block directives only** "
+        "(no outer `fqdn { … }` wrapper — the import is already inside the site block):\n"
         "  ```\n"
         "  handle_path /myapp/* {\n"
         "      reverse_proxy localhost:9000\n"
         "  }\n"
         "  ```\n"
-        "  Then `systemctl reload caddy` and the user can hit "
-        "`https://your.fqdn/myapp/`. The agent stays reachable on `/` because the "
-        "default `reverse_proxy` catches everything your snippets don't. For "
+        "  Then `systemctl reload caddy`"
+        + (f" and the user can hit `https://{fqdn}/myapp/`"
+           if fqdn else " and the user can hit `https://<your-fqdn>/myapp/`") +
+        ". The agent stays reachable on `/` because the default `reverse_proxy` "
+        "catches everything your snippets don't. Check `systemctl status caddy` "
+        "after reload — if the config is invalid, Caddy refuses to start and you "
+        "(and the user) lose all HTTPS access until you fix the snippet. For "
         "quick-and-dirty exposure of a raw port without touching Caddy, you can also "
         "give the user `http://[<your-ipv6>]:<port>` directly — find your IPv6 with "
         "`ip -6 addr show scope global`. You can register for third-party APIs, "
@@ -205,11 +214,13 @@ def build_system_prompt(
     workspace_path: str,
     tool_names: list[str] | None = None,
     heartbeat_interval: int = 0,
+    fqdn: str = "",
 ) -> str:
     """Full system prompt (static + dynamic). Used for non-cached contexts."""
     static = build_static_system_prompt(
         user_prompt, agent_name, workspace_path, tool_names,
         heartbeat_interval=heartbeat_interval,
+        fqdn=fqdn,
     )
     dynamic = build_dynamic_context(workspace_path)
     if dynamic:
