@@ -100,6 +100,10 @@ class PersistentShell:
             #    redirected from /dev/null. Bash scopes the redirection to the
             #    group, so children (ssh, etc.) inherit a drained fd 0 and
             #    can't swallow the sentinel bytes queued on bash's own stdin.
+            #    (Edge case: if the user's command ends with a backslash line
+            #    continuation, it will splice `}` onto the last line and break
+            #    the group parse — same class of broken-input breakage that
+            #    existed before this wrapper was introduced. Not worth guarding.)
             # 2. Capture its exit code
             # 3. Echo a stdout sentinel so we know stdout is done
             # 4. Echo a stderr sentinel with the exit code
