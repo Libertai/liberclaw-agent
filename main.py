@@ -405,7 +405,7 @@ async def _run_agent_turn(
             else:
                 result = await execute_tool(
                     tool_name, arguments,
-                    image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                    image_callback=_stash_images,
                 )
 
             # Plugin post_tool hook
@@ -514,10 +514,7 @@ async def _maybe_skill_nudge(
         # Execute any tool calls (the agent may write a skill file)
         if tool_calls:
             for tc in tool_calls:
-                result = await execute_tool(
-                    tc.function.name, tc.function.arguments,
-                    pii_redaction=settings.pii_redaction_enabled,
-                )
+                result = await execute_tool(tc.function.name, tc.function.arguments)
                 if store_history:
                     await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
@@ -894,7 +891,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 else:
                     result = await execute_tool(
                         tool_name, arguments,
-                        image_callback=_stash_images, pii_redaction=settings.pii_redaction_enabled,
+                        image_callback=_stash_images,
                     )
 
                 # Plugin post_tool hook: may modify result

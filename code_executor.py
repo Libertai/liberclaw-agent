@@ -111,9 +111,7 @@ class CodeExecutor:
                     from baal_agent.tools import execute_tool
 
                     try:
-                        result = await execute_tool(
-                            tool_name, tool_args, pii_redaction=False
-                        )
+                        result = await execute_tool(tool_name, tool_args)
                         response = {"result": result, "id": req_id}
                     except Exception as exc:
                         response = {"error": str(exc), "id": req_id}

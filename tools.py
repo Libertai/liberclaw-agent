@@ -23,7 +23,6 @@ from baal_agent.image_utils import (
     is_image,
 )
 from baal_agent.checkpoints import CheckpointManager
-from baal_agent.pii import redact_pii
 from baal_agent.security import (
     MAX_SEND_FILE_SIZE,
     PathSecurityError,
@@ -1749,32 +1748,18 @@ async def execute_tool(
     arguments: str | dict,
     *,
     image_callback=None,
-    pii_redaction: bool = True,
 ) -> str:
-    """Dispatch a tool call by name. Returns the result string.
-
-    When *pii_redaction* is True (the default), the result is scanned for
-    sensitive data patterns (credit cards, SSNs, API keys, emails) and
-    matches are replaced with ``[REDACTED:type]`` tokens.  Code blocks
-    inside fenced ``` markers are left untouched.
-    """
+    """Dispatch a tool call by name. Returns the result string."""
     if isinstance(arguments, str):
         arguments = json.loads(arguments)
 
     # Route MCP tool calls to the MCP client
     if name.startswith("mcp_") and _mcp_client is not None:
-        result = await _mcp_client.call_tool(name, arguments)
-        if pii_redaction:
-            result = redact_pii(result)
-        return result
+        return await _mcp_client.call_tool(name, arguments)
 
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"[error: unknown tool '{name}']"
     if name in _IMAGE_AWARE_TOOLS and image_callback:
-        result = await handler(arguments, image_callback=image_callback)
-    else:
-        result = await handler(arguments)
-    if pii_redaction:
-        result = redact_pii(result)
-    return result
+        return await handler(arguments, image_callback=image_callback)
+    return await handler(arguments)

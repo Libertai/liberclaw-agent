@@ -28,7 +28,6 @@ class AgentSettings(BaseSettings):
     inference_timeout: int = 300  # seconds — timeout for inference in the SSE loop
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
-    pii_redaction_enabled: bool = True  # redact PII from tool outputs
     mcp_servers: str = ""  # JSON: [{"name": "...", "transport": "stdio", "command": "...", "args": [...], "env": {...}}]
     local_ui_enabled: bool = True
     local_ui_cors_origins: str = "*"  # comma-separated
