@@ -226,7 +226,11 @@ async def _screenshot(full_page: bool = False) -> str:
         if _workspace_path:
             tmp_dir = Path(_workspace_path) / "tmp"
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            fname = f"screenshot_{asyncio.current_task().get_name() if asyncio.current_task() else 'browser'}.png"
+            try:
+                task_name = asyncio.current_task().get_name()
+            except (RuntimeError, AttributeError):
+                task_name = "browser"
+            fname = f"screenshot_{task_name}.png"
             fname = re.sub(r"[^a-zA-Z0-9._-]", "_", fname)
             fpath = tmp_dir / fname
             fpath.write_bytes(png_bytes)
@@ -299,6 +303,10 @@ async def _exec_browser(args: dict) -> str:
         url = args.get("url")
         if not url:
             return "[error: 'url' is required for navigate]"
+        # Validate URL scheme to prevent file:// and other unsafe schemes
+        url_lower = url.strip().lower()
+        if not url_lower.startswith(("http://", "https://")):
+            return "[error: only http:// and https:// URLs are allowed.]"
         return await _navigate(url)
 
     elif action == "click":
