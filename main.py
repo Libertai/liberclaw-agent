@@ -219,6 +219,29 @@ async def lifespan(app: FastAPI):
             await _telegram_bot.start()
             _telegram_bot_task = asyncio.create_task(_telegram_bot.poll_loop())
             logger.info("Telegram bot started")
+
+            # Register Telegram as a messaging platform for the send_message tool
+            from baal_agent.messaging import register_platform, register_target
+
+            async def _tg_send(chat_id: str, text: str, **kwargs) -> str:
+                if _telegram_bot is None:
+                    return "Telegram bot not available"
+                result = await _telegram_bot._send_message(chat_id, text, **kwargs)
+                return json.dumps(result) if result else "sent"
+
+            register_platform(
+                "telegram",
+                _tg_send,
+                known_targets={
+                    "Owner": f"telegram:{settings.owner_telegram_id}",
+                },
+            )
+            register_target(
+                "Telegram (owner)", f"telegram:{settings.owner_telegram_id}"
+            )
+            logger.info(
+                "send_message tool registered with Telegram platform"
+            )
         except Exception as e:
             logger.error(f"Failed to start Telegram bot: {e}")
             _telegram_bot = None

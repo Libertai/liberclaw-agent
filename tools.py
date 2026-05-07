@@ -46,6 +46,12 @@ from baal_agent.skills import (
     _exec_skill_view,
     _exec_skills_list,
 )
+from baal_agent.messaging import (
+    SEND_MESSAGE_TOOL_DEF,
+    _exec_send_message,
+    register_platform,
+    register_target,
+)
 
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
@@ -1755,6 +1761,7 @@ TOOL_HANDLERS: dict[str, callable] = {
     "skills_list": _exec_skills_list,
     "skill_view": _exec_skill_view,
     "skill_manage": _exec_skill_manage,
+    "send_message": _exec_send_message,
 }
 
 
@@ -1769,6 +1776,7 @@ def get_tool_definitions(*, include_spawn: bool = True, include_browser: bool = 
     defs.append(SKILLS_TOOL_DEF)
     defs.append(SKILL_VIEW_TOOL_DEF)
     defs.append(SKILL_MANAGE_TOOL_DEF)
+    defs.append(SEND_MESSAGE_TOOL_DEF)
     if _mcp_client is not None:
         defs.extend(_mcp_client.get_tool_definitions())
     return defs

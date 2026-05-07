@@ -8,6 +8,12 @@ from .skills import (
     _exec_skill_view,
     _exec_skills_list,
 )
+from .messaging import (
+    SEND_MESSAGE_TOOL_DEF,
+    _exec_send_message,
+    register_platform,
+    register_target,
+)
 from .compaction import maybe_compact
 from .config import AgentSettings
 from .context import build_system_prompt
@@ -32,4 +38,5 @@ __all__ = [
     "is_image", "encode_bytes_to_data_uri",
     "BROWSER_TOOL_DEF", "configure_browser", "shutdown_browser",
     "CLARIFY_TOOL_DEF",
+    "SEND_MESSAGE_TOOL_DEF", "register_platform", "register_target",
 ]
