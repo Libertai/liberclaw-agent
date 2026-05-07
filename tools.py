@@ -37,6 +37,7 @@ from baal_agent.browser import (
     configure_browser,
     shutdown_browser as _shutdown_browser_engine,
 )
+from baal_agent.clarify import CLARIFY_TOOL_DEF, _exec_clarify
 
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
@@ -531,8 +532,7 @@ TOOL_DEFINITIONS = [
 
 # Browser tool — add directly to TOOL_DEFINITIONS so it's always available
 # (Playwright will be lazily imported on first use)
-_BROWSER_DEF = BROWSER_TOOL_DEF
-
+_CLARIFY_DEF = CLARIFY_TOOL_DEF
 
 # Spawn tool — added dynamically in main.py (not available to subagents)
 SPAWN_TOOL_DEF = {
@@ -1743,16 +1743,18 @@ TOOL_HANDLERS: dict[str, callable] = {
     "checkpoint": _exec_checkpoint,
     "process": _exec_process,
     "browser": _exec_browser,
+    "clarify": _exec_clarify,
 }
 
 
 def get_tool_definitions(*, include_spawn: bool = True, include_browser: bool = True) -> list[dict]:
-    """Return tool definitions, optionally including spawn, browser, and MCP tools."""
+    """Return tool definitions, optionally including spawn, browser, clarify, and MCP tools."""
     defs = list(TOOL_DEFINITIONS)
     if include_spawn:
         defs.append(SPAWN_TOOL_DEF)
     if include_browser:
         defs.append(BROWSER_TOOL_DEF)
+    defs.append(CLARIFY_TOOL_DEF)
     if _mcp_client is not None:
         defs.extend(_mcp_client.get_tool_definitions())
     return defs

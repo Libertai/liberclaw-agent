@@ -1,3 +1,5 @@
+from .browser import BROWSER_TOOL_DEF, _exec_browser, configure_browser, shutdown_browser
+from .clarify import CLARIFY_TOOL_DEF, _exec_clarify
 from .compaction import maybe_compact
 from .config import AgentSettings
 from .context import build_system_prompt
@@ -20,4 +22,6 @@ __all__ = [
     "get_tool_definitions", "PluginManager", "PersistentShell",
     "CodeExecutor", "MCPClient", "CheckpointManager", "CronScheduler",
     "is_image", "encode_bytes_to_data_uri",
+    "BROWSER_TOOL_DEF", "configure_browser", "shutdown_browser",
+    "CLARIFY_TOOL_DEF",
 ]
