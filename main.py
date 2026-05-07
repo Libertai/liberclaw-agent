@@ -33,6 +33,7 @@ from baal_agent.tools import (
     configure_tools,
     execute_tool,
     get_tool_definitions,
+    shutdown_browser,
     shutdown_code_executor,
     shutdown_mcp,
     shutdown_processes,
@@ -241,6 +242,7 @@ async def lifespan(app: FastAPI):
             run.task.cancel()
     await shutdown_mcp()
     await shutdown_processes()
+    await shutdown_browser()
     await shutdown_code_executor()
     await shutdown_shell()
     await db.close()
