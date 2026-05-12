@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import baal_agent.tools as tools_module
+
 # Concurrent eval runs would race on the module-globals they monkey-patch
 # (inference + db). Serialize them so a parent test runner or a misbehaving
 # caller can't contaminate a live agent session.
@@ -179,9 +181,21 @@ async def run_agent_eval_case(
     async with _EVAL_LOCK:
         original_inference = main_module.inference
         original_db = main_module.db if db is not None else None
+        original_tool_state = (
+            tools_module._workspace_path,
+            tools_module._db,
+            tools_module._inference,
+            tools_module._model,
+        )
         main_module.inference = scripted
         if db is not None:
             main_module.db = db
+            tools_module.configure_tools(
+                str(workspace),
+                db=db,
+                inference=scripted,
+                model=getattr(main_module.settings, "model", ""),
+            )
         try:
             final = await main_module._run_agent_turn(
                 case["input"],
@@ -193,6 +207,12 @@ async def run_agent_eval_case(
             main_module.inference = original_inference
             if db is not None:
                 main_module.db = original_db
+                (
+                    tools_module._workspace_path,
+                    tools_module._db,
+                    tools_module._inference,
+                    tools_module._model,
+                ) = original_tool_state
 
     failures: list[str] = []
     expect = case.get("expect", {})
