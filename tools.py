@@ -52,6 +52,13 @@ _MUTATING_TOOLS = {
     "checkpoint",
     "process",
     "run_format",
+    # The next three shell out to user commands that routinely have side
+    # effects (coverage caches, generated artifacts, ephemeral test DBs).
+    # Running them in parallel with concurrent write_file/edit_file/apply_patch
+    # would race; treat them as mutating so run_tool_calls_ordered serializes.
+    "run_tests",
+    "run_lint",
+    "run_typecheck",
     "spawn",
 }
 _SHELL_TOOLS = {
@@ -134,6 +141,9 @@ class ToolExecutionContext:
     """Turn-scoped state shared across tool calls."""
 
     read_hashes: dict[str, str] = _field(default_factory=dict)
+    # The chat_id of the current conversation. Empty string means "unscoped",
+    # in which case memory writes default to global / unscoped storage.
+    chat_id: str = ""
 
 
 @dataclass
@@ -2156,6 +2166,17 @@ async def _exec_search_history(args: dict) -> str:
     return _truncate(raw_output, source="search_history")
 
 
+def _context_chat_id(args: dict) -> str | None:
+    """Pull the conversation's chat_id off the injected ToolExecutionContext.
+
+    Returns None when running unscoped (legacy paths, in-process eval, etc.).
+    """
+    ctx = args.get("_context")
+    if isinstance(ctx, ToolExecutionContext) and ctx.chat_id:
+        return ctx.chat_id
+    return None
+
+
 async def _exec_remember_fact(args: dict) -> str:
     if _db is None:
         return "[error: memory database is not configured]"
@@ -2171,11 +2192,13 @@ async def _exec_remember_fact(args: dict) -> str:
         return "[error: memory content must be 2000 characters or less]"
     if metadata is not None and not isinstance(metadata, dict):
         return "[error: metadata must be an object when provided]"
+    chat_id = _context_chat_id(args)
     record_id = await _db.add_memory_record(
         kind=kind,
         content=content,
         source=source,
         metadata=metadata,
+        chat_id=chat_id,
     )
     return f"Stored memory record {record_id} ({kind})"
 
@@ -2193,6 +2216,7 @@ async def _exec_search_memory(args: dict) -> str:
         kind=kind,
         limit=limit,
         include_archived=bool(args.get("include_archived", False)),
+        chat_id=_context_chat_id(args),
     )
     if not records:
         return "(no memory records)"
@@ -2515,7 +2539,8 @@ async def _exec_execute_code(args: dict) -> str:
     if _code_executor is None:
         return "[error: code executor not available]"
     timeout = min(args.get("timeout", 120), 300)
-    return await _code_executor.execute(code, timeout=timeout)
+    chat_id = _context_chat_id(args) or ""
+    return await _code_executor.execute(code, timeout=timeout, chat_id=chat_id)
 
 
 # ── Checkpoint tool ──────────────────────────────────────────────────
@@ -2971,7 +2996,9 @@ async def execute_tool_result(
     # Route MCP tool calls to the MCP client
     if name.startswith("mcp_") and _mcp_client is not None:
         if hasattr(_mcp_client, "call_tool_result"):
-            mcp_result = await _mcp_client.call_tool_result(name, arguments)
+            mcp_result = await _mcp_client.call_tool_result(
+                name, arguments, image_callback=image_callback
+            )
             content = mcp_result.content
             mcp_is_error = mcp_result.is_error
             mcp_metadata = mcp_result.metadata

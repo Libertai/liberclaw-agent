@@ -119,9 +119,13 @@ async def _apply_post_inference(assistant_msg):
     return assistant_msg
 
 
-async def _load_typed_memory_context(limit: int = 8) -> str:
+async def _load_typed_memory_context(
+    limit: int = 8, *, chat_id: str | None = None
+) -> str:
     try:
-        records = await db.search_memory_records("", limit=limit)
+        records = await db.search_memory_records(
+            "", limit=limit, chat_id=chat_id
+        )
     except Exception:
         logger.debug("Failed to load typed memory records", exc_info=True)
         return ""
@@ -491,7 +495,7 @@ async def _run_agent_turn(
     tool_policy = _current_tool_policy()
     tools = get_tool_definitions(include_spawn=not restricted, policy=tool_policy)
     tool_names = [t["function"]["name"] for t in tools]
-    tool_context = ToolExecutionContext()
+    tool_context = ToolExecutionContext(chat_id=chat_id)
     pending_images: list[dict] = []
 
     def _stash_images(blocks: list[dict]):
@@ -514,7 +518,7 @@ async def _run_agent_turn(
             tool_names=tool_names,
             platform=platform,
         )
-        typed_memory = await _load_typed_memory_context()
+        typed_memory = await _load_typed_memory_context(chat_id=chat_id)
         if typed_memory:
             dynamic_context = _append_context_block(dynamic_context, typed_memory)
         if mode == "coding":
@@ -791,6 +795,11 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
 async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
     """Run a subagent in the background with restricted tools and a lightweight prompt."""
     try:
+        # Reload plugins so subagents see the latest hooks (mirrors the cron
+        # and main-chat paths). Without this, long-lived agents fork
+        # subagents with the plugin set frozen at startup.
+        if _plugin_manager is not None:
+            _plugin_manager.load_plugins()
         # Build lightweight subagent prompt
         tools = get_tool_definitions(include_spawn=False)
         tool_names = [t["function"]["name"] for t in tools]
@@ -899,6 +908,11 @@ async def _run_cron_job(task: str, job_id: str):
     chat_id = f"__cron_{job_id}__"
     files: list[dict] = []
     try:
+        # Reload plugins so newly created plugins take effect on the next cron
+        # run without requiring an agent restart. _run_chat_background does the
+        # same at line ~1074; without it, cron turns silently used stale hooks.
+        if _plugin_manager is not None:
+            _plugin_manager.load_plugins()
         result = await _run_agent_turn(
             task,
             chat_id=chat_id,
@@ -1078,7 +1092,7 @@ async def _run_chat_background(
         tool_policy = _current_tool_policy()
         tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
         tool_names = [t["function"]["name"] for t in tools]
-        tool_context = ToolExecutionContext()
+        tool_context = ToolExecutionContext(chat_id=chat_id)
         pending_images: list[dict] = []
 
         def _stash_images(blocks: list[dict]):
@@ -1095,6 +1109,24 @@ async def _run_chat_background(
                 "status": "failed" if checkpoint.is_error else "ok",
                 "content": checkpoint.content,
             })
+            # The whole point of coding mode is the pre-mutation rollback
+            # point. If we couldn't create it (no git, restricted policy,
+            # disk issue, etc.), running the loop blind would mutate files
+            # with no safety net. Bail out and tell the caller; they can
+            # retry without coding mode or fix the underlying issue.
+            if checkpoint.is_error:
+                await _emit(run, {
+                    "type": "error",
+                    "content": (
+                        "Coding-task aborted: could not create pre-mutation "
+                        "checkpoint. Fix the checkpoint setup (git installed, "
+                        "checkpoint tool not blocked by policy) or retry "
+                        "without coding mode. Details: "
+                        f"{checkpoint.content}"
+                    ),
+                })
+                await _emit(run, {"type": "done"})
+                return
 
         # Use static prompt + dynamic context injection for KV cache preservation
         system_prompt = build_static_system_prompt(
@@ -1110,7 +1142,7 @@ async def _run_chat_background(
             tool_names=tool_names,
             platform="api",
         )
-        typed_memory = await _load_typed_memory_context()
+        typed_memory = await _load_typed_memory_context(chat_id=chat_id)
         if typed_memory:
             dynamic_context = _append_context_block(dynamic_context, typed_memory)
         if mode == "coding":

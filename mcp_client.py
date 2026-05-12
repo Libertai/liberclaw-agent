@@ -3,20 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import itertools
 import json
 import logging
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
-
-# JSON-RPC request ID counter
-_next_id = 0
-
-
-def _get_id() -> int:
-    global _next_id
-    _next_id += 1
-    return _next_id
 
 
 @dataclass
@@ -62,6 +55,13 @@ class MCPClient:
         self._tools: dict[str, MCPToolInfo] = {}  # namespaced_name -> info
         self._configured: dict[str, str] = {}  # server name -> transport
         self._errors: dict[str, str] = {}
+        # Per-instance request id counter. Was a module-global before, which
+        # caused id collisions if two MCPClient instances coexisted (mostly an
+        # issue in tests, but conceptually wrong).
+        self._id_counter = itertools.count(1)
+
+    def _next_request_id(self) -> int:
+        return next(self._id_counter)
 
     async def connect(self, name: str, config: dict) -> None:
         """Connect to an MCP server.
@@ -226,7 +226,7 @@ class MCPClient:
         if not conn.process or not conn.process.stdin:
             return None
 
-        req_id = _get_id()
+        req_id = self._next_request_id()
         msg = {
             "jsonrpc": "2.0",
             "method": method,
@@ -370,7 +370,11 @@ class MCPClient:
         return defs
 
     async def call_tool_result(
-        self, namespaced_name: str, arguments: dict
+        self,
+        namespaced_name: str,
+        arguments: dict,
+        *,
+        image_callback=None,
     ) -> MCPToolCallResult:
         """Call an MCP tool and return text plus structured metadata."""
         info = self._tools.get(namespaced_name)
@@ -429,17 +433,40 @@ class MCPClient:
                     metadata=metadata,
                 )
 
+            # Forward image blocks to the model via the optional callback so
+            # vision-capable models see them as image_url content. Without this
+            # MCP image tools (screenshot servers, OCR servers, etc.) were
+            # invisible to the model.
+            image_blocks = _mcp_image_blocks(
+                content_blocks, info.server_name, info.original_name
+            )
+            if image_blocks and image_callback is not None:
+                try:
+                    image_callback(image_blocks)
+                except Exception:
+                    logger.warning(
+                        "MCP image callback raised; continuing without images",
+                        exc_info=True,
+                    )
+
             parts = []
             for block in content_blocks:
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
                 elif block.get("type") == "image":
-                    parts.append(f"[image: {block.get('mimeType', 'unknown')}]")
+                    mime = block.get("mimeType", "unknown")
+                    if image_blocks:
+                        parts.append(f"[Image forwarded to model: {mime}]")
+                    else:
+                        parts.append(f"[image: {mime}]")
                 elif block.get("type") == "resource":
                     uri = block.get("resource", {}).get("uri", "")
                     parts.append(f"[resource: {uri}]")
                 else:
                     parts.append(json.dumps(block))
+
+            if image_blocks:
+                metadata["image_count"] = len(image_blocks) // 2
 
             return MCPToolCallResult(
                 content="\n".join(parts),
@@ -465,6 +492,38 @@ class MCPClient:
         """Call an MCP tool and return the result as a string."""
         result = await self.call_tool_result(namespaced_name, arguments)
         return result.content
+
+
+def _mcp_image_blocks(content_blocks: list, server_name: str, tool_name: str) -> list:
+    """Convert MCP image blocks to OpenAI image_url content blocks.
+
+    Returns an empty list if no images are present.
+    """
+    blocks: list[dict] = []
+    for index, block in enumerate(content_blocks):
+        if not isinstance(block, dict) or block.get("type") != "image":
+            continue
+        data = block.get("data") or block.get("base64")
+        mime = block.get("mimeType") or "image/png"
+        if not data:
+            continue
+        # The MCP spec allows raw bytes or already-encoded base64; we re-encode
+        # bytes to keep the data URI consistent for the downstream image
+        # callback, which expects "data:<mime>;base64,<payload>".
+        if isinstance(data, (bytes, bytearray)):
+            payload = base64.b64encode(bytes(data)).decode("ascii")
+        else:
+            payload = str(data)
+        data_uri = f"data:{mime};base64,{payload}"
+        blocks.append({
+            "type": "text",
+            "text": f"[Image #{index + 1} from mcp_{server_name}_{tool_name}]",
+        })
+        blocks.append({
+            "type": "image_url",
+            "image_url": {"url": data_uri},
+        })
+    return blocks
 
 
 class MCPError(Exception):

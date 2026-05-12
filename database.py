@@ -69,11 +69,17 @@ class AgentDatabase:
                 source TEXT NOT NULL DEFAULT 'agent',
                 metadata TEXT,
                 archived INTEGER NOT NULL DEFAULT 0,
+                -- chat_id scopes a record to a single conversation. NULL
+                -- means "global / visible to every chat" (used by the
+                -- markdown-style import path and pre-scope records).
+                chat_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_memory_records_kind
                 ON memory_records (kind, archived, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_records_chat
+                ON memory_records (chat_id, archived, updated_at);
         """)
 
         # FTS5 full-text search index over message content
@@ -103,6 +109,18 @@ class AgentDatabase:
         if "metadata" not in columns:
             await self._db.execute(
                 "ALTER TABLE messages ADD COLUMN metadata TEXT"
+            )
+
+        # Migration: add chat_id scope to typed memory records.
+        cursor = await self._db.execute("PRAGMA table_info(memory_records)")
+        memory_columns = {row[1] for row in await cursor.fetchall()}
+        if "chat_id" not in memory_columns:
+            await self._db.execute(
+                "ALTER TABLE memory_records ADD COLUMN chat_id TEXT"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_records_chat "
+                "ON memory_records (chat_id, archived, updated_at)"
             )
 
         await self._db.commit()
@@ -194,18 +212,24 @@ class AgentDatabase:
         content: str,
         source: str = "agent",
         metadata: dict | None = None,
+        chat_id: str | None = None,
     ) -> int:
-        """Store a typed memory record."""
+        """Store a typed memory record.
+
+        ``chat_id=None`` makes the record visible to every conversation
+        (legacy behaviour). Pass the current chat_id to scope it.
+        """
         now = datetime.now(timezone.utc).isoformat()
         cursor = await self.db.execute(
             "INSERT INTO memory_records "
-            "(kind, content, source, metadata, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(kind, content, source, metadata, chat_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 kind,
                 content,
                 source,
                 json.dumps(metadata) if metadata else None,
+                chat_id,
                 now,
                 now,
             ),
@@ -220,8 +244,16 @@ class AgentDatabase:
         kind: str | None = None,
         limit: int = 20,
         include_archived: bool = False,
+        chat_id: str | None = None,
     ) -> list[dict]:
-        """Search typed memory records with simple SQLite LIKE matching."""
+        """Search typed memory records with simple SQLite LIKE matching.
+
+        Scope semantics:
+        - ``chat_id=None`` returns records from every chat (admin / debug
+          path).
+        - A non-empty ``chat_id`` returns rows that either belong to that
+          chat OR are global (``memory_records.chat_id IS NULL``).
+        """
         clauses = []
         params: list[object] = []
         if not include_archived:
@@ -232,10 +264,14 @@ class AgentDatabase:
         if query:
             clauses.append("content LIKE ?")
             params.append(f"%{query}%")
+        if chat_id is not None:
+            clauses.append("(chat_id IS NULL OR chat_id = ?)")
+            params.append(chat_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(min(max(int(limit), 1), 100))
         cursor = await self.db.execute(
-            "SELECT id, kind, content, source, metadata, archived, created_at, updated_at "
+            "SELECT id, kind, content, source, metadata, archived, chat_id, "
+            "created_at, updated_at "
             f"FROM memory_records {where} "
             "ORDER BY updated_at DESC, id DESC LIMIT ?",
             params,
@@ -283,6 +319,13 @@ class AgentDatabase:
                 metadata = json.loads(row["metadata"])
             except (json.JSONDecodeError, TypeError):
                 metadata = None
+        # `chat_id` is missing on rows from older schemas before the
+        # migration ran in the same session; defensive get protects tests
+        # that construct rows manually.
+        try:
+            row_chat_id = row["chat_id"]
+        except (IndexError, KeyError):
+            row_chat_id = None
         return {
             "id": row["id"],
             "kind": row["kind"],
@@ -290,6 +333,7 @@ class AgentDatabase:
             "source": row["source"],
             "metadata": metadata,
             "archived": bool(row["archived"]),
+            "chat_id": row_chat_id,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

@@ -130,7 +130,9 @@ class CodeExecutor:
             except Exception:
                 pass
 
-    async def execute(self, code: str, timeout: int = 120) -> str:
+    async def execute(
+        self, code: str, timeout: int = 120, *, chat_id: str = ""
+    ) -> str:
         """Run a Python script with tool access and return stdout.
 
         The script receives the ``BAAL_TOOL_SOCKET`` env var and a pre-injected
@@ -139,6 +141,10 @@ class CodeExecutor:
         Args:
             code: Python source code to execute.
             timeout: Wall-clock timeout in seconds (max 300).
+            chat_id: Propagated into the inner ``ToolExecutionContext`` so
+                that ``call_tool('remember_fact', ...)`` from inside the
+                sandboxed script scopes to the same conversation as the
+                outer turn.
 
         Returns:
             The script's stdout output, truncated to *MAX_OUTPUT* chars.
@@ -148,7 +154,7 @@ class CodeExecutor:
 
         timeout = min(timeout, 300)
         from baal_agent.tools import ToolExecutionContext
-        self._tool_context = ToolExecutionContext()
+        self._tool_context = ToolExecutionContext(chat_id=chat_id)
 
         # Write combined helper + user code to a temp file
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="baal_exec_")
