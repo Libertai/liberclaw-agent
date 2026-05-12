@@ -53,6 +53,15 @@ class AgentDatabase:
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS runtime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_chat
+                ON runtime_events (chat_id, id);
         """)
 
         # FTS5 full-text search index over message content
@@ -150,6 +159,59 @@ class AgentDatabase:
         )
         await self._index_message_fts(cursor.lastrowid, content)
         await self.db.commit()
+
+    async def add_event(self, chat_id: str, event_type: str, payload: dict) -> int:
+        """Persist a runtime event for trace/replay/debug views."""
+        cursor = await self.db.execute(
+            "INSERT INTO runtime_events (chat_id, type, payload, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                chat_id,
+                event_type,
+                json.dumps(payload),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await self.db.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def get_events(
+        self,
+        chat_id: str,
+        limit: int = 200,
+        after_id: int | None = None,
+    ) -> list[dict]:
+        """Return persisted runtime events in chronological order."""
+        if after_id is not None:
+            cursor = await self.db.execute(
+                "SELECT id, type, payload, created_at "
+                "FROM runtime_events WHERE chat_id = ? AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (chat_id, after_id, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT id, type, payload, created_at "
+                "FROM runtime_events WHERE chat_id = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (chat_id, limit),
+            )
+        rows = await cursor.fetchall()
+        if after_id is None:
+            rows = list(reversed(rows))
+        events = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                payload = {}
+            events.append({
+                "id": row["id"],
+                "type": row["type"],
+                "payload": payload,
+                "created_at": row["created_at"],
+            })
+        return events
 
     async def get_history(
         self,
@@ -296,6 +358,7 @@ class AgentDatabase:
         row = await cursor.fetchone()
         count = row["cnt"] if row else 0
         await self.db.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
+        await self.db.execute("DELETE FROM runtime_events WHERE chat_id = ?", (chat_id,))
         # Rebuild FTS index to remove stale entries from deleted messages
         await self.db.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
         await self.db.commit()

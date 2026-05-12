@@ -812,9 +812,25 @@ async def _emit(run: ChatRun, data: dict):
     """
     if "timestamp_ms" not in data:
         data["timestamp_ms"] = int(time.time() * 1000)
+    if data.get("type") not in {"keepalive", "stream_meta"}:
+        try:
+            await db.add_event(run.chat_id, data.get("type", "unknown"), data)
+        except Exception:
+            logger.debug("Failed to persist runtime event", exc_info=True)
     async with run.condition:
         run.events.append(data)
         run.condition.notify_all()
+
+
+async def _append_terminal_event(run: ChatRun, data: dict) -> None:
+    if "timestamp_ms" not in data:
+        data["timestamp_ms"] = int(time.time() * 1000)
+    if data.get("type") not in {"keepalive", "stream_meta"}:
+        try:
+            await db.add_event(run.chat_id, data.get("type", "unknown"), data)
+        except Exception:
+            logger.debug("Failed to persist terminal runtime event", exc_info=True)
+    run.events.append(data)
 
 
 async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[dict]):
@@ -1027,13 +1043,15 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
     except asyncio.CancelledError:
         logger.info(f"Chat run cancelled for {chat_id}")
         # Force-append without await — we may be in a cancelled state
-        run.events.append({"type": "error", "content": "Chat run was cancelled."})
+        await _append_terminal_event(
+            run, {"type": "error", "content": "Chat run was cancelled."}
+        )
     except Exception as e:
         logger.error(f"Chat run error for {chat_id}: {e}", exc_info=True)
         try:
             await _emit(run, {"type": "error", "content": str(e)})
         except asyncio.CancelledError:
-            run.events.append({"type": "error", "content": str(e)})
+            await _append_terminal_event(run, {"type": "error", "content": str(e)})
     finally:
         # Fire session end hook (best-effort)
         if _plugin_manager is not None:
@@ -1043,7 +1061,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 pass  # never let plugin errors block cleanup
         # Always emit done and mark run as finished — force-append to avoid
         # re-cancellation in the finally block leaving run.done=False forever
-        run.events.append({"type": "done"})
+        await _append_terminal_event(run, {"type": "done"})
         run.done = True
         run.completed_at = time.time()
         try:
@@ -1205,6 +1223,17 @@ async def get_chat_history(chat_id: str, limit: int = 50):
                 if rel_path:
                     events.append({"type": "file", "path": rel_path, **ts_field})
     return {"messages": events}
+
+
+@app.get("/chat/{chat_id}/events")
+async def get_runtime_events(
+    chat_id: str,
+    limit: int = 200,
+    after_id: int | None = None,
+):
+    """Return durable runtime events for a chat, ordered oldest to newest."""
+    limit = min(max(limit, 1), 1000)
+    return {"events": await db.get_events(chat_id, limit=limit, after_id=after_id)}
 
 
 @app.delete("/chat/{chat_id}")
@@ -1390,6 +1419,7 @@ async def info():
             "tool_result_events": True,
             "tool_metadata": True,
             "runtime_health": True,
+            "runtime_events": True,
             "context_injection_scanner": True,
         },
         "runtime_health": {
