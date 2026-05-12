@@ -277,6 +277,19 @@ async def shutdown_mcp() -> None:
         await _mcp_client.disconnect_all()
         _mcp_client = None
 
+
+def get_mcp_health() -> dict:
+    """Return health for the active MCP client, if configured."""
+    if _mcp_client is None:
+        return {
+            "enabled": False,
+            "server_count": 0,
+            "connected_count": 0,
+            "tool_count": 0,
+            "servers": [],
+        }
+    return _mcp_client.get_health()
+
 # ── Bash safety guards ────────────────────────────────────────────────
 # Legacy BASH_DENY_PATTERNS kept for backward compatibility with tests.
 # The actual safety check is now done by check_command_safety() in security.py

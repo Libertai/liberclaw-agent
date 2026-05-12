@@ -42,6 +42,7 @@ class MCPServerConnection:
     _pending: dict[int, asyncio.Future] = field(default_factory=dict)
     _reader_task: asyncio.Task | None = None
     url: str | None = None  # for http transport
+    error: str | None = None
 
 
 class MCPClient:
@@ -50,6 +51,8 @@ class MCPClient:
     def __init__(self):
         self._servers: dict[str, MCPServerConnection] = {}
         self._tools: dict[str, MCPToolInfo] = {}  # namespaced_name -> info
+        self._configured: dict[str, str] = {}  # server name -> transport
+        self._errors: dict[str, str] = {}
 
     async def connect(self, name: str, config: dict) -> None:
         """Connect to an MCP server.
@@ -62,12 +65,16 @@ class MCPClient:
             url: server URL (http)
         """
         transport = config.get("transport", "stdio")
+        self._configured[name] = transport
 
         if transport == "stdio":
             await self._connect_stdio(name, config)
         elif transport == "http":
+            message = "HTTP transport not yet implemented"
+            self._errors[name] = message
             logger.warning(f"MCP HTTP transport not yet implemented for server '{name}'")
         else:
+            self._errors[name] = f"unknown transport '{transport}'"
             logger.error(f"Unknown MCP transport '{transport}' for server '{name}'")
 
     async def _connect_stdio(self, name: str, config: dict) -> None:
@@ -77,6 +84,7 @@ class MCPClient:
         env = config.get("env")
 
         if not command:
+            self._errors[name] = "missing command"
             logger.error(f"MCP server '{name}' missing 'command' in config")
             return
 
@@ -115,6 +123,7 @@ class MCPClient:
             })
 
             if init_result is None:
+                self._errors[name] = "initialization failed"
                 logger.error(f"MCP server '{name}' initialization failed")
                 await self._disconnect_server(name)
                 return
@@ -145,10 +154,13 @@ class MCPClient:
             logger.info(
                 f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
             )
+            self._errors.pop(name, None)
 
         except FileNotFoundError:
+            self._errors[name] = f"command '{command}' not found"
             logger.error(f"MCP server '{name}': command '{command}' not found")
         except Exception as e:
+            self._errors[name] = str(e)
             logger.error(f"MCP server '{name}' connection failed: {e}")
             await self._disconnect_server(name)
 
@@ -297,6 +309,31 @@ class MCPClient:
                 logger.warning(f"Error stopping MCP server '{name}': {e}")
 
         logger.info(f"MCP server '{name}' disconnected")
+
+    def get_health(self) -> dict:
+        """Return lightweight MCP health for /info and runtime diagnostics."""
+        servers = []
+        for name in sorted(set(self._configured) | set(self._servers)):
+            conn = self._servers.get(name)
+            connected = bool(conn)
+            if conn and conn.transport == "stdio" and conn.process:
+                connected = conn.process.returncode is None
+            servers.append({
+                "name": name,
+                "transport": conn.transport if conn else self._configured.get(name, "unknown"),
+                "connected": connected,
+                "tool_count": len(conn.tools) if conn else 0,
+                "pending_requests": len(conn._pending) if conn else 0,
+                "error": self._errors.get(name) or (conn.error if conn else None),
+            })
+
+        return {
+            "enabled": bool(self._configured or self._servers),
+            "server_count": len(set(self._configured) | set(self._servers)),
+            "connected_count": sum(1 for server in servers if server["connected"]),
+            "tool_count": len(self._tools),
+            "servers": servers,
+        }
 
     def get_tool_definitions(self) -> list[dict]:
         """Return OpenAI-format tool definitions for all discovered MCP tools."""

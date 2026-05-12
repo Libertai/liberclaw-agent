@@ -45,6 +45,7 @@ from baal_agent.tools import (
     execute_tool,
     execute_tool_result,
     get_tool_definitions,
+    get_mcp_health,
     get_unavailable_tools,
     run_tool_calls_ordered,
     shutdown_code_executor,
@@ -1757,6 +1758,7 @@ async def info():
 
     tool_policy = _current_tool_policy()
     tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
+    mcp_health = get_mcp_health()
     return {
         "agent_name": settings.agent_name,
         "agent_version": AGENT_VERSION,
@@ -1775,6 +1777,7 @@ async def info():
             "tool_result_events": True,
             "tool_metadata": True,
             "runtime_health": True,
+            "mcp_health": True,
             "runtime_events": True,
             "context_injection_scanner": True,
             "tool_policy": True,
@@ -1785,6 +1788,7 @@ async def info():
             "database": "configured" if db is not None else "unavailable",
             "workspace": "configured" if settings.workspace_path else "unavailable",
             "mcp": "configured" if settings.mcp_servers.strip() else "disabled",
+            "mcp_detail": mcp_health,
             "heartbeat": "enabled" if settings.heartbeat_interval > 0 else "disabled",
         },
         "heartbeat_interval": settings.heartbeat_interval,
