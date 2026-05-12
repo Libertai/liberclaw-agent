@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+# Concurrent eval runs would race on the module-globals they monkey-patch
+# (inference + db). Serialize them so a parent test runner or a misbehaving
+# caller can't contaminate a live agent session.
+_EVAL_LOCK = asyncio.Lock()
 
 
 @dataclass
@@ -123,33 +129,70 @@ def load_eval_cases(path: str | Path) -> list[dict[str, Any]]:
     return [load_eval_case(eval_path)]
 
 
+def _resolve_eval_workspace_path(workspace: Path, rel_path: str) -> Path:
+    """Reject workspace-escaping paths in case files.
+
+    The eval JSON is dev-supplied today, but anyone running CI on
+    contributed eval cases needs this defense — `{"../../../etc/foo": ...}`
+    would otherwise write outside the harness.
+    """
+    raw = rel_path.strip()
+    if not raw or raw.startswith("/") or Path(raw).is_absolute():
+        raise ValueError(f"eval workspace_files path is absolute: {rel_path!r}")
+    resolved = (workspace / raw).resolve()
+    try:
+        resolved.relative_to(workspace.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"eval workspace_files path escapes workspace: {rel_path!r}"
+        ) from exc
+    return resolved
+
+
 async def run_agent_eval_case(
     main_module,
     case: dict[str, Any],
     *,
     workspace_path: str | Path | None = None,
+    db: Any | None = None,
 ) -> EvalResult:
-    """Run one scripted eval case through baal_agent.main._run_agent_turn."""
+    """Run one scripted eval case through baal_agent.main._run_agent_turn.
+
+    Caller may pass ``db`` to override ``main_module.db`` for the duration
+    of the run (the InMemoryEvalDatabase is a natural choice). Without an
+    override, the run shares the live agent DB, which contaminates real
+    history and is rarely what tests want.
+    """
     name = case.get("name", "unnamed")
     workspace = Path(workspace_path or main_module.settings.workspace_path)
     workspace.mkdir(parents=True, exist_ok=True)
     for rel_path, content in case.get("workspace_files", {}).items():
-        target = workspace / rel_path
+        target = _resolve_eval_workspace_path(workspace, rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
 
     scripted = ScriptedInference(case.get("responses", []))
-    original_inference = main_module.inference
-    main_module.inference = scripted
-    try:
-        final = await main_module._run_agent_turn(
-            case["input"],
-            chat_id=case.get("chat_id", f"eval:{name}"),
-            max_iterations=case.get("max_iterations", 5),
-            platform=case.get("platform", "eval"),
-        )
-    finally:
-        main_module.inference = original_inference
+    chat_id = case.get("chat_id", f"eval:{name}")
+
+    # Serialize the monkey-patch window so two concurrent eval runs can't
+    # observe each other's swapped-in inference / db.
+    async with _EVAL_LOCK:
+        original_inference = main_module.inference
+        original_db = main_module.db if db is not None else None
+        main_module.inference = scripted
+        if db is not None:
+            main_module.db = db
+        try:
+            final = await main_module._run_agent_turn(
+                case["input"],
+                chat_id=chat_id,
+                max_iterations=case.get("max_iterations", 5),
+                platform=case.get("platform", "eval"),
+            )
+        finally:
+            main_module.inference = original_inference
+            if db is not None:
+                main_module.db = original_db
 
     failures: list[str] = []
     expect = case.get("expect", {})
@@ -158,7 +201,7 @@ async def run_agent_eval_case(
         failures.append(f"final did not contain {expected_final!r}")
 
     for rel_path, expected_content in expect.get("files", {}).items():
-        target = workspace / rel_path
+        target = _resolve_eval_workspace_path(workspace, rel_path)
         if not target.exists():
             failures.append(f"expected file missing: {rel_path}")
             continue
@@ -166,14 +209,15 @@ async def run_agent_eval_case(
         if expected_content not in actual:
             failures.append(f"file {rel_path} did not contain expected text")
 
+    eval_db = db if db is not None else main_module.db
     if "history_roles" in expect:
-        history = await main_module.db.get_history(case.get("chat_id", f"eval:{name}"))
+        history = await eval_db.get_history(chat_id)
         roles = [message["role"] for message in history]
         if roles != expect["history_roles"]:
             failures.append(f"history roles {roles!r} != {expect['history_roles']!r}")
 
     if "events" in expect:
-        events = await main_module.db.get_events(case.get("chat_id", f"eval:{name}"))
+        events = await eval_db.get_events(chat_id)
         event_types = [event["type"] for event in events]
         for event_type in expect["events"]:
             if event_type not in event_types:
