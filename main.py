@@ -361,7 +361,11 @@ async def lifespan(app: FastAPI):
     # Start cron scheduler (replaces old heartbeat loop).
     # It reads workspace/cron.json every tick and falls back to the legacy
     # HEARTBEAT.md behaviour when no cron.json exists.
-    _scheduler = CronScheduler(settings.workspace_path, heartbeat_interval=settings.heartbeat_interval)
+    _scheduler = CronScheduler(
+        settings.workspace_path,
+        heartbeat_interval=settings.heartbeat_interval,
+        event_callback=_record_scheduler_event,
+    )
     await _scheduler.start(_run_cron_job)
 
     # Start Telegram bot if configured
@@ -903,6 +907,11 @@ async def _run_cron_job(task: str, job_id: str):
             logger.debug(f"Cron job {job_id!r}: no output")
     except Exception as e:
         logger.error(f"Cron job {job_id!r} failed: {e}")
+
+
+async def _record_scheduler_event(event_type: str, payload: dict) -> None:
+    """Persist scheduler events for runtime inspection."""
+    await db.add_event("__scheduler__", event_type, payload)
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────
@@ -1782,6 +1791,7 @@ async def info():
             "context_injection_scanner": True,
             "tool_policy": True,
             "coding_task_runtime": True,
+            "file_watchers": True,
         },
         "tool_policy": tool_policy.describe(),
         "runtime_health": {

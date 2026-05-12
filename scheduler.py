@@ -107,9 +107,15 @@ class CronScheduler:
     so the agent can add/remove jobs via its file tools.
     """
 
-    def __init__(self, workspace_path: str, heartbeat_interval: int = 0):
+    def __init__(
+        self,
+        workspace_path: str,
+        heartbeat_interval: int = 0,
+        event_callback: Callable[[str, dict], Awaitable[None]] | None = None,
+    ):
         self.workspace_path = workspace_path
         self.heartbeat_interval = heartbeat_interval
+        self.event_callback = event_callback
         self.jobs: list[CronJob] = []
         self._last_run: dict[str, float] = {}  # job_id -> unix timestamp
         self._task: asyncio.Task | None = None
@@ -260,6 +266,11 @@ class CronScheduler:
         state = load_watcher_state(self.workspace_path)
         changed = False
         for watcher in watchers:
+            await self._emit_watcher_event("watcher.checked", {
+                "id": watcher.id,
+                "path": watcher.path,
+                "enabled": watcher.enabled,
+            })
             try:
                 if watcher_due(
                     watcher,
@@ -269,13 +280,36 @@ class CronScheduler:
                 ):
                     changed = True
                     logger.info(f"File watcher {watcher.id!r} changed; dispatching")
+                    await self._emit_watcher_event("watcher.triggered", {
+                        "id": watcher.id,
+                        "path": watcher.path,
+                        "job_id": f"watcher:{watcher.id}",
+                    })
                     await run_job_callback(watcher.task, f"watcher:{watcher.id}")
                 else:
                     changed = True
+                    await self._emit_watcher_event("watcher.skipped", {
+                        "id": watcher.id,
+                        "path": watcher.path,
+                        "reason": "unchanged_or_debounced",
+                    })
             except Exception as e:
                 logger.error(f"File watcher {watcher.id!r} failed: {e}")
+                await self._emit_watcher_event("watcher.error", {
+                    "id": watcher.id,
+                    "path": watcher.path,
+                    "error": str(e),
+                })
         if changed:
             save_watcher_state(self.workspace_path, state)
+
+    async def _emit_watcher_event(self, event_type: str, payload: dict) -> None:
+        if self.event_callback is None:
+            return
+        try:
+            await self.event_callback(event_type, payload)
+        except Exception as e:
+            logger.warning(f"Watcher event callback failed: {e}")
 
     # ── legacy heartbeat fallback ────────────────────────────────────
 
