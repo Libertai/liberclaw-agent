@@ -56,6 +56,11 @@ class CodeExecutor:
         self._socket_path: str | None = None
         self._server: asyncio.AbstractServer | None = None
         self._tool_context = None
+        # Per-call snapshot of the active ToolPolicy. The socket dispatcher
+        # re-applies it to every tool call the sandboxed script issues, so
+        # a `call_tool('bash', ...)` from inside execute_code cannot bypass
+        # the parent turn's guardrails.
+        self._tool_policy = None
 
     @property
     def socket_path(self) -> str | None:
@@ -112,10 +117,18 @@ class CodeExecutor:
                     from baal_agent.tools import execute_tool
 
                     try:
-                        result = await execute_tool(
-                            tool_name, tool_args, context=self._tool_context
+                        # Use the result-shape API so policy enforcement on
+                        # the wrapped tool call returns the same guardrail
+                        # error shape as the top-level dispatcher would.
+                        from baal_agent.tools import execute_tool_result
+
+                        tr = await execute_tool_result(
+                            tool_name,
+                            tool_args,
+                            context=self._tool_context,
+                            policy=self._tool_policy,
                         )
-                        response = {"result": result, "id": req_id}
+                        response = {"result": tr.content, "id": req_id}
                     except Exception as exc:
                         response = {"error": str(exc), "id": req_id}
 
@@ -131,7 +144,12 @@ class CodeExecutor:
                 pass
 
     async def execute(
-        self, code: str, timeout: int = 120, *, chat_id: str = ""
+        self,
+        code: str,
+        timeout: int = 120,
+        *,
+        chat_id: str = "",
+        policy=None,
     ) -> str:
         """Run a Python script with tool access and return stdout.
 
@@ -145,6 +163,8 @@ class CodeExecutor:
                 that ``call_tool('remember_fact', ...)`` from inside the
                 sandboxed script scopes to the same conversation as the
                 outer turn.
+            policy: The active ToolPolicy. Carried through the socket
+                dispatcher so guardrails apply to every inner tool call.
 
         Returns:
             The script's stdout output, truncated to *MAX_OUTPUT* chars.
@@ -154,7 +174,8 @@ class CodeExecutor:
 
         timeout = min(timeout, 300)
         from baal_agent.tools import ToolExecutionContext
-        self._tool_context = ToolExecutionContext(chat_id=chat_id)
+        self._tool_context = ToolExecutionContext(chat_id=chat_id, policy=policy)
+        self._tool_policy = policy
 
         # Write combined helper + user code to a temp file
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="baal_exec_")
@@ -214,6 +235,7 @@ class CodeExecutor:
             return result
         finally:
             self._tool_context = None
+            self._tool_policy = None
             try:
                 os.unlink(tmp_path)
             except OSError:

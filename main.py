@@ -472,6 +472,7 @@ async def _run_agent_turn(
     channel_hint: str | None = None,
     platform: str | None = None,
     mode: str = "chat",
+    policy_override: ToolPolicy | None = None,
 ) -> str | None:
     """Run a single agentic turn (message -> tool loop -> response).
 
@@ -492,10 +493,10 @@ async def _run_agent_turn(
         The final text response, or None if no text was generated.
     """
     iterations = max_iterations or settings.max_tool_iterations
-    tool_policy = _current_tool_policy()
+    tool_policy = policy_override if policy_override is not None else _current_tool_policy()
     tools = get_tool_definitions(include_spawn=not restricted, policy=tool_policy)
     tool_names = [t["function"]["name"] for t in tools]
-    tool_context = ToolExecutionContext(chat_id=chat_id)
+    tool_context = ToolExecutionContext(chat_id=chat_id, policy=tool_policy)
     pending_images: list[dict] = []
 
     def _stash_images(blocks: list[dict]):
@@ -800,8 +801,25 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         # subagents with the plugin set frozen at startup.
         if _plugin_manager is not None:
             _plugin_manager.load_plugins()
-        # Build lightweight subagent prompt
-        tools = get_tool_definitions(include_spawn=False)
+
+        # Derive the effective ToolPolicy for this subagent: the per-role
+        # allowlist (explorer/reviewer/verifier/researcher) layered on top
+        # of the parent's global policy. Roles like default/worker stay
+        # unrestricted and inherit the parent's policy as-is.
+        from baal_agent.tools import (
+            intersect_policies,
+            subagent_role_policy,
+        )
+        global_policy = _current_tool_policy()
+        role_policy = subagent_role_policy(run.role)
+        effective_policy = intersect_policies(global_policy, role_policy)
+
+        # Build lightweight subagent prompt with the *enforced* tool list,
+        # not the full schema — otherwise the prompt would advertise tools
+        # the dispatcher will then refuse.
+        tools = get_tool_definitions(
+            include_spawn=False, policy=effective_policy
+        )
         tool_names = [t["function"]["name"] for t in tools]
         subagent_prompt = build_subagent_prompt(
             settings.agent_name,
@@ -821,6 +839,7 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
                 store_history=False,
                 file_events=files,
                 system_prompt_override=subagent_prompt,
+                policy_override=effective_policy,
             ),
             timeout=timeout,
         )
@@ -1092,7 +1111,7 @@ async def _run_chat_background(
         tool_policy = _current_tool_policy()
         tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
         tool_names = [t["function"]["name"] for t in tools]
-        tool_context = ToolExecutionContext(chat_id=chat_id)
+        tool_context = ToolExecutionContext(chat_id=chat_id, policy=tool_policy)
         pending_images: list[dict] = []
 
         def _stash_images(blocks: list[dict]):

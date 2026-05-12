@@ -136,6 +136,103 @@ class ToolPolicy:
         return False, f"unknown tool policy mode '{self.mode}'"
 
 
+# ── Subagent role policies ──────────────────────────────────────────
+#
+# Per-role tool subsets. Each role declares the allowlist of tools its
+# subagent may invoke. `worker` / `default` mean "inherit the global policy"
+# and stay None. The policies layer on top of the parent's policy: the
+# stricter of (parent, role) wins via _intersect_policies.
+
+# Read-only tools available to every constrained role.
+_READ_ONLY_TOOLS: frozenset[str] = frozenset({
+    "read_file",
+    "read_pdf",
+    "list_dir",
+    "glob",
+    "grep",
+    "search_history",
+    "search_memory",
+})
+
+_SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
+    "explorer": ToolPolicy(
+        mode="auto-read",
+        allowlist=_READ_ONLY_TOOLS,
+    ),
+    "reviewer": ToolPolicy(
+        mode="auto-read",
+        allowlist=_READ_ONLY_TOOLS | frozenset({"git_diff", "git_show", "git_blame", "git_status"}),
+    ),
+    "verifier": ToolPolicy(
+        mode="ask-before-write",
+        allowlist=_READ_ONLY_TOOLS
+        | frozenset({
+            "run_tests",
+            "run_lint",
+            "run_typecheck",
+            "git_diff",
+            "git_status",
+        }),
+    ),
+    "researcher": ToolPolicy(
+        mode="auto-read",
+        allowlist=_READ_ONLY_TOOLS | frozenset({"web_fetch", "web_search"}),
+    ),
+}
+
+
+def subagent_role_policy(role: str | None) -> "ToolPolicy | None":
+    """Return the per-role ToolPolicy, or None for unrestricted roles.
+
+    `default` and `worker` get no extra restriction; the parent agent's
+    global policy still applies as usual. Other roles return a role-scoped
+    allowlist that the dispatcher intersects with the global policy.
+    """
+    if not role:
+        return None
+    return _SUBAGENT_ROLE_POLICIES.get(role.strip().lower())
+
+
+def intersect_policies(
+    base: "ToolPolicy | None", overlay: "ToolPolicy | None"
+) -> "ToolPolicy | None":
+    """Return a policy at least as strict as both inputs.
+
+    Used to stack a subagent role policy on top of the global agent
+    policy: any allowlist on either side narrows the resulting set; the
+    stricter mode wins.
+    """
+    if base is None and overlay is None:
+        return None
+    if base is None:
+        return overlay
+    if overlay is None:
+        return base
+    # Mode precedence (most → least restrictive).
+    order = [
+        "locked-down",
+        "auto-read",
+        "ask-before-write",
+        "ask-before-shell",
+        "full-auto",
+    ]
+    base_rank = order.index(base.mode) if base.mode in order else len(order)
+    overlay_rank = order.index(overlay.mode) if overlay.mode in order else len(order)
+    mode = base.mode if base_rank <= overlay_rank else overlay.mode
+
+    # Allowlist intersection: if either side has an allowlist, the result
+    # is the intersection of all declared allowlists.
+    if base.allowlist and overlay.allowlist:
+        allowlist = base.allowlist & overlay.allowlist
+    else:
+        allowlist = base.allowlist or overlay.allowlist
+    return ToolPolicy(
+        mode=mode,
+        allowlist=allowlist,
+        denylist=base.denylist | overlay.denylist,
+    )
+
+
 @dataclass
 class ToolExecutionContext:
     """Turn-scoped state shared across tool calls."""
@@ -144,6 +241,10 @@ class ToolExecutionContext:
     # The chat_id of the current conversation. Empty string means "unscoped",
     # in which case memory writes default to global / unscoped storage.
     chat_id: str = ""
+    # The active ToolPolicy for this turn. Carried through ToolExecutionContext
+    # so that nested dispatchers (notably execute_code's sandbox bridge) can
+    # re-apply policy on inner tool calls instead of running unchecked.
+    policy: "ToolPolicy | None" = None
 
 
 @dataclass
@@ -2585,7 +2686,14 @@ async def _exec_execute_code(args: dict) -> str:
         return "[error: code executor not available]"
     timeout = min(args.get("timeout", 120), 300)
     chat_id = _context_chat_id(args) or ""
-    return await _code_executor.execute(code, timeout=timeout, chat_id=chat_id)
+    # Carry the parent turn's ToolPolicy into the sandbox so call_tool()
+    # invocations inside the script can't bypass guardrails the outer
+    # turn was running under.
+    ctx = args.get("_context")
+    policy = ctx.policy if isinstance(ctx, ToolExecutionContext) else None
+    return await _code_executor.execute(
+        code, timeout=timeout, chat_id=chat_id, policy=policy
+    )
 
 
 # ── Checkpoint tool ──────────────────────────────────────────────────
@@ -3080,6 +3188,11 @@ async def execute_tool_result(
             metadata={"unavailable_reason": reason},
         )
     if context is not None:
+        # Propagate the active policy onto the context so nested dispatchers
+        # (notably execute_code's sandbox bridge) can re-apply it on inner
+        # tool calls instead of silently running unchecked.
+        if policy is not None and context.policy is None:
+            context.policy = policy
         arguments = dict(arguments)
         arguments["_context"] = context
     if name in _IMAGE_AWARE_TOOLS and image_callback:
