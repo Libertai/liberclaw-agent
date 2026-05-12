@@ -31,6 +31,15 @@ class MCPToolInfo:
 
 
 @dataclass
+class MCPToolCallResult:
+    """Structured result from an MCP tool call."""
+
+    content: str
+    is_error: bool
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
 class MCPServerConnection:
     """An active connection to an MCP server."""
 
@@ -360,15 +369,33 @@ class MCPClient:
             })
         return defs
 
-    async def call_tool(self, namespaced_name: str, arguments: dict) -> str:
-        """Call an MCP tool and return the result as a string."""
+    async def call_tool_result(
+        self, namespaced_name: str, arguments: dict
+    ) -> MCPToolCallResult:
+        """Call an MCP tool and return text plus structured metadata."""
         info = self._tools.get(namespaced_name)
+        base_metadata = {
+            "provider": "mcp",
+            "server": info.server_name if info else None,
+            "original_name": info.original_name if info else None,
+            "namespaced_name": namespaced_name,
+            "content_types": [],
+            "mcp_is_error": False,
+        }
         if info is None:
-            return f"[error: unknown MCP tool '{namespaced_name}']"
+            return MCPToolCallResult(
+                content=f"[error: unknown MCP tool '{namespaced_name}']",
+                is_error=True,
+                metadata=base_metadata,
+            )
 
         conn = self._servers.get(info.server_name)
         if conn is None:
-            return f"[error: MCP server '{info.server_name}' not connected]"
+            return MCPToolCallResult(
+                content=f"[error: MCP server '{info.server_name}' not connected]",
+                is_error=True,
+                metadata=base_metadata,
+            )
 
         try:
             result = await self._send_request(conn, "tools/call", {
@@ -377,12 +404,30 @@ class MCPClient:
             }, timeout=60.0)
 
             if result is None:
-                return "[error: MCP tool call returned no result]"
+                return MCPToolCallResult(
+                    content="[error: MCP tool call returned no result]",
+                    is_error=True,
+                    metadata=base_metadata,
+                )
 
             # MCP tool results have a "content" array with text/image blocks
             content_blocks = result.get("content", [])
+            content_types = [
+                block.get("type", "unknown")
+                for block in content_blocks
+                if isinstance(block, dict)
+            ]
+            metadata = {
+                **base_metadata,
+                "content_types": content_types,
+                "mcp_is_error": bool(result.get("isError", False)),
+            }
             if not content_blocks:
-                return "(empty result)"
+                return MCPToolCallResult(
+                    content="(empty result)",
+                    is_error=metadata["mcp_is_error"],
+                    metadata=metadata,
+                )
 
             parts = []
             for block in content_blocks:
@@ -396,13 +441,30 @@ class MCPClient:
                 else:
                     parts.append(json.dumps(block))
 
-            return "\n".join(parts)
+            return MCPToolCallResult(
+                content="\n".join(parts),
+                is_error=metadata["mcp_is_error"],
+                metadata=metadata,
+            )
 
         except MCPError as e:
-            return f"[error: MCP tool call failed: {e}]"
+            return MCPToolCallResult(
+                content=f"[error: MCP tool call failed: {e}]",
+                is_error=True,
+                metadata=base_metadata,
+            )
         except Exception as e:
             logger.error(f"MCP tool '{namespaced_name}' call error: {e}")
-            return f"[error: MCP tool call error: {e}]"
+            return MCPToolCallResult(
+                content=f"[error: MCP tool call error: {e}]",
+                is_error=True,
+                metadata=base_metadata,
+            )
+
+    async def call_tool(self, namespaced_name: str, arguments: dict) -> str:
+        """Call an MCP tool and return the result as a string."""
+        result = await self.call_tool_result(namespaced_name, arguments)
+        return result.content
 
 
 class MCPError(Exception):

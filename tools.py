@@ -2970,14 +2970,22 @@ async def execute_tool_result(
 
     # Route MCP tool calls to the MCP client
     if name.startswith("mcp_") and _mcp_client is not None:
-        content = await _mcp_client.call_tool(name, arguments)
+        if hasattr(_mcp_client, "call_tool_result"):
+            mcp_result = await _mcp_client.call_tool_result(name, arguments)
+            content = mcp_result.content
+            mcp_is_error = mcp_result.is_error
+            mcp_metadata = mcp_result.metadata
+        else:
+            content = await _mcp_client.call_tool(name, arguments)
+            mcp_is_error = _is_error_result(content)
+            mcp_metadata = {"provider": "mcp"}
         return ToolResult(
             name=name,
             content=content,
-            is_error=_is_error_result(content),
+            is_error=mcp_is_error or _is_error_result(content),
             duration_ms=int((_time.perf_counter() - started) * 1000),
             truncated=_is_truncated_result(content),
-            metadata={"mutating": True, "provider": "mcp"},
+            metadata={"mutating": True, **mcp_metadata},
         )
 
     handler = TOOL_HANDLERS.get(name)
