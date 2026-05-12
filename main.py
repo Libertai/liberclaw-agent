@@ -31,8 +31,10 @@ from baal_agent.plugins import PluginManager
 from baal_agent.scheduler import CronScheduler
 from baal_agent.tools import (
     ToolExecutionContext,
+    ToolResult,
     configure_tools,
     execute_tool,
+    execute_tool_result,
     get_tool_definitions,
     get_unavailable_tools,
     run_tool_calls_ordered,
@@ -43,6 +45,7 @@ from baal_agent.tools import (
     start_code_executor,
     start_mcp,
     start_shell,
+    tool_metadata,
 )
 
 logger = logging.getLogger(__name__)
@@ -435,11 +438,12 @@ async def _run_agent_turn(
             if tool_name == "spawn" and not restricted:
                 result = await _handle_spawn(arguments, chat_id)
             else:
-                result = await execute_tool(
+                tool_result = await execute_tool_result(
                     tool_name, arguments,
                     image_callback=_stash_images,
                     context=tool_context,
                 )
+                result = tool_result
 
             # Plugin post_tool hook
             if _plugin_manager is not None:
@@ -454,6 +458,19 @@ async def _run_agent_turn(
         for tc, result in zip(tool_calls, results):
             if isinstance(result, BaseException):
                 result = f"Error executing {tc.function.name}: {result}"
+                tool_metadata_payload = None
+            elif isinstance(result, ToolResult):
+                tool_metadata_payload = {
+                    "name": result.name,
+                    "is_error": result.is_error,
+                    "duration_ms": result.duration_ms,
+                    "truncated": result.truncated,
+                    "metadata": result.metadata,
+                    "artifacts": result.artifacts,
+                }
+                result = result.content
+            else:
+                tool_metadata_payload = None
 
             # Detect send_file markers and accumulate for callers
             if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -465,7 +482,13 @@ async def _run_agent_turn(
                 result = f"File sent to user: {rel_path}"
 
             if store_history:
-                await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
+                await db.add_message(
+                    chat_id,
+                    "tool",
+                    result,
+                    tool_call_id=tc.id,
+                    metadata=tool_metadata_payload,
+                )
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -934,11 +957,13 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 if tool_name == "spawn":
                     result = await _handle_spawn(arguments, chat_id)
                 else:
-                    result = await execute_tool(
+                    tool_result = await execute_tool_result(
                         tool_name, arguments,
                         image_callback=_stash_images,
                         context=tool_context,
                     )
+                    await _emit(run, tool_result.to_event())
+                    result = tool_result
 
                 # Plugin post_tool hook: may modify result
                 if _plugin_manager is not None:
@@ -957,6 +982,19 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                         f"Tool {tc.function.name} raised: {result}", exc_info=result
                     )
                     result = f"Error executing {tc.function.name}: {result}"
+                    tool_metadata_payload = None
+                elif isinstance(result, ToolResult):
+                    tool_metadata_payload = {
+                        "name": result.name,
+                        "is_error": result.is_error,
+                        "duration_ms": result.duration_ms,
+                        "truncated": result.truncated,
+                        "metadata": result.metadata,
+                        "artifacts": result.artifacts,
+                    }
+                    result = result.content
+                else:
+                    tool_metadata_payload = None
 
                 # Detect send_file markers and emit file SSE event
                 if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
@@ -967,7 +1005,11 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                     result = f"File sent to user: {rel_path}"
 
                 await db.add_message(
-                    chat_id, "tool", result, tool_call_id=tc.id
+                    chat_id,
+                    "tool",
+                    result,
+                    tool_call_id=tc.id,
+                    metadata=tool_metadata_payload,
                 )
                 messages.append({
                     "role": "tool",
@@ -1327,18 +1369,34 @@ async def health():
 
 @app.get("/info")
 async def info():
+    from baal_agent import AGENT_VERSION
+
+    tools = get_tool_definitions(include_spawn=True)
     return {
         "agent_name": settings.agent_name,
+        "agent_version": AGENT_VERSION,
+        "api_version": 3,
         "model": settings.model,
         "has_system_prompt": bool(settings.system_prompt),
         "capabilities": ["vision"],
-        "tools": [t["function"]["name"] for t in get_tool_definitions(include_spawn=True)],
+        "tools": [t["function"]["name"] for t in tools],
+        "tool_metadata": tool_metadata(),
         "unavailable_tools": get_unavailable_tools(),
         "features": {
             "workspace_tree": True,
             "subagents": True,
             "subagent_detail": True,
             "tool_gating": True,
+            "tool_result_events": True,
+            "tool_metadata": True,
+            "runtime_health": True,
+            "context_injection_scanner": True,
+        },
+        "runtime_health": {
+            "database": "configured" if db is not None else "unavailable",
+            "workspace": "configured" if settings.workspace_path else "unavailable",
+            "mcp": "configured" if settings.mcp_servers.strip() else "disabled",
+            "heartbeat": "enabled" if settings.heartbeat_interval > 0 else "disabled",
         },
         "heartbeat_interval": settings.heartbeat_interval,
     }

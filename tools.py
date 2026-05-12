@@ -57,6 +57,59 @@ class ToolExecutionContext:
 
     read_hashes: dict[str, str] = _field(default_factory=dict)
 
+
+@dataclass
+class ToolResult:
+    """Structured metadata for a tool execution."""
+
+    name: str
+    content: str
+    is_error: bool = False
+    duration_ms: int = 0
+    truncated: bool = False
+    metadata: dict = _field(default_factory=dict)
+    artifacts: list[dict] = _field(default_factory=list)
+
+    def to_event(self) -> dict:
+        preview = self.content[:2_000]
+        if len(self.content) > 2_000:
+            preview += "\n... preview truncated ..."
+        return {
+            "type": "tool_result",
+            "name": self.name,
+            "is_error": self.is_error,
+            "duration_ms": self.duration_ms,
+            "truncated": self.truncated,
+            "metadata": self.metadata,
+            "artifacts": self.artifacts,
+            "content": preview,
+        }
+
+
+def _is_error_result(content: str) -> bool:
+    return content.startswith("[error:") or content.startswith("Error executing ")
+
+
+def _is_truncated_result(content: str) -> bool:
+    lowered = content.lower()
+    return "[large output saved:" in content or "... truncated" in lowered or "omitted" in lowered
+
+
+def tool_metadata() -> list[dict]:
+    """Return public metadata for built-in tools."""
+    metadata = []
+    for tool in TOOL_DEFINITIONS:
+        name = tool["function"]["name"]
+        available, reason = _tool_available(name)
+        metadata.append({
+            "name": name,
+            "available": available,
+            "unavailable_reason": reason,
+            "mutating": is_mutating_tool(name),
+            "image_aware": name in _IMAGE_AWARE_TOOLS,
+        })
+    return metadata
+
 # ── Workspace configuration ──────────────────────────────────────────
 
 _workspace_path: str | None = None
@@ -2109,22 +2162,88 @@ async def execute_tool(
     context: ToolExecutionContext | None = None,
 ) -> str:
     """Dispatch a tool call by name. Returns the result string."""
+    result = await execute_tool_result(
+        name,
+        arguments,
+        image_callback=image_callback,
+        context=context,
+    )
+    return result.content
+
+
+async def execute_tool_result(
+    name: str,
+    arguments: str | dict,
+    *,
+    image_callback=None,
+    context: ToolExecutionContext | None = None,
+) -> ToolResult:
+    """Dispatch a tool call and return a structured result envelope."""
+    started = _time.perf_counter()
     if isinstance(arguments, str):
-        arguments = json.loads(arguments)
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError as exc:
+            content = f"[error: invalid tool arguments JSON: {exc}]"
+            return ToolResult(
+                name=name,
+                content=content,
+                is_error=True,
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+            )
 
     # Route MCP tool calls to the MCP client
     if name.startswith("mcp_") and _mcp_client is not None:
-        return await _mcp_client.call_tool(name, arguments)
+        content = await _mcp_client.call_tool(name, arguments)
+        return ToolResult(
+            name=name,
+            content=content,
+            is_error=_is_error_result(content),
+            duration_ms=int((_time.perf_counter() - started) * 1000),
+            truncated=_is_truncated_result(content),
+            metadata={"mutating": True, "provider": "mcp"},
+        )
 
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
-        return f"[error: unknown tool '{name}']"
+        content = f"[error: unknown tool '{name}']"
+        return ToolResult(
+            name=name,
+            content=content,
+            is_error=True,
+            duration_ms=int((_time.perf_counter() - started) * 1000),
+        )
     available, reason = _tool_available(name)
     if not available:
-        return f"[error: tool '{name}' unavailable: {reason}]"
+        content = f"[error: tool '{name}' unavailable: {reason}]"
+        return ToolResult(
+            name=name,
+            content=content,
+            is_error=True,
+            duration_ms=int((_time.perf_counter() - started) * 1000),
+            metadata={"unavailable_reason": reason},
+        )
     if context is not None:
         arguments = dict(arguments)
         arguments["_context"] = context
     if name in _IMAGE_AWARE_TOOLS and image_callback:
-        return await handler(arguments, image_callback=image_callback)
-    return await handler(arguments)
+        content = await handler(arguments, image_callback=image_callback)
+    else:
+        content = await handler(arguments)
+    artifacts = []
+    if isinstance(content, str) and content.startswith("__SEND_FILE__:"):
+        parts = content.split(":", 2)
+        artifacts.append({
+            "type": "file",
+            "path": parts[1] if len(parts) > 1 else "",
+            "caption": parts[2] if len(parts) > 2 else "",
+        })
+    return ToolResult(
+        name=name,
+        content=content,
+        is_error=_is_error_result(content),
+        duration_ms=int((_time.perf_counter() - started) * 1000),
+        truncated=_is_truncated_result(content),
+        metadata={"mutating": is_mutating_tool(name)},
+        artifacts=artifacts,
+    )

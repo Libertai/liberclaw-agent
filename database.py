@@ -29,6 +29,7 @@ class AgentDatabase:
                 content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
+                metadata TEXT,
                 compacted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -77,6 +78,10 @@ class AgentDatabase:
         if "compacted" not in columns:
             await self._db.execute(
                 "ALTER TABLE messages ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0"
+            )
+        if "metadata" not in columns:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN metadata TEXT"
             )
 
         await self._db.commit()
@@ -131,21 +136,27 @@ class AgentDatabase:
         *,
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         tc_json = json.dumps(tool_calls) if tool_calls else None
+        metadata_json = json.dumps(metadata) if metadata else None
         # Serialize list content to JSON for storage
         stored = json.dumps(content) if isinstance(content, list) else content
         cursor = await self.db.execute(
-            "INSERT INTO messages (chat_id, role, content, tool_calls, tool_call_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, role, stored, tc_json, tool_call_id, now),
+            "INSERT INTO messages (chat_id, role, content, tool_calls, tool_call_id, metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, role, stored, tc_json, tool_call_id, metadata_json, now),
         )
         await self._index_message_fts(cursor.lastrowid, content)
         await self.db.commit()
 
     async def get_history(
-        self, chat_id: str, limit: int = 50, include_timestamps: bool = False
+        self,
+        chat_id: str,
+        limit: int = 50,
+        include_timestamps: bool = False,
+        include_metadata: bool = False,
     ) -> list[dict]:
         """Return conversation history. When `include_timestamps=True`, each
         row also carries `created_at` (UTC 'YYYY-MM-DD HH:MM:SS'). Off by
@@ -154,6 +165,8 @@ class AgentDatabase:
         cols = "role, content, tool_calls, tool_call_id"
         if include_timestamps:
             cols += ", created_at"
+        if include_metadata:
+            cols += ", metadata"
         cursor = await self.db.execute(
             f"SELECT {cols} "
             "FROM messages WHERE chat_id = ? AND compacted = 0 "
@@ -180,6 +193,11 @@ class AgentDatabase:
                 msg["tool_call_id"] = r["tool_call_id"]
             if include_timestamps and r["created_at"]:
                 msg["created_at"] = r["created_at"]
+            if include_metadata and r["metadata"]:
+                try:
+                    msg["metadata"] = json.loads(r["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
             messages.append(msg)
         return messages
 
