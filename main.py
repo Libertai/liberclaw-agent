@@ -92,6 +92,23 @@ async def _emit_guardrail_blocked(run: "ChatRun", result: ToolResult) -> None:
     except Exception:
         logger.debug("Failed to persist canonical guardrail event", exc_info=True)
 
+
+async def _apply_pre_inference(messages: list[dict]) -> list[dict]:
+    if _plugin_manager is None:
+        return messages
+    modified = await _plugin_manager.fire_modify("pre_inference", messages)
+    return modified if isinstance(modified, list) else messages
+
+
+async def _apply_post_inference(assistant_msg):
+    if _plugin_manager is None:
+        return assistant_msg
+    content = assistant_msg.content or ""
+    modified = await _plugin_manager.fire_modify("post_inference", content)
+    if isinstance(modified, str):
+        assistant_msg.content = modified
+    return assistant_msg
+
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
@@ -422,9 +439,11 @@ async def _run_agent_turn(
     total_tool_calls = 0
 
     for _iteration in range(iterations):
+        inference_messages = await _apply_pre_inference(messages)
         assistant_msg = await inference.chat(
-            messages=messages, model=settings.model, tools=tools
+            messages=inference_messages, model=settings.model, tools=tools
         )
+        assistant_msg = await _apply_post_inference(assistant_msg)
 
         text_content = assistant_msg.content
         tool_calls = assistant_msg.tool_calls
@@ -932,12 +951,14 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
 
             for _inf_attempt in range(_LOOP_INFERENCE_RETRIES + 1):
                 try:
+                    inference_messages = await _apply_pre_inference(messages)
                     assistant_msg = await asyncio.wait_for(
                         inference.chat(
-                            messages=messages, model=settings.model, tools=tools
+                            messages=inference_messages, model=settings.model, tools=tools
                         ),
                         timeout=inference_timeout,
                     )
+                    assistant_msg = await _apply_post_inference(assistant_msg)
                     break  # success — exit retry loop
                 except Exception as e:
                     last_inference_error = e
