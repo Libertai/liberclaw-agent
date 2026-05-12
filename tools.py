@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import os
 import re
+import shutil
 import signal
 import time as _time
 import uuid
@@ -236,7 +238,12 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Find and replace an exact string in a file (first occurrence).",
+            "description": (
+                "Find and replace an exact string in a text file. By default the "
+                "old string must appear exactly once. Set replace_all=true to "
+                "replace every occurrence. Optionally pass expected_hash "
+                "(SHA-256 of the current file) to reject stale edits."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -251,6 +258,14 @@ TOOL_DEFINITIONS = [
                     "new_string": {
                         "type": "string",
                         "description": "The replacement string.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "If true, replace all occurrences. Defaults to false.",
+                    },
+                    "expected_hash": {
+                        "type": "string",
+                        "description": "Optional SHA-256 hash the file must match before editing.",
                     },
                 },
                 "required": ["path", "old_string", "new_string"],
@@ -270,6 +285,75 @@ TOOL_DEFINITIONS = [
                         "description": "Directory path to list. Defaults to current directory.",
                     },
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": (
+                "Find files by filename pattern inside the workspace. Results are "
+                "sorted by modification time, newest first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern such as '*.py' or '**/*.md'.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search within. Defaults to workspace root.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 100, max 500).",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": (
+                "Search text files with ripgrep inside the workspace. Use this "
+                "instead of bash for code/text search."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Search pattern passed to ripgrep.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search. Defaults to workspace root.",
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_with_matches", "count"],
+                        "description": "Result mode. Defaults to content.",
+                    },
+                    "type_filter": {
+                        "type": "string",
+                        "description": "Optional ripgrep file type filter, e.g. 'py', 'ts', 'md'.",
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "If false, run case-insensitive search.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum output lines to return (default 200, max 1000).",
+                    },
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -566,6 +650,39 @@ _ERROR_PATTERNS = re.compile(
 )
 
 
+def _spill_tool_output(text: str, source: str = "") -> str | None:
+    """Persist oversized tool output to workspace/tool-results and return a preview."""
+    if not _workspace_path:
+        return None
+    try:
+        workspace = Path(_workspace_path)
+        out_dir = workspace / "tool-results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_source = re.sub(r"[^A-Za-z0-9_.-]+", "-", source or "tool").strip("-")
+        filename = f"{safe_source or 'tool'}-{uuid.uuid4().hex[:12]}.txt"
+        path = out_dir / filename
+        path.write_text(text)
+        rel = path.relative_to(workspace)
+        line_count = text.count("\n") + (1 if text else 0)
+        preview_budget = min(MAX_TOOL_OUTPUT - 500, 8_000)
+        head = preview_budget * 2 // 3
+        tail = preview_budget - head
+        preview = text[:head]
+        if len(text) > preview_budget:
+            preview += (
+                f"\n\n... full output saved to {rel} "
+                f"({len(text):,} chars, {line_count:,} lines) ...\n\n"
+                + text[-tail:]
+            )
+        return (
+            f"[large output saved: {rel} "
+            f"({len(text):,} chars, {line_count:,} lines)]\n\n"
+            f"{preview}"
+        )
+    except Exception:
+        return None
+
+
 def _truncate(text: str, source: str = "") -> str:
     """Context-aware truncation of tool output.
 
@@ -579,6 +696,10 @@ def _truncate(text: str, source: str = "") -> str:
     """
     if len(text) <= MAX_TOOL_OUTPUT:
         return text
+
+    spilled = _spill_tool_output(text, source)
+    if spilled is not None:
+        return spilled
 
     total_chars = len(text)
     # Reserve space for the truncation notice
@@ -998,6 +1119,8 @@ async def _exec_edit_file(args: dict) -> str:
     path = args.get("path")
     old_string = args.get("old_string")
     new_string = args.get("new_string")
+    replace_all = bool(args.get("replace_all", False))
+    expected_hash = args.get("expected_hash")
     if not path:
         return "[error: missing required 'path' parameter]"
     if old_string is None:
@@ -1013,11 +1136,28 @@ async def _exec_edit_file(args: dict) -> str:
             return f"[error: {path} is a binary file and cannot be edited as text]"
         with open(resolved, "r") as f:
             content = f.read()
-        if old_string not in content:
+        if expected_hash:
+            actual_hash = hashlib.sha256(content.encode()).hexdigest()
+            if actual_hash != expected_hash:
+                return (
+                    f"[error: stale edit refused for {path}; expected_hash "
+                    f"does not match current file hash]"
+                )
+        occurrences = content.count(old_string)
+        if occurrences == 0:
             return f"[error: old_string not found in {path}]"
-        content = content.replace(old_string, new_string, 1)
+        if occurrences > 1 and not replace_all:
+            return (
+                f"[error: old_string appears {occurrences} times in {path}; "
+                "refusing ambiguous edit. Set replace_all=true to replace all occurrences.]"
+            )
+        content = content.replace(
+            old_string, new_string, occurrences if replace_all else 1
+        )
         with open(resolved, "w") as f:
             f.write(content)
+        if replace_all:
+            return f"Edited {path} ({occurrences} replacements)"
         return f"Edited {path}"
     except PathSecurityError as e:
         return f"[error: {e}]"
@@ -1046,6 +1186,104 @@ async def _exec_list_dir(args: dict) -> str:
         return f"[error: {e}]"
     except PermissionError:
         return f"[error: permission denied: {path}]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+async def _exec_glob(args: dict) -> str:
+    pattern = args.get("pattern")
+    if not pattern:
+        return "[error: missing required 'pattern' parameter]"
+    limit = min(max(int(args.get("limit", 100)), 1), 500)
+    path = args.get("path", ".")
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    try:
+        workspace = Path(_workspace_path).resolve()
+        root = validate_workspace_path(path, workspace, must_exist=True)
+        if not root.is_dir():
+            return f"[error: not a directory: {path}]"
+        matches = []
+        for item in root.glob(pattern):
+            try:
+                resolved = item.resolve()
+                resolved.relative_to(workspace)
+            except (OSError, ValueError):
+                continue
+            matches.append(resolved)
+        matches = sorted(
+            matches,
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        if not matches:
+            return "(no matches)"
+        lines = []
+        for match in matches[:limit]:
+            rel = match.relative_to(workspace)
+            suffix = "/" if match.is_dir() else ""
+            lines.append(f"{rel}{suffix}")
+        if len(matches) > limit:
+            lines.append(f"... {len(matches) - limit} more matches omitted")
+        return "\n".join(lines)
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+async def _exec_grep(args: dict) -> str:
+    pattern = args.get("pattern")
+    if not pattern:
+        return "[error: missing required 'pattern' parameter]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    rg = shutil.which("rg")
+    if not rg:
+        return "[error: ripgrep (rg) is not installed]"
+    output_mode = args.get("output_mode", "content")
+    if output_mode not in {"content", "files_with_matches", "count"}:
+        return "[error: output_mode must be one of content, files_with_matches, count]"
+    limit = min(max(int(args.get("limit", 200)), 1), 1000)
+    path = args.get("path", ".")
+    try:
+        workspace = Path(_workspace_path).resolve()
+        target = validate_workspace_path(path, workspace, must_exist=True)
+        cmd = [rg, "--color", "never"]
+        if output_mode == "content":
+            cmd.extend(["--line-number", "--no-heading"])
+        elif output_mode == "files_with_matches":
+            cmd.append("--files-with-matches")
+        elif output_mode == "count":
+            cmd.append("--count-matches")
+        if args.get("case_sensitive") is False:
+            cmd.append("--ignore-case")
+        type_filter = args.get("type_filter")
+        if type_filter:
+            cmd.extend(["--type", str(type_filter)])
+        cmd.extend(["--", str(pattern), str(target)])
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(workspace),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace").strip()
+        if proc.returncode == 1 and not out:
+            return "(no matches)"
+        if proc.returncode not in (0, 1):
+            return f"[error: rg exited {proc.returncode}: {err or out}]"
+        lines = out.splitlines()
+        if len(lines) > limit:
+            out = "\n".join(lines[:limit])
+            out += f"\n... {len(lines) - limit} more lines omitted"
+        return _truncate(out, source="grep") if out.strip() else "(no matches)"
+    except asyncio.TimeoutError:
+        return "[timed out after 30s]"
+    except PathSecurityError as e:
+        return f"[error: {e}]"
     except Exception as e:
         return f"[error: {e}]"
 
@@ -1721,6 +1959,8 @@ TOOL_HANDLERS: dict[str, callable] = {
     "write_file": _exec_write_file,
     "edit_file": _exec_edit_file,
     "list_dir": _exec_list_dir,
+    "glob": _exec_glob,
+    "grep": _exec_grep,
     "web_fetch": _exec_web_fetch,
     "search_history": _exec_search_history,
     "web_search": _exec_web_search,
@@ -1733,9 +1973,32 @@ TOOL_HANDLERS: dict[str, callable] = {
 }
 
 
+def _tool_available(name: str) -> tuple[bool, str | None]:
+    """Return whether a built-in tool is currently usable."""
+    if name in {"web_search", "generate_image"} and not os.environ.get("LIBERTAI_API_KEY", ""):
+        return False, "LIBERTAI_API_KEY is not configured"
+    if name == "grep" and shutil.which("rg") is None:
+        return False, "ripgrep (rg) is not installed"
+    return True, None
+
+
+def get_unavailable_tools() -> dict[str, str]:
+    """Return unavailable built-in tool names mapped to their reasons."""
+    unavailable: dict[str, str] = {}
+    for tool in TOOL_DEFINITIONS:
+        name = tool["function"]["name"]
+        available, reason = _tool_available(name)
+        if not available and reason:
+            unavailable[name] = reason
+    return unavailable
+
+
 def get_tool_definitions(*, include_spawn: bool = True) -> list[dict]:
     """Return tool definitions, optionally including spawn and MCP tools."""
-    defs = list(TOOL_DEFINITIONS)
+    defs = [
+        tool for tool in TOOL_DEFINITIONS
+        if _tool_available(tool["function"]["name"])[0]
+    ]
     if include_spawn:
         defs.append(SPAWN_TOOL_DEF)
     if _mcp_client is not None:
@@ -1760,6 +2023,9 @@ async def execute_tool(
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"[error: unknown tool '{name}']"
+    available, reason = _tool_available(name)
+    if not available:
+        return f"[error: tool '{name}' unavailable: {reason}]"
     if name in _IMAGE_AWARE_TOOLS and image_callback:
         return await handler(arguments, image_callback=image_callback)
     return await handler(arguments)

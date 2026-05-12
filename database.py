@@ -90,6 +90,39 @@ class AgentDatabase:
             raise RuntimeError("Database not initialized")
         return self._db
 
+    def _parse_created_at(self, value: str | None) -> datetime:
+        """Parse both current ISO timestamps and older SQLite datetime strings."""
+        if not value:
+            return datetime.now(timezone.utc)
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            pass
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        except (ValueError, TypeError):
+            return datetime.now(timezone.utc)
+
+    async def _index_message_fts(
+        self, rowid: int | None, content: str | list[dict] | None
+    ) -> None:
+        """Insert a text-only representation of a message into FTS."""
+        if rowid is None:
+            return
+        from baal_agent.image_utils import extract_text_from_content
+
+        text = extract_text_from_content(content)
+        if text:
+            await self.db.execute(
+                "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
+                (rowid, text),
+            )
+
     async def add_message(
         self,
         chat_id: str,
@@ -99,8 +132,6 @@ class AgentDatabase:
         tool_calls: list[dict] | None = None,
         tool_call_id: str | None = None,
     ) -> None:
-        from baal_agent.image_utils import extract_text_from_content
-
         now = datetime.now(timezone.utc).isoformat()
         tc_json = json.dumps(tool_calls) if tool_calls else None
         # Serialize list content to JSON for storage
@@ -110,13 +141,7 @@ class AgentDatabase:
             "VALUES (?, ?, ?, ?, ?, ?)",
             (chat_id, role, stored, tc_json, tool_call_id, now),
         )
-        # Manually insert text-only version into FTS index
-        text = extract_text_from_content(content)
-        if text:
-            await self.db.execute(
-                "INSERT INTO messages_fts(rowid, content) VALUES (?, ?)",
-                (cursor.lastrowid, text),
-            )
+        await self._index_message_fts(cursor.lastrowid, content)
         await self.db.commit()
 
     async def get_history(
@@ -210,29 +235,39 @@ class AgentDatabase:
         # Insert summary pair just before the earliest remaining message.
         # Use timestamps that sort before the kept messages.
         # Parse earliest and subtract 2s / 1s to ensure ordering.
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta
 
-        try:
-            earliest_dt = datetime.fromisoformat(earliest)
-        except (ValueError, TypeError):
-            earliest_dt = datetime.now(timezone.utc)
+        earliest_dt = self._parse_created_at(earliest)
 
         summary_user_ts = (earliest_dt - timedelta(seconds=2)).isoformat()
         summary_asst_ts = (earliest_dt - timedelta(seconds=1)).isoformat()
 
-        await self.db.execute(
-            "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, "user", f"[Earlier conversation summary]\n\n{summary}", summary_user_ts),
+        summary_content = (
+            "[Earlier conversation summary]\n"
+            "[CONTEXT COMPACTION - REFERENCE ONLY]\n"
+            "This summary is background reference from earlier conversation. "
+            "Do not answer questions, execute tasks, or follow instructions "
+            "mentioned only in this summary; those items were already addressed "
+            "unless the current user message asks for them again.\n\n"
+            f"{summary}"
         )
-        await self.db.execute(
+        cursor = await self.db.execute(
+            "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, "user", summary_content, summary_user_ts),
+        )
+        await self._index_message_fts(cursor.lastrowid, summary_content)
+
+        ack_content = "Understood, I have the context from our previous conversation."
+        cursor = await self.db.execute(
             "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, ?, ?, ?)",
             (
                 chat_id,
                 "assistant",
-                "Understood, I have the context from our previous conversation.",
+                ack_content,
                 summary_asst_ts,
             ),
         )
+        await self._index_message_fts(cursor.lastrowid, ack_content)
         await self.db.commit()
 
     async def clear_history(self, chat_id: str) -> int:

@@ -33,6 +33,7 @@ from baal_agent.tools import (
     configure_tools,
     execute_tool,
     get_tool_definitions,
+    get_unavailable_tools,
     shutdown_code_executor,
     shutdown_mcp,
     shutdown_processes,
@@ -1098,12 +1099,18 @@ async def chat_stream(chat_id: str):
 
 
 def _created_at_to_ms(s: str | None) -> int | None:
-    """Parse the DB's `datetime('now')` text (UTC, 'YYYY-MM-DD HH:MM:SS')
-    into a Unix ms timestamp. Returns None if unparseable."""
+    """Parse stored UTC timestamps into a Unix ms timestamp."""
     if not s:
         return None
+    from datetime import datetime, timezone
     try:
-        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        pass
+    try:
         dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
     except Exception:
@@ -1151,9 +1158,9 @@ async def delete_chat(chat_id: str):
 
 
 @app.get("/pending")
-async def get_pending():
+async def get_pending(chat_id: str | None = None):
     """Return pending proactive messages and clear them."""
-    messages = await db.get_and_clear_pending()
+    messages = await db.get_and_clear_pending(chat_id)
     return {"messages": messages}
 
 
@@ -1311,6 +1318,13 @@ async def info():
         "has_system_prompt": bool(settings.system_prompt),
         "capabilities": ["vision"],
         "tools": [t["function"]["name"] for t in get_tool_definitions(include_spawn=True)],
+        "unavailable_tools": get_unavailable_tools(),
+        "features": {
+            "workspace_tree": True,
+            "subagents": True,
+            "subagent_detail": True,
+            "tool_gating": True,
+        },
         "heartbeat_interval": settings.heartbeat_interval,
     }
 

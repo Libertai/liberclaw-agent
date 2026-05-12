@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 
 from baal_agent.config import AgentSettings
 from baal_agent.database import AgentDatabase
@@ -86,6 +87,9 @@ _COMPACTION_UPDATE_PROMPT = (
     "Active Tasks, Important Context). Add new items, update changed items, "
     "mark completed tasks. Preserve all sections even if unchanged."
 )
+
+_MAX_TODO_CONTEXT_CHARS = 4_000
+_MAX_TODO_CONTEXT_ITEMS = 25
 
 _MEMORY_FLUSH_PROMPT = (
     "The conversation context is about to be compressed. Review the recent messages "
@@ -226,6 +230,60 @@ def _inject_dynamic_context(messages: list[dict], dynamic_context: str) -> list[
     return messages
 
 
+def _load_active_todo_context(workspace_path: str) -> str:
+    """Render active TODO.json items for post-compaction context reinjection."""
+    todo_file = Path(workspace_path) / "TODO.json"
+    if not todo_file.exists():
+        return ""
+    try:
+        data = json.loads(todo_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, list):
+        return ""
+
+    active = [
+        task for task in data
+        if isinstance(task, dict)
+        and task.get("status") in {"pending", "in_progress"}
+    ]
+    if not active:
+        return ""
+
+    lines = [
+        "## Active Tasks From TODO.json",
+        "",
+        "These are active operational tasks, not long-term memory.",
+    ]
+    for task in active[:_MAX_TODO_CONTEXT_ITEMS]:
+        task_id = task.get("id", "?")
+        status = task.get("status", "pending")
+        priority = task.get("priority", "medium")
+        title = str(task.get("title", "(untitled)")).strip() or "(untitled)"
+        lines.append(f"- [{task_id}] ({status}, {priority}) {title}")
+        notes = str(task.get("notes", "")).strip()
+        if notes:
+            lines.append(f"  Notes: {notes}")
+
+    if len(active) > _MAX_TODO_CONTEXT_ITEMS:
+        lines.append(f"- ... {len(active) - _MAX_TODO_CONTEXT_ITEMS} more active tasks omitted")
+
+    rendered = "\n".join(lines)
+    if len(rendered) > _MAX_TODO_CONTEXT_CHARS:
+        rendered = rendered[:_MAX_TODO_CONTEXT_CHARS].rstrip()
+        rendered += "\n- ... active task context truncated"
+    return rendered
+
+
+def _append_context_section(dynamic_context: str, section: str) -> str:
+    """Append a dynamic context section, preserving the existing separator style."""
+    if not section:
+        return dynamic_context
+    if dynamic_context:
+        return dynamic_context + "\n\n---\n\n" + section
+    return section
+
+
 async def maybe_compact(
     db: AgentDatabase,
     inference: InferenceClient,
@@ -339,6 +397,10 @@ async def maybe_compact(
     history = await db.get_history(chat_id, limit=settings.max_history)
     result = [{"role": "system", "content": system_prompt}]
     result.extend(history)
+    dynamic_context = _append_context_section(
+        dynamic_context,
+        _load_active_todo_context(settings.workspace_path),
+    )
 
     new_tokens = estimate_tokens(result)
     logger.info(
