@@ -7,9 +7,16 @@ import base64
 import itertools
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Circuit-breaker thresholds. After N consecutive failures from a server,
+# we short-circuit subsequent calls for COOLDOWN seconds so a single bad
+# server doesn't stall every chat turn (each call has a 60s timeout).
+_CIRCUIT_THRESHOLD = 3
+_CIRCUIT_COOLDOWN = 60.0
 
 
 @dataclass
@@ -59,9 +66,42 @@ class MCPClient:
         # caused id collisions if two MCPClient instances coexisted (mostly an
         # issue in tests, but conceptually wrong).
         self._id_counter = itertools.count(1)
+        # Circuit breaker state per server.
+        self._failure_counts: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
 
     def _next_request_id(self) -> int:
         return next(self._id_counter)
+
+    def _circuit_state(self, server_name: str) -> tuple[bool, float]:
+        """Return (open, seconds_remaining) for a server."""
+        until = self._circuit_open_until.get(server_name, 0.0)
+        now = time.monotonic()
+        if until > now:
+            return True, until - now
+        if until:
+            # Cooldown elapsed; clear so the next failure counts fresh.
+            self._circuit_open_until.pop(server_name, None)
+        return False, 0.0
+
+    def _record_success(self, server_name: str) -> None:
+        self._failure_counts.pop(server_name, None)
+        self._circuit_open_until.pop(server_name, None)
+
+    def _record_failure(self, server_name: str) -> None:
+        count = self._failure_counts.get(server_name, 0) + 1
+        self._failure_counts[server_name] = count
+        if count >= _CIRCUIT_THRESHOLD:
+            self._circuit_open_until[server_name] = (
+                time.monotonic() + _CIRCUIT_COOLDOWN
+            )
+            logger.warning(
+                "MCP server %r tripped the circuit breaker after %d "
+                "consecutive failures; pausing calls for %.0fs",
+                server_name,
+                count,
+                _CIRCUIT_COOLDOWN,
+            )
 
     async def connect(self, name: str, config: dict) -> None:
         """Connect to an MCP server.
@@ -401,6 +441,20 @@ class MCPClient:
                 metadata=base_metadata,
             )
 
+        # Fail fast when the breaker is open. Each MCP call is bounded by a
+        # 60s timeout — without this, a flaky server adds 60s of latency to
+        # every chat turn until it recovers.
+        is_open, remaining = self._circuit_state(info.server_name)
+        if is_open:
+            return MCPToolCallResult(
+                content=(
+                    f"[error: MCP server '{info.server_name}' circuit open; "
+                    f"retry in {remaining:.0f}s]"
+                ),
+                is_error=True,
+                metadata={**base_metadata, "circuit_open": True},
+            )
+
         try:
             result = await self._send_request(conn, "tools/call", {
                 "name": info.original_name,
@@ -408,6 +462,7 @@ class MCPClient:
             }, timeout=60.0)
 
             if result is None:
+                self._record_failure(info.server_name)
                 return MCPToolCallResult(
                     content="[error: MCP tool call returned no result]",
                     is_error=True,
@@ -468,6 +523,15 @@ class MCPClient:
             if image_blocks:
                 metadata["image_count"] = len(image_blocks) // 2
 
+            # Server-side `isError=True` is a protocol-level error from the
+            # tool itself (model called it with bad args, etc.). It does not
+            # mean the transport is unhealthy, so it shouldn't trip the
+            # breaker — only transport/timeout failures should.
+            if metadata["mcp_is_error"]:
+                # Leave failure counter unchanged.
+                pass
+            else:
+                self._record_success(info.server_name)
             return MCPToolCallResult(
                 content="\n".join(parts),
                 is_error=metadata["mcp_is_error"],
@@ -475,12 +539,14 @@ class MCPClient:
             )
 
         except MCPError as e:
+            self._record_failure(info.server_name)
             return MCPToolCallResult(
                 content=f"[error: MCP tool call failed: {e}]",
                 is_error=True,
                 metadata=base_metadata,
             )
         except Exception as e:
+            self._record_failure(info.server_name)
             logger.error(f"MCP tool '{namespaced_name}' call error: {e}")
             return MCPToolCallResult(
                 content=f"[error: MCP tool call error: {e}]",

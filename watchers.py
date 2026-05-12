@@ -11,6 +11,30 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Cap the watcher set per agent. Each watcher fingerprints its target on
+# every tick (~60s); without a cap a user could trivially make tick time
+# proportional to the workspace size times the watcher count.
+MAX_WATCHERS = 16
+
+# Cap rglob entries fingerprinted for a single directory watcher. Stops a
+# pathological workspace (e.g. a huge node_modules clone in a watched dir)
+# from chewing CPU for seconds on every tick.
+MAX_DIR_FINGERPRINT_ENTRIES = 5_000
+
+# Subdirectories we always skip when fingerprinting a watched directory.
+# These are agent-internal and produce spurious churn — `tool-results/` and
+# `.baal-history/` accumulate per turn, `.git` is the user's own repo state,
+# and the others are language toolchain caches.
+_FINGERPRINT_SKIP_DIRS = frozenset({
+    ".git",
+    ".baal-history",
+    "tool-results",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+})
+
 
 @dataclass
 class FileWatcher:
@@ -51,6 +75,13 @@ def load_watchers(workspace_path: str) -> list[FileWatcher]:
             enabled=entry.get("enabled", True),
             debounce=max(0, int(entry.get("debounce", 60))),
         ))
+    if len(watchers) > MAX_WATCHERS:
+        logger.warning(
+            "watchers.json declared %d watchers; capping at %d",
+            len(watchers),
+            MAX_WATCHERS,
+        )
+        watchers = watchers[:MAX_WATCHERS]
     return watchers
 
 
@@ -92,9 +123,21 @@ def watched_fingerprint(workspace_path: str, watch_path: str) -> str | None:
         return digest.hexdigest()
 
     if target.is_dir():
+        entries = []
+        truncated = False
         for child in sorted(target.rglob("*")):
-            if child.name in {".git", "__pycache__", "node_modules"}:
+            # Skip anything under one of the agent-internal / toolchain
+            # directories so they don't churn the fingerprint every turn.
+            parts = set(child.relative_to(target).parts)
+            if parts & _FINGERPRINT_SKIP_DIRS:
                 continue
+            if child.name in _FINGERPRINT_SKIP_DIRS:
+                continue
+            entries.append(child)
+            if len(entries) >= MAX_DIR_FINGERPRINT_ENTRIES:
+                truncated = True
+                break
+        for child in entries:
             try:
                 rel = child.relative_to(workspace)
                 stat = child.stat()
@@ -102,6 +145,17 @@ def watched_fingerprint(workspace_path: str, watch_path: str) -> str | None:
                 continue
             kind = "dir" if child.is_dir() else "file"
             digest.update(f"{kind}:{rel}:{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+        if truncated:
+            digest.update(
+                f"truncated:{MAX_DIR_FINGERPRINT_ENTRIES}\n".encode()
+            )
+            logger.warning(
+                "Watched dir %s exceeded %d entries; fingerprint may miss "
+                "changes outside the first %d entries.",
+                watch_path,
+                MAX_DIR_FINGERPRINT_ENTRIES,
+                MAX_DIR_FINGERPRINT_ENTRIES,
+            )
         return digest.hexdigest()
 
     return None

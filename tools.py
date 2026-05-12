@@ -1793,6 +1793,10 @@ async def _exec_apply_patch(args: dict) -> str:
         detail = (check_stderr or check_stdout).decode("utf-8", errors="replace").strip()
         return f"[error: patch check failed: {detail}]"
 
+    paths_ok, paths_err = await _verify_patch_numstat(git, workspace, patch)
+    if not paths_ok:
+        return paths_err
+
     apply_proc = await asyncio.create_subprocess_exec(
         git,
         "apply",
@@ -1807,6 +1811,47 @@ async def _exec_apply_patch(args: dict) -> str:
         detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
         return f"[error: patch apply failed: {detail}]"
     return "Patch applied"
+
+
+async def _verify_patch_numstat(
+    git: str, workspace: Path, patch: str
+) -> tuple[bool, str]:
+    """Re-validate the patch via git's own filename parser.
+
+    `_validate_patch_paths` is a best-effort header parse and is fragile
+    against quoted filenames with embedded escapes; git's --numstat output
+    is the canonical source of truth for which paths a patch would touch.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        git,
+        "apply",
+        "--numstat",
+        "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
+        cwd=str(workspace),
+    )
+    stdout, _ = await asyncio.wait_for(proc.communicate(patch.encode()), timeout=30)
+    try:
+        for raw_line in stdout.decode("utf-8", errors="replace").splitlines():
+            parts = raw_line.split("\t")
+            if len(parts) < 3:
+                continue
+            touched = parts[2].strip()
+            if not touched or touched.startswith("/"):
+                return False, f"[error: patch touches non-workspace path: {touched!r}]"
+            candidates = [touched]
+            if " => " in touched:
+                left, _, right = touched.partition(" => ")
+                candidates = [left.strip("{}"), right.strip("{}")]
+            for candidate in candidates:
+                if not candidate or candidate == "/dev/null":
+                    continue
+                validate_workspace_path(candidate, workspace, must_exist=False)
+    except PathSecurityError as e:
+        return False, f"[error: patch touches path outside workspace: {e}]"
+    return True, ""
 
 
 def _validate_patch_paths(patch: str, workspace: Path) -> None:
