@@ -457,19 +457,26 @@ class SkillMetadata:
     platforms: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class AvailableSkill:
+    id: str
+    path: Path
+    metadata: SkillMetadata
+
+
 _SKILLS_SUMMARY_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], list[tuple[str, SkillMetadata]]]] = {}
 
 
-def _load_skills_summary(
+def collect_available_skills(
     workspace: Path,
     *,
     tool_names: set[str] | None = None,
     platform: str | None = None,
-) -> str:
-    """Scan workspace/skills/*/SKILL.md and return a summary list."""
+) -> list[AvailableSkill]:
+    """Return skills visible for the current tool/platform context."""
     skills_dir = workspace / "skills"
     if not skills_dir.is_dir():
-        return ""
+        return []
 
     entries: list[tuple[str, Path]] = []
     manifest_parts: list[tuple[str, int, int]] = []
@@ -501,7 +508,7 @@ def _load_skills_summary(
             parsed_skills.append((dir_name, _parse_skill_metadata(dir_name, skill_content)))
         _SKILLS_SUMMARY_CACHE[cache_key] = (manifest, parsed_skills)
 
-    lines = []
+    available: list[AvailableSkill] = []
     available_tools = tool_names or set()
     normalized_platform = platform.lower() if platform else None
     for dir_name, metadata in parsed_skills:
@@ -513,9 +520,26 @@ def _load_skills_summary(
         ):
             continue
         skill_file = skills_dir / dir_name / "SKILL.md"
+        available.append(AvailableSkill(dir_name, skill_file, metadata))
+    return available
+
+
+def _load_skills_summary(
+    workspace: Path,
+    *,
+    tool_names: set[str] | None = None,
+    platform: str | None = None,
+) -> str:
+    """Scan workspace/skills/*/SKILL.md and return a summary list."""
+    lines = []
+    for skill in collect_available_skills(
+        workspace,
+        tool_names=tool_names,
+        platform=platform,
+    ):
         lines.append(
-            f"- **{metadata.name}**: {metadata.description} "
-            f"(read `{skill_file}` for details)"
+            f"- **{skill.metadata.name}**: {skill.metadata.description} "
+            f"(read `{skill.path}` for details)"
         )
 
     return "\n".join(lines) if lines else ""

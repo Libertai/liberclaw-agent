@@ -28,6 +28,7 @@ from baal_agent.context import (
     build_static_system_prompt,
     build_subagent_prompt,
     build_system_prompt,
+    collect_available_skills,
 )
 from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
@@ -153,6 +154,49 @@ def _append_context_block(dynamic_context: str, block: str) -> str:
     if not block:
         return dynamic_context
     return dynamic_context + "\n\n---\n\n" + block if dynamic_context else block
+
+
+async def _record_skill_considered(
+    chat_id: str,
+    tool_names: list[str],
+    platform: str | None,
+) -> None:
+    try:
+        skills = collect_available_skills(
+            Path(settings.workspace_path),
+            tool_names=set(tool_names),
+            platform=platform,
+        )
+        payload = {
+            "type": "skill.considered",
+            "platform": platform,
+            "count": len(skills),
+            "skills": [
+                {
+                    "id": skill.id,
+                    "name": skill.metadata.name,
+                    "description": skill.metadata.description,
+                }
+                for skill in skills
+            ],
+        }
+        await db.add_event(chat_id, "skill.considered", payload)
+    except Exception:
+        logger.debug("Failed to record skill consideration", exc_info=True)
+
+
+async def _record_skill_loaded(chat_id: str, result: ToolResult) -> None:
+    for skill in result.metadata.get("skills_loaded", []) or []:
+        try:
+            payload = {
+                "type": "skill.loaded",
+                "id": skill.get("id"),
+                "path": skill.get("path"),
+                "tool": result.name,
+            }
+            await db.add_event(chat_id, "skill.loaded", payload)
+        except Exception:
+            logger.debug("Failed to record skill load", exc_info=True)
 
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
@@ -465,6 +509,7 @@ async def _run_agent_turn(
         if channel_hint:
             dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
+        await _record_skill_considered(chat_id, tool_names, platform)
         messages = await maybe_compact(
             db, inference, chat_id, static_prompt, settings.model, settings,
             dynamic_context=dynamic_context,
@@ -582,6 +627,7 @@ async def _run_agent_turn(
                 result = f"Error executing {tc.function.name}: {result}"
                 tool_metadata_payload = None
             elif isinstance(result, ToolResult):
+                await _record_skill_loaded(chat_id, result)
                 tool_metadata_payload = {
                     "name": result.name,
                     "is_error": result.is_error,
@@ -634,19 +680,16 @@ async def _maybe_skill_nudge(
     store_history: bool,
     tools: list[dict],
 ) -> str | None:
-    """If the turn used many tools, nudge the agent to consider saving a skill.
-
-    Runs one additional inference iteration so the agent can decide whether
-    to create a skill file. Returns the agent's text response if any.
-    """
+    """If a turn used many tools, ask for a draft skill proposal only."""
     threshold = settings.auto_skill_threshold
     if threshold <= 0 or total_tool_calls < threshold:
         return None
 
     nudge = (
         f"[System] You completed a complex task with {total_tool_calls} tool calls. "
-        f"If this procedure might be useful again, consider saving it as a skill at "
-        f"workspace/skills/<name>/SKILL.md with YAML frontmatter (name, description)."
+        "If this procedure might be reusable, draft a skill proposal only. "
+        "Do not write files or call tools. Return concise JSON with keys: "
+        "name, description, trigger, steps, why_reusable."
     )
 
     if store_history:
@@ -655,58 +698,20 @@ async def _maybe_skill_nudge(
 
     try:
         response = await inference.chat(
-            messages=messages, model=settings.model, tools=tools
+            messages=messages, model=settings.model, tools=None
         )
 
         text = response.content
-        tool_calls = response.tool_calls
-
-        tc_for_db = None
-        if tool_calls:
-            tc_for_db = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ]
-
+        await db.add_event(chat_id, "skill.draft.proposed", {
+            "type": "skill.draft.proposed",
+            "tool_calls": total_tool_calls,
+            "proposal": text or "",
+        })
         if store_history:
-            await db.add_message(chat_id, "assistant", text, tool_calls=tc_for_db)
-
-        # Append assistant message (with tool_calls) to messages list so
-        # subsequent tool result messages have the correct conversation structure
-        if tool_calls:
-            assistant_dict: dict = {"role": "assistant"}
-            if text:
-                assistant_dict["content"] = text
-            assistant_dict["tool_calls"] = tc_for_db
-            messages.append(assistant_dict)
-
-        # Execute any tool calls (the agent may write a skill file)
-        if tool_calls:
-            for tc in tool_calls:
-                result = await execute_tool(tc.function.name, tc.function.arguments)
-                if store_history:
-                    await db.add_message(chat_id, "tool", result, tool_call_id=tc.id)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-
-            # Let the model see the tool results and produce a final response
-            try:
-                final = await inference.chat(messages=messages, model=settings.model, tools=None)
-                if final.content and store_history:
-                    await db.add_message(chat_id, "assistant", final.content)
-                return final.content
-            except Exception:
-                pass  # If follow-up fails, return the original text
-
+            await db.add_message(chat_id, "assistant", text)
         return text
     except Exception as e:
-        logger.warning(f"Auto-skill nudge inference failed: {e}")
+        logger.warning(f"Skill draft proposal inference failed: {e}")
         return None
 
 
@@ -1053,6 +1058,7 @@ async def _run_chat_background(
             dynamic_context = _append_context_block(dynamic_context, _coding_task_context())
 
         await db.add_message(chat_id, "user", message)
+        await _record_skill_considered(chat_id, tool_names, "api")
         messages = await maybe_compact(
             db, inference, chat_id, system_prompt, settings.model, settings,
             dynamic_context=dynamic_context,
@@ -1204,6 +1210,7 @@ async def _run_chat_background(
                     result = f"Error executing {tc.function.name}: {result}"
                     tool_metadata_payload = None
                 elif isinstance(result, ToolResult):
+                    await _record_skill_loaded(chat_id, result)
                     tool_metadata_payload = {
                         "name": result.name,
                         "is_error": result.is_error,

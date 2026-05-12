@@ -1806,6 +1806,30 @@ def _validate_git_path_arg(path: str | None, workspace: Path) -> str | None:
     return str(resolved.relative_to(workspace))
 
 
+def _skill_load_metadata(name: str, arguments: dict) -> list[dict]:
+    if name not in {"read_file", "read_many_files"} or not _workspace_path:
+        return []
+    workspace = Path(_workspace_path).resolve()
+    raw_paths = (
+        arguments.get("paths", [])
+        if name == "read_many_files"
+        else [arguments.get("path")]
+    )
+    loaded = []
+    for raw_path in raw_paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            continue
+        try:
+            resolved = validate_workspace_path(raw_path, workspace, must_exist=True)
+            rel = resolved.relative_to(workspace)
+        except (PathSecurityError, FileNotFoundError, ValueError, OSError):
+            continue
+        parts = rel.parts
+        if len(parts) == 3 and parts[0] == "skills" and parts[2] == "SKILL.md":
+            loaded.append({"id": parts[1], "path": str(rel)})
+    return loaded
+
+
 async def _exec_git_status(args: dict) -> str:
     git = shutil.which("git")
     if not git:
@@ -2968,12 +2992,16 @@ async def execute_tool_result(
             "path": parts[1] if len(parts) > 1 else "",
             "caption": parts[2] if len(parts) > 2 else "",
         })
+    metadata = {"mutating": is_mutating_tool(name)}
+    skills_loaded = _skill_load_metadata(name, arguments)
+    if skills_loaded:
+        metadata["skills_loaded"] = skills_loaded
     return ToolResult(
         name=name,
         content=content,
         is_error=_is_error_result(content),
         duration_ms=int((_time.perf_counter() - started) * 1000),
         truncated=_is_truncated_result(content),
-        metadata={"mutating": is_mutating_tool(name)},
+        metadata=metadata,
         artifacts=artifacts,
     )
