@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 
 from baal_agent.config import AgentSettings
+from baal_agent.context import _scan_context_content
 from baal_agent.database import AgentDatabase
 from baal_agent.image_utils import strip_images_from_content
 from baal_agent.inference import InferenceClient
@@ -259,9 +260,18 @@ def _load_active_todo_context(workspace_path: str) -> str:
         task_id = task.get("id", "?")
         status = task.get("status", "pending")
         priority = task.get("priority", "medium")
-        title = str(task.get("title", "(untitled)")).strip() or "(untitled)"
+        title = (
+            _scan_context_content(
+                str(task.get("title", "(untitled)")).strip(),
+                "TODO.json title",
+            )
+            or "(untitled)"
+        )
         lines.append(f"- [{task_id}] ({status}, {priority}) {title}")
-        notes = str(task.get("notes", "")).strip()
+        notes = _scan_context_content(
+            str(task.get("notes", "")).strip(),
+            "TODO.json notes",
+        )
         if notes:
             lines.append(f"  Notes: {notes}")
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -301,7 +302,7 @@ def _load_user_profile(workspace: Path) -> str:
     user_file = workspace / "memory" / "USER.md"
     try:
         if user_file.exists():
-            content = user_file.read_text().strip()
+            content = _read_context_text(user_file, "USER.md")
             if content:
                 return content
     except (OSError, UnicodeDecodeError):
@@ -311,6 +312,76 @@ def _load_user_profile(workspace: Path) -> str:
 
 _CONTEXT_FILENAMES = ("CONTEXT.md", "AGENTS.md", ".hermes.md", "CLAUDE.md")
 _CONTEXT_MAX_CHARS = 20_000
+
+
+_INJECTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"<(?:div|span|p|section|article|main|body|html|pre|code)\b[^>]*"
+            r"(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0|font-size\s*:\s*0)"
+            r"[^>]*>.*?</(?:div|span|p|section|article|main|body|html|pre|code)>",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "hidden HTML prompt text",
+    ),
+    (
+        re.compile(
+            r"<!--.*?(?:ignore|system prompt|developer instruction|\.env|api[_-]?key|secret|token).*?-->",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "hidden HTML comment prompt text",
+    ),
+    (
+        re.compile(
+            r"\b(?:ignore|forget|disregard)\s+(?:all\s+)?(?:previous|prior|above|system|developer)\s+instructions\b",
+            re.IGNORECASE,
+        ),
+        "instruction override attempt",
+    ),
+    (
+        re.compile(
+            r"\b(?:reveal|print|dump|exfiltrate|send|upload|curl|wget|cat)\b[^\n]{0,120}"
+            r"(?:\.env|api[_-]?key|secret|token|password|credential|environment variables?)",
+            re.IGNORECASE,
+        ),
+        "secret exfiltration attempt",
+    ),
+    (
+        re.compile(
+            r"(?:\b(?:system|developer)\s+prompt\b[^\n]{0,120}\b(?:reveal|print|dump|show|send)\b"
+            r"|\b(?:reveal|print|dump|show|send)\b[^\n]{0,120}\b(?:system|developer)\s+prompt\b)",
+            re.IGNORECASE,
+        ),
+        "prompt disclosure attempt",
+    ),
+    (
+        re.compile(
+            r"\b(?:disable|bypass|override)\b[^\n]{0,100}\b(?:tool|safety|policy|guard|permission)s?\b",
+            re.IGNORECASE,
+        ),
+        "tool or safety policy override attempt",
+    ),
+)
+
+
+def _scan_context_content(content: str, source: str) -> str:
+    """Redact obvious prompt-injection payloads from user-editable context."""
+    sanitized = content
+    blocked: list[str] = []
+    for pattern, reason in _INJECTION_PATTERNS:
+        if not pattern.search(sanitized):
+            continue
+        blocked.append(reason)
+        sanitized = pattern.sub(f"[BLOCKED: {reason} in {source}]", sanitized)
+    if blocked:
+        reasons = ", ".join(dict.fromkeys(blocked))
+        return f"[Context security scan: blocked {reasons}]\n\n{sanitized}"
+    return sanitized
+
+
+def _read_context_text(path: Path, source: str) -> str:
+    content = path.read_text().strip()
+    return _scan_context_content(content, source) if content else ""
 
 
 def _load_context_files(workspace: Path) -> str:
@@ -327,7 +398,7 @@ def _load_context_files(workspace: Path) -> str:
         if not path.exists():
             continue
         try:
-            content = path.read_text().strip()
+            content = _read_context_text(path, filename)
         except (OSError, UnicodeDecodeError):
             continue  # Skip unreadable files
         if not content:
@@ -358,7 +429,7 @@ def _load_memory(workspace: Path) -> str:
     memory_file = workspace / "memory" / "MEMORY.md"
     try:
         if memory_file.exists():
-            content = memory_file.read_text().strip()
+            content = _read_context_text(memory_file, "MEMORY.md")
             if content:
                 parts.append(f"### Long-term Memory\n\n{content}")
     except (OSError, UnicodeDecodeError):
@@ -369,7 +440,7 @@ def _load_memory(workspace: Path) -> str:
     daily_file = workspace / "memory" / f"{today}.md"
     try:
         if daily_file.exists():
-            content = daily_file.read_text().strip()
+            content = _read_context_text(daily_file, f"{today}.md")
             if content:
                 parts.append(f"### Today's Notes ({today})\n\n{content}")
     except (OSError, UnicodeDecodeError):
@@ -466,20 +537,32 @@ def _parse_skill_metadata(dir_name: str, content: str) -> SkillMetadata:
                 metadata = _parse_frontmatter_metadata(dir_name, frontmatter_lines)
                 # End of frontmatter — use parsed values if we got a description
                 if metadata.description:
-                    return metadata
+                    return _sanitize_skill_metadata(metadata, f"{dir_name}/SKILL.md")
                 # No description in frontmatter, fall through to legacy parsing
                 # but skip past the frontmatter block
                 legacy = _parse_legacy_description(dir_name, lines[i + 1 :])
-                return SkillMetadata(
+                return _sanitize_skill_metadata(SkillMetadata(
                     legacy.name,
                     legacy.description,
                     metadata.requires_tools,
                     metadata.platforms,
-                )
+                ), f"{dir_name}/SKILL.md")
             frontmatter_lines.append(line)
 
     # No frontmatter — legacy format
-    return _parse_legacy_description(dir_name, lines)
+    return _sanitize_skill_metadata(
+        _parse_legacy_description(dir_name, lines),
+        f"{dir_name}/SKILL.md",
+    )
+
+
+def _sanitize_skill_metadata(metadata: SkillMetadata, source: str) -> SkillMetadata:
+    return SkillMetadata(
+        name=_scan_context_content(metadata.name, source),
+        description=_scan_context_content(metadata.description, source),
+        requires_tools=metadata.requires_tools,
+        platforms=metadata.platforms,
+    )
 
 
 def _parse_frontmatter_metadata(dir_name: str, lines: list[str]) -> SkillMetadata:
