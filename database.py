@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
+from baal_agent.image_utils import extract_text_from_content
+
 
 class AgentDatabase:
     """Async SQLite wrapper for per-agent conversation history."""
@@ -114,8 +116,6 @@ class AgentDatabase:
         """Insert a text-only representation of a message into FTS."""
         if rowid is None:
             return
-        from baal_agent.image_utils import extract_text_from_content
-
         text = extract_text_from_content(content)
         if text:
             await self.db.execute(

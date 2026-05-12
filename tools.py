@@ -294,7 +294,9 @@ TOOL_DEFINITIONS = [
             "name": "glob",
             "description": (
                 "Find files by filename pattern inside the workspace. Results are "
-                "sorted by modification time, newest first."
+                "sorted by modification time, newest first. Dotfiles and dot-directories "
+                "(.git, .env, etc.) are not matched by '*' or '**/*' — match them "
+                "explicitly with patterns like '.*' or '**/.git/**'."
             ),
             "parameters": {
                 "type": "object",
