@@ -72,7 +72,12 @@ class CheckpointManager:
             # Create .gitignore for sensitive/transient files
             gitignore_path = os.path.join(self.workspace, ".baal-history-gitignore")
             with open(gitignore_path, "w") as f:
-                f.write("agent.db\nagent.db-journal\nagent.db-wal\nagent.db-shm\n.env\n.baal-history/\n")
+                # `.git` and `.git/` exclude any nested user git repo so we don't
+                # snapshot its internal state and later trample it on `restore`.
+                f.write(
+                    "agent.db\nagent.db-journal\nagent.db-wal\nagent.db-shm\n"
+                    ".env\n.baal-history/\n.git\n.git/\n"
+                )
             # Tell git to use this as the exclude file
             await self._run("config", "core.excludesFile", gitignore_path)
 

@@ -271,6 +271,7 @@ class CronScheduler:
                 "path": watcher.path,
                 "enabled": watcher.enabled,
             })
+            pre_fingerprint = state.get(watcher.id, {}).get("fingerprint")
             try:
                 if watcher_due(
                     watcher,
@@ -287,7 +288,13 @@ class CronScheduler:
                     })
                     await run_job_callback(watcher.task, f"watcher:{watcher.id}")
                 else:
-                    changed = True
+                    # Persist state when first-observing a watcher (initial
+                    # fingerprint) or when the fingerprint diverged but the
+                    # watcher was debounced. Otherwise nothing material changed
+                    # and rewriting the file every tick is just write churn.
+                    post_fingerprint = state.get(watcher.id, {}).get("fingerprint")
+                    if pre_fingerprint != post_fingerprint:
+                        changed = True
                     await self._emit_watcher_event("watcher.skipped", {
                         "id": watcher.id,
                         "path": watcher.path,

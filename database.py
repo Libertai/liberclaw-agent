@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 
@@ -251,6 +251,30 @@ class AgentDatabase:
         )
         await self.db.commit()
         return bool(cursor.rowcount)
+
+    async def delete_memory_record(self, record_id: int) -> bool:
+        """Permanently remove a typed memory record."""
+        cursor = await self.db.execute(
+            "DELETE FROM memory_records WHERE id = ?", (record_id,)
+        )
+        await self.db.commit()
+        return bool(cursor.rowcount)
+
+    async def prune_runtime_events(self, retention_days: int) -> int:
+        """Drop runtime_events older than `retention_days`. Returns deleted count.
+
+        A non-positive retention disables pruning.
+        """
+        if retention_days <= 0:
+            return 0
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=retention_days)
+        ).isoformat()
+        cursor = await self.db.execute(
+            "DELETE FROM runtime_events WHERE created_at < ?", (cutoff,)
+        )
+        await self.db.commit()
+        return int(cursor.rowcount or 0)
 
     def _memory_row_to_dict(self, row) -> dict:
         metadata = None

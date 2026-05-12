@@ -36,3 +36,4 @@ class AgentSettings(BaseSettings):
     tool_policy: str = "full-auto"  # full-auto, auto-read, ask-before-write, ask-before-shell, locked-down
     tool_allowlist: str = ""  # comma-separated tool names; empty = no explicit allowlist
     tool_denylist: str = ""  # comma-separated tool names denied even if otherwise allowed
+    runtime_event_retention_days: int = 30  # rolling window for runtime_events; 0 disables pruning

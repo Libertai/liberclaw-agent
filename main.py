@@ -344,6 +344,12 @@ async def _telegram_agent_turn(
 async def lifespan(app: FastAPI):
     global _scheduler, _plugin_manager, _telegram_bot, _telegram_bot_task
     await db.initialize()
+    pruned = await db.prune_runtime_events(settings.runtime_event_retention_days)
+    if pruned:
+        logger.info(
+            f"Pruned {pruned} runtime_events older than "
+            f"{settings.runtime_event_retention_days} days"
+        )
     configure_tools(settings.workspace_path, db=db, inference=inference, model=settings.model)
     await start_shell()
     await start_code_executor()
@@ -909,8 +915,16 @@ async def _run_cron_job(task: str, job_id: str):
         logger.error(f"Cron job {job_id!r} failed: {e}")
 
 
+# Watcher tick events fire once per watcher per minute; persisting them all
+# would inflate runtime_events without value. Keep them in the logger and on
+# the in-memory event stream only.
+_EPHEMERAL_SCHEDULER_EVENTS = frozenset({"watcher.checked", "watcher.skipped"})
+
+
 async def _record_scheduler_event(event_type: str, payload: dict) -> None:
     """Persist scheduler events for runtime inspection."""
+    if event_type in _EPHEMERAL_SCHEDULER_EVENTS:
+        return
     await db.add_event("__scheduler__", event_type, payload)
 
 
