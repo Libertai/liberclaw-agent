@@ -22,7 +22,13 @@ from pydantic import BaseModel, field_validator
 
 from baal_agent.compaction import maybe_compact
 from baal_agent.config import AgentSettings
-from baal_agent.context import build_dynamic_context, build_static_system_prompt, build_subagent_prompt, build_system_prompt
+from baal_agent.context import (
+    _scan_context_content,
+    build_dynamic_context,
+    build_static_system_prompt,
+    build_subagent_prompt,
+    build_system_prompt,
+)
 from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
@@ -108,6 +114,23 @@ async def _apply_post_inference(assistant_msg):
     if isinstance(modified, str):
         assistant_msg.content = modified
     return assistant_msg
+
+
+async def _load_typed_memory_context(limit: int = 8) -> str:
+    try:
+        records = await db.search_memory_records("", limit=limit)
+    except Exception:
+        logger.debug("Failed to load typed memory records", exc_info=True)
+        return ""
+    if not records:
+        return ""
+    lines = []
+    for record in records:
+        content = _scan_context_content(
+            record["content"], f"typed-memory:{record['kind']}"
+        )
+        lines.append(f"- [{record['kind']}] {content}")
+    return "## Typed Memory\n\n" + "\n".join(lines)
 
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
@@ -410,6 +433,12 @@ async def _run_agent_turn(
             tool_names=tool_names,
             platform=platform,
         )
+        typed_memory = await _load_typed_memory_context()
+        if typed_memory:
+            dynamic_context = (
+                dynamic_context + "\n\n---\n\n" + typed_memory
+                if dynamic_context else typed_memory
+            )
         if channel_hint:
             dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
@@ -934,6 +963,12 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
             tool_names=tool_names,
             platform="api",
         )
+        typed_memory = await _load_typed_memory_context()
+        if typed_memory:
+            dynamic_context = (
+                dynamic_context + "\n\n---\n\n" + typed_memory
+                if dynamic_context else typed_memory
+            )
 
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(

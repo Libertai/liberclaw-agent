@@ -44,6 +44,7 @@ _MUTATING_TOOLS = {
     "write_file",
     "edit_file",
     "multi_edit",
+    "remember_fact",
     "send_file",
     "generate_image",
     "todo",
@@ -772,6 +773,67 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "Store a compact typed memory record for durable future use. "
+                "Use only for stable facts, repo conventions, decisions, or "
+                "test commands that will remain useful later."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "Memory category, e.g. user_fact, repo_convention, test_command, decision.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Compact declarative memory content.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Optional source label. Defaults to agent.",
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional structured metadata.",
+                    },
+                },
+                "required": ["kind", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": "Search typed memory records stored by remember_fact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for. Empty lists recent records.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional kind/category filter.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default 20, max 100).",
+                    },
+                    "include_archived": {
+                        "type": "boolean",
+                        "description": "Whether archived records should be returned.",
+                    },
+                },
             },
         },
     },
@@ -2048,6 +2110,55 @@ async def _exec_search_history(args: dict) -> str:
     return _truncate(raw_output, source="search_history")
 
 
+async def _exec_remember_fact(args: dict) -> str:
+    if _db is None:
+        return "[error: memory database is not configured]"
+    kind = str(args.get("kind", "")).strip()
+    content = str(args.get("content", "")).strip()
+    source = str(args.get("source", "agent") or "agent").strip()
+    metadata = args.get("metadata")
+    if not kind:
+        return "[error: missing required 'kind' parameter]"
+    if not content:
+        return "[error: missing required 'content' parameter]"
+    if len(content) > 2_000:
+        return "[error: memory content must be 2000 characters or less]"
+    if metadata is not None and not isinstance(metadata, dict):
+        return "[error: metadata must be an object when provided]"
+    record_id = await _db.add_memory_record(
+        kind=kind,
+        content=content,
+        source=source,
+        metadata=metadata,
+    )
+    return f"Stored memory record {record_id} ({kind})"
+
+
+async def _exec_search_memory(args: dict) -> str:
+    if _db is None:
+        return "[error: memory database is not configured]"
+    query = str(args.get("query", "") or "").strip()
+    kind = args.get("kind")
+    if kind is not None:
+        kind = str(kind).strip() or None
+    limit = min(max(int(args.get("limit", 20)), 1), 100)
+    records = await _db.search_memory_records(
+        query,
+        kind=kind,
+        limit=limit,
+        include_archived=bool(args.get("include_archived", False)),
+    )
+    if not records:
+        return "(no memory records)"
+    lines = []
+    for record in records:
+        lines.append(
+            f"[{record['id']}] {record['kind']} ({record['source']}): "
+            f"{record['content']}"
+        )
+    return _truncate("\n".join(lines), source="search_memory")
+
+
 async def _exec_web_search(args: dict) -> str:
     query = args["query"]
     count = min(args.get("count", 5), 10)
@@ -2645,6 +2756,8 @@ TOOL_HANDLERS: dict[str, callable] = {
     "run_format": _exec_run_format,
     "web_fetch": _exec_web_fetch,
     "search_history": _exec_search_history,
+    "remember_fact": _exec_remember_fact,
+    "search_memory": _exec_search_memory,
     "web_search": _exec_web_search,
     "generate_image": _exec_generate_image,
     "send_file": _exec_send_file,

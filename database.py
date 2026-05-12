@@ -62,6 +62,18 @@ class AgentDatabase:
             );
             CREATE INDEX IF NOT EXISTS idx_runtime_events_chat
                 ON runtime_events (chat_id, id);
+            CREATE TABLE IF NOT EXISTS memory_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'agent',
+                metadata TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_records_kind
+                ON memory_records (kind, archived, updated_at);
         """)
 
         # FTS5 full-text search index over message content
@@ -174,6 +186,89 @@ class AgentDatabase:
         )
         await self.db.commit()
         return int(cursor.lastrowid or 0)
+
+    async def add_memory_record(
+        self,
+        *,
+        kind: str,
+        content: str,
+        source: str = "agent",
+        metadata: dict | None = None,
+    ) -> int:
+        """Store a typed memory record."""
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self.db.execute(
+            "INSERT INTO memory_records "
+            "(kind, content, source, metadata, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                kind,
+                content,
+                source,
+                json.dumps(metadata) if metadata else None,
+                now,
+                now,
+            ),
+        )
+        await self.db.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def search_memory_records(
+        self,
+        query: str = "",
+        *,
+        kind: str | None = None,
+        limit: int = 20,
+        include_archived: bool = False,
+    ) -> list[dict]:
+        """Search typed memory records with simple SQLite LIKE matching."""
+        clauses = []
+        params: list[object] = []
+        if not include_archived:
+            clauses.append("archived = 0")
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if query:
+            clauses.append("content LIKE ?")
+            params.append(f"%{query}%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(min(max(int(limit), 1), 100))
+        cursor = await self.db.execute(
+            "SELECT id, kind, content, source, metadata, archived, created_at, updated_at "
+            f"FROM memory_records {where} "
+            "ORDER BY updated_at DESC, id DESC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
+        return [self._memory_row_to_dict(row) for row in rows]
+
+    async def archive_memory_record(self, record_id: int) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        cursor = await self.db.execute(
+            "UPDATE memory_records SET archived = 1, updated_at = ? WHERE id = ?",
+            (now, record_id),
+        )
+        await self.db.commit()
+        return bool(cursor.rowcount)
+
+    def _memory_row_to_dict(self, row) -> dict:
+        metadata = None
+        if row["metadata"]:
+            try:
+                metadata = json.loads(row["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                metadata = None
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "content": row["content"],
+            "source": row["source"],
+            "metadata": metadata,
+            "archived": bool(row["archived"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     async def get_events(
         self,
