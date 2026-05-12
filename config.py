@@ -33,3 +33,6 @@ class AgentSettings(BaseSettings):
     local_ui_cors_origins: str = "*"  # comma-separated
     local_ui_dist_path: str = ""  # empty = <package>/webui/dist
     agent_fqdn: str = ""  # set by the deployer, used in the system prompt; empty = standalone/local
+    tool_policy: str = "full-auto"  # full-auto, auto-read, ask-before-write, ask-before-shell, locked-down
+    tool_allowlist: str = ""  # comma-separated tool names; empty = no explicit allowlist
+    tool_denylist: str = ""  # comma-separated tool names denied even if otherwise allowed

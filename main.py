@@ -31,6 +31,7 @@ from baal_agent.plugins import PluginManager
 from baal_agent.scheduler import CronScheduler
 from baal_agent.tools import (
     ToolExecutionContext,
+    ToolPolicy,
     ToolResult,
     configure_tools,
     execute_tool,
@@ -49,6 +50,47 @@ from baal_agent.tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _current_tool_policy() -> ToolPolicy:
+    return ToolPolicy.from_strings(
+        mode=settings.tool_policy,
+        allowlist=settings.tool_allowlist,
+        denylist=settings.tool_denylist,
+    )
+
+
+def _blocked_tool_result(tool_name: str, policy: ToolPolicy) -> ToolResult | None:
+    allowed, reason = policy.check(tool_name)
+    if allowed:
+        return None
+    return ToolResult(
+        name=tool_name,
+        content=f"[error: guardrail blocked {tool_name}: {reason}]",
+        is_error=True,
+        metadata={
+            "guardrail": "tool_policy",
+            "policy": policy.describe(),
+            "reason": reason,
+        },
+    )
+
+
+async def _emit_guardrail_blocked(run: "ChatRun", result: ToolResult) -> None:
+    payload = {
+        "tool": result.name,
+        "reason": result.metadata.get("reason", ""),
+        "policy": result.metadata.get("policy", {}),
+    }
+    await _emit(run, {"type": "guardrail_blocked", **payload})
+    try:
+        await db.add_event(run.chat_id, "guardrail.blocked", {
+            "type": "guardrail.blocked",
+            **payload,
+            "timestamp_ms": int(time.time() * 1000),
+        })
+    except Exception:
+        logger.debug("Failed to persist canonical guardrail event", exc_info=True)
 
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
@@ -325,7 +367,8 @@ async def _run_agent_turn(
         The final text response, or None if no text was generated.
     """
     iterations = max_iterations or settings.max_tool_iterations
-    tools = get_tool_definitions(include_spawn=not restricted)
+    tool_policy = _current_tool_policy()
+    tools = get_tool_definitions(include_spawn=not restricted, policy=tool_policy)
     tool_names = [t["function"]["name"] for t in tools]
     tool_context = ToolExecutionContext()
     pending_images: list[dict] = []
@@ -429,11 +472,18 @@ async def _run_agent_turn(
             tool_name = tc.function.name
             arguments = tc.function.arguments
 
+            blocked = _blocked_tool_result(tool_name, tool_policy)
+            if blocked is not None:
+                return blocked
+
             # Plugin pre_tool hook
             if _plugin_manager is not None:
                 arguments = await _plugin_manager.fire_modify(
                     "pre_tool", arguments, tool_name,
                 )
+                blocked = _blocked_tool_result(tool_name, tool_policy)
+                if blocked is not None:
+                    return blocked
 
             if tool_name == "spawn" and not restricted:
                 result = await _handle_spawn(arguments, chat_id)
@@ -442,6 +492,7 @@ async def _run_agent_turn(
                     tool_name, arguments,
                     image_callback=_stash_images,
                     context=tool_context,
+                    policy=tool_policy,
                 )
                 result = tool_result
 
@@ -841,7 +892,8 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
             _plugin_manager.load_plugins()
             await _plugin_manager.fire("on_session_start", chat_id)
 
-        tools = get_tool_definitions(include_spawn=True)
+        tool_policy = _current_tool_policy()
+        tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
         tool_names = [t["function"]["name"] for t in tools]
         tool_context = ToolExecutionContext()
         pending_images: list[dict] = []
@@ -964,11 +1016,22 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 tool_name = tc.function.name
                 arguments = tc.function.arguments
 
+                blocked = _blocked_tool_result(tool_name, tool_policy)
+                if blocked is not None:
+                    await _emit(run, blocked.to_event())
+                    await _emit_guardrail_blocked(run, blocked)
+                    return blocked
+
                 # Plugin pre_tool hook: may modify arguments
                 if _plugin_manager is not None:
                     arguments = await _plugin_manager.fire_modify(
                         "pre_tool", arguments, tool_name,
                     )
+                    blocked = _blocked_tool_result(tool_name, tool_policy)
+                    if blocked is not None:
+                        await _emit(run, blocked.to_event())
+                        await _emit_guardrail_blocked(run, blocked)
+                        return blocked
 
                 if tool_name == "spawn":
                     result = await _handle_spawn(arguments, chat_id)
@@ -977,8 +1040,11 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                         tool_name, arguments,
                         image_callback=_stash_images,
                         context=tool_context,
+                        policy=tool_policy,
                     )
                     await _emit(run, tool_result.to_event())
+                    if tool_result.metadata.get("guardrail"):
+                        await _emit_guardrail_blocked(run, tool_result)
                     result = tool_result
 
                 # Plugin post_tool hook: may modify result
@@ -1400,7 +1466,8 @@ async def health():
 async def info():
     from baal_agent import AGENT_VERSION
 
-    tools = get_tool_definitions(include_spawn=True)
+    tool_policy = _current_tool_policy()
+    tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
     return {
         "agent_name": settings.agent_name,
         "agent_version": AGENT_VERSION,
@@ -1421,7 +1488,9 @@ async def info():
             "runtime_health": True,
             "runtime_events": True,
             "context_injection_scanner": True,
+            "tool_policy": True,
         },
+        "tool_policy": tool_policy.describe(),
         "runtime_health": {
             "database": "configured" if db is not None else "unavailable",
             "workspace": "configured" if settings.workspace_path else "unavailable",

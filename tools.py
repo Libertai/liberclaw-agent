@@ -48,7 +48,69 @@ _MUTATING_TOOLS = {
     "execute_code",
     "checkpoint",
     "process",
+    "spawn",
 }
+_SHELL_TOOLS = {"bash", "process", "execute_code"}
+
+
+def _split_tool_list(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+@dataclass(frozen=True)
+class ToolPolicy:
+    """Declarative tool policy enforced before execution."""
+
+    mode: str = "full-auto"
+    allowlist: frozenset[str] = frozenset()
+    denylist: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_strings(
+        cls,
+        *,
+        mode: str = "full-auto",
+        allowlist: str = "",
+        denylist: str = "",
+    ) -> "ToolPolicy":
+        normalized = (mode or "full-auto").strip()
+        return cls(
+            mode=normalized,
+            allowlist=frozenset(_split_tool_list(allowlist)),
+            denylist=frozenset(_split_tool_list(denylist)),
+        )
+
+    def describe(self) -> dict:
+        return {
+            "mode": self.mode,
+            "allowlist": sorted(self.allowlist),
+            "denylist": sorted(self.denylist),
+        }
+
+    def check(self, name: str) -> tuple[bool, str | None]:
+        if name in self.denylist:
+            return False, f"tool '{name}' is denied by policy"
+        if self.allowlist and name not in self.allowlist:
+            return False, f"tool '{name}' is not in the policy allowlist"
+        if self.mode == "full-auto":
+            return True, None
+        if self.mode == "auto-read":
+            if is_mutating_tool(name):
+                return False, f"tool '{name}' is mutating and policy mode is auto-read"
+            return True, None
+        if self.mode == "locked-down":
+            return False, f"tool '{name}' is blocked by locked-down policy"
+        if self.mode == "ask-before-write":
+            if is_mutating_tool(name):
+                return False, f"tool '{name}' requires approval in ask-before-write mode"
+            return True, None
+        if self.mode == "ask-before-shell":
+            if name in _SHELL_TOOLS:
+                return False, f"tool '{name}' requires approval in ask-before-shell mode"
+            return True, None
+        return False, f"unknown tool policy mode '{self.mode}'"
 
 
 @dataclass
@@ -2094,16 +2156,31 @@ def get_unavailable_tools() -> dict[str, str]:
     return unavailable
 
 
-def get_tool_definitions(*, include_spawn: bool = True) -> list[dict]:
+def _policy_allows_tool(policy: ToolPolicy | None, name: str) -> bool:
+    if policy is None:
+        return True
+    allowed, _ = policy.check(name)
+    return allowed
+
+
+def get_tool_definitions(
+    *,
+    include_spawn: bool = True,
+    policy: ToolPolicy | None = None,
+) -> list[dict]:
     """Return tool definitions, optionally including spawn and MCP tools."""
     defs = [
         tool for tool in TOOL_DEFINITIONS
         if _tool_available(tool["function"]["name"])[0]
+        and _policy_allows_tool(policy, tool["function"]["name"])
     ]
-    if include_spawn:
+    if include_spawn and _policy_allows_tool(policy, "spawn"):
         defs.append(SPAWN_TOOL_DEF)
     if _mcp_client is not None:
-        defs.extend(_mcp_client.get_tool_definitions())
+        defs.extend(
+            tool for tool in _mcp_client.get_tool_definitions()
+            if _policy_allows_tool(policy, tool["function"]["name"])
+        )
     return defs
 
 
@@ -2160,6 +2237,7 @@ async def execute_tool(
     *,
     image_callback=None,
     context: ToolExecutionContext | None = None,
+    policy: ToolPolicy | None = None,
 ) -> str:
     """Dispatch a tool call by name. Returns the result string."""
     result = await execute_tool_result(
@@ -2167,6 +2245,7 @@ async def execute_tool(
         arguments,
         image_callback=image_callback,
         context=context,
+        policy=policy,
     )
     return result.content
 
@@ -2177,6 +2256,7 @@ async def execute_tool_result(
     *,
     image_callback=None,
     context: ToolExecutionContext | None = None,
+    policy: ToolPolicy | None = None,
 ) -> ToolResult:
     """Dispatch a tool call and return a structured result envelope."""
     started = _time.perf_counter()
@@ -2190,6 +2270,22 @@ async def execute_tool_result(
                 content=content,
                 is_error=True,
                 duration_ms=int((_time.perf_counter() - started) * 1000),
+            )
+
+    if policy is not None:
+        allowed, policy_reason = policy.check(name)
+        if not allowed:
+            content = f"[error: guardrail blocked {name}: {policy_reason}]"
+            return ToolResult(
+                name=name,
+                content=content,
+                is_error=True,
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+                metadata={
+                    "guardrail": "tool_policy",
+                    "policy": policy.describe(),
+                    "reason": policy_reason,
+                },
             )
 
     # Route MCP tool calls to the MCP client
