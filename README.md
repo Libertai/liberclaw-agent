@@ -21,7 +21,7 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 | `web_search` | LibertAI Search (always available) |
 | `generate_image` | Generate images from text prompts via LibertAI |
 | `send_file` | Send workspace files back to the user |
-| `spawn` | Launch background subagents for parallel work |
+| `spawn` | Launch typed background subagents for parallel work |
 
 ## Features
 
@@ -30,7 +30,7 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 - **Context compaction**: When conversation history exceeds the model's context window, older messages are summarized by the LLM while recent messages are preserved
 - **Memory**: Persistent file-based memory at `workspace/memory/MEMORY.md` (long-term) and daily notes
 - **Skills**: Markdown skill files at `workspace/skills/*/SKILL.md` — summaries are injected into context, full content loaded on demand
-- **Subagents**: Spawn background workers for parallel tasks with their own tool sets (no further spawning)
+- **Subagents**: Spawn typed background workers for parallel tasks with their own tool sets (no further spawning)
 - **Heartbeat**: Periodic check of `workspace/HEARTBEAT.md` for autonomous task execution (configurable interval, results stored in chat history)
 - **Security**: Bearer token auth, workspace path sandboxing, bash command deny patterns, sensitive file protection
 

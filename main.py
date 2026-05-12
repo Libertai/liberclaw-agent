@@ -29,6 +29,7 @@ from baal_agent.context import (
     build_subagent_prompt,
     build_system_prompt,
     collect_available_skills,
+    normalize_subagent_role,
 )
 from baal_agent.database import AgentDatabase
 from baal_agent.inference import InferenceClient
@@ -241,6 +242,7 @@ class SubagentRun:
     label: str
     task: str
     persona: str | None
+    role: str
     status: str  # running / completed / failed / timeout
     chat_id: str
     started_at: float
@@ -725,6 +727,7 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     task = arguments["task"]
     label = arguments.get("label", task[:50])
     persona = arguments.get("persona")
+    role = normalize_subagent_role(arguments.get("role"))
     timeout = min(int(arguments.get("timeout", DEFAULT_SUBAGENT_TIMEOUT)), MAX_SUBAGENT_TIMEOUT)
 
     _prune_old_subagent_runs()
@@ -743,6 +746,7 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
         label=label,
         task=task,
         persona=persona,
+        role=role,
         status="running",
         chat_id=origin_chat_id,
         started_at=time.time(),
@@ -752,7 +756,14 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     # Emit spawned event
     await db.add_pending(
         origin_chat_id,
-        json.dumps({"type": "subagent_spawned", "run_id": run_id, "label": label, "status": "running"}),
+        json.dumps({
+            "type": "subagent_spawned",
+            "run_id": run_id,
+            "label": label,
+            "subagent_role": role,
+            "role": role,
+            "status": "running",
+        }),
         source="subagent_event",
     )
 
@@ -760,7 +771,7 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     run.asyncio_task = task_handle
 
     return (
-        f"Subagent '{label}' spawned (id: {run_id}, timeout: {timeout}s). "
+        f"Subagent '{label}' spawned (id: {run_id}, role: {role}, timeout: {timeout}s). "
         f"The subagent is working in the background — do NOT repeat its task. "
         f"Move on to other work or inform the user you've delegated this task."
     )
@@ -777,6 +788,7 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
             settings.workspace_path,
             tool_names=tool_names,
             persona=run.persona,
+            role=run.role,
         )
 
         files: list[dict] = []
@@ -805,7 +817,14 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         # Emit completed event
         await db.add_pending(
             origin_chat_id,
-            json.dumps({"type": "subagent_completed", "run_id": run.id, "label": run.label, "status": "completed"}),
+            json.dumps({
+                "type": "subagent_completed",
+                "run_id": run.id,
+                "label": run.label,
+                "subagent_role": run.role,
+                "role": run.role,
+                "status": "completed",
+            }),
             source="subagent_event",
         )
         # Forward file events (pending for web UI + direct Telegram delivery
@@ -830,7 +849,15 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         logger.warning(f"Subagent {run.id} ({run.label}) timed out after {timeout}s")
         await db.add_pending(
             origin_chat_id,
-            json.dumps({"type": "subagent_failed", "run_id": run.id, "label": run.label, "status": "timeout", "error": run.error}),
+            json.dumps({
+                "type": "subagent_failed",
+                "run_id": run.id,
+                "label": run.label,
+                "subagent_role": run.role,
+                "role": run.role,
+                "status": "timeout",
+                "error": run.error,
+            }),
             source="subagent_event",
         )
 
@@ -841,7 +868,15 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         logger.error(f"Subagent {run.id} ({run.label}) failed: {e}")
         await db.add_pending(
             origin_chat_id,
-            json.dumps({"type": "subagent_failed", "run_id": run.id, "label": run.label, "status": "failed", "error": str(e)}),
+            json.dumps({
+                "type": "subagent_failed",
+                "run_id": run.id,
+                "label": run.label,
+                "subagent_role": run.role,
+                "role": run.role,
+                "status": "failed",
+                "error": str(e),
+            }),
             source="subagent_event",
         )
 
@@ -1772,6 +1807,7 @@ async def list_subagents():
                 "id": r.id,
                 "label": r.label,
                 "task": r.task[:200],
+                "role": r.role,
                 "status": r.status,
                 "chat_id": r.chat_id,
                 "started_at": r.started_at,
@@ -1798,6 +1834,7 @@ async def get_subagent(run_id: str):
         "label": run.label,
         "task": run.task,
         "persona": run.persona,
+        "role": run.role,
         "status": run.status,
         "chat_id": run.chat_id,
         "started_at": run.started_at,
@@ -1828,7 +1865,15 @@ async def stop_subagent(run_id: str):
     # Emit failed event
     await db.add_pending(
         run.chat_id,
-        json.dumps({"type": "subagent_failed", "run_id": run.id, "label": run.label, "status": "failed", "error": run.error}),
+        json.dumps({
+            "type": "subagent_failed",
+            "run_id": run.id,
+            "label": run.label,
+            "subagent_role": run.role,
+            "role": run.role,
+            "status": "failed",
+            "error": run.error,
+        }),
         source="subagent_event",
     )
 

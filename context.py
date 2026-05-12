@@ -256,11 +256,45 @@ def build_system_prompt(
     return static
 
 
+SUBAGENT_ROLE_GUIDANCE: dict[str, str] = {
+    "default": "Handle the delegated task directly and report the result clearly.",
+    "explorer": (
+        "Investigate the codebase or topic without editing files. Return concrete "
+        "findings with file paths, line references, and recommended next steps."
+    ),
+    "worker": (
+        "Implement the delegated change in the workspace. Keep edits scoped, respect "
+        "other concurrent work, and report changed files plus verification."
+    ),
+    "reviewer": (
+        "Review for bugs, regressions, missing tests, and compatibility risks. Lead "
+        "with findings ordered by severity and avoid making edits."
+    ),
+    "verifier": (
+        "Run or design focused checks for the delegated area. Report commands, "
+        "outcomes, failures, and residual risk."
+    ),
+    "researcher": (
+        "Research the delegated question and synthesize the answer with sources, "
+        "assumptions, and uncertainty. Avoid implementation unless asked."
+    ),
+}
+
+
+def normalize_subagent_role(role: str | None) -> str:
+    """Return a supported subagent role, defaulting unknown values safely."""
+    if not role:
+        return "default"
+    normalized = role.strip().lower()
+    return normalized if normalized in SUBAGENT_ROLE_GUIDANCE else "default"
+
+
 def build_subagent_prompt(
     agent_name: str,
     workspace_path: str,
     tool_names: list[str] | None = None,
     persona: str | None = None,
+    role: str = "default",
 ) -> str:
     """Build a lightweight system prompt for subagents.
 
@@ -281,9 +315,16 @@ def build_subagent_prompt(
         identity += f"\nAvailable tools: {', '.join(tool_names)}"
     sections.append(identity)
 
-    # Optional persona / role
+    normalized_role = normalize_subagent_role(role)
+    sections.append(
+        "## Subagent Role\n\n"
+        f"Role: {normalized_role}\n\n"
+        f"{SUBAGENT_ROLE_GUIDANCE[normalized_role]}"
+    )
+
+    # Optional persona
     if persona and persona.strip():
-        sections.append(f"## Role\n\n{persona.strip()}")
+        sections.append(f"## Additional Persona\n\n{persona.strip()}")
 
     # Guidelines
     sections.append(

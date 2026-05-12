@@ -1037,6 +1037,15 @@ SPAWN_TOOL_DEF = {
                     "type": "string",
                     "description": "Optional system prompt override for the subagent. Gives it a specialized role.",
                 },
+                "role": {
+                    "type": "string",
+                    "enum": ["default", "explorer", "worker", "reviewer", "verifier", "researcher"],
+                    "description": (
+                        "Typed role for the subagent. Use explorer for read-only codebase "
+                        "inspection, worker for bounded implementation, reviewer for code "
+                        "review, verifier for tests/checks, and researcher for synthesis."
+                    ),
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Wall-clock timeout in seconds (default 300, max 600).",
