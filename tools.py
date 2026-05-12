@@ -40,17 +40,32 @@ MAX_WEB_CONTENT = 50_000
 _IMAGE_AWARE_TOOLS = {"read_file", "read_pdf", "web_fetch"}
 _MUTATING_TOOLS = {
     "bash",
+    "apply_patch",
     "write_file",
     "edit_file",
+    "multi_edit",
     "send_file",
     "generate_image",
     "todo",
     "execute_code",
     "checkpoint",
     "process",
+    "run_format",
     "spawn",
 }
-_SHELL_TOOLS = {"bash", "process", "execute_code"}
+_SHELL_TOOLS = {
+    "bash",
+    "execute_code",
+    "git_blame",
+    "git_diff",
+    "git_show",
+    "git_status",
+    "process",
+    "run_format",
+    "run_lint",
+    "run_tests",
+    "run_typecheck",
+}
 
 
 def _split_tool_list(value: str | None) -> set[str]:
@@ -319,6 +334,35 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "read_many_files",
+            "description": (
+                "Read up to 20 text files in one call, returning each file with "
+                "line numbers. Use this for efficient multi-file code inspection."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths to read, relative to the workspace or absolute within it.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Line number to start reading from for every file (1-based).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of lines per file.",
+                    },
+                },
+                "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_pdf",
             "description": (
                 "Read a PDF file. In text mode (default), extracts text from pages — fast and lightweight, "
@@ -408,6 +452,58 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "multi_edit",
+            "description": (
+                "Apply multiple exact string replacements. Each edit follows "
+                "edit_file safety rules: the file must have been read this turn "
+                "or the edit must include expected_hash."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "old_string": {"type": "string"},
+                                "new_string": {"type": "string"},
+                                "replace_all": {"type": "boolean"},
+                                "expected_hash": {"type": "string"},
+                            },
+                            "required": ["path", "old_string", "new_string"],
+                        },
+                        "description": "Ordered edit_file operations to apply.",
+                    },
+                },
+                "required": ["edits"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": (
+                "Apply a unified diff patch to files in the workspace. The patch "
+                "is checked before it is applied."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "Unified diff text accepted by git apply.",
+                    },
+                },
+                "required": ["patch"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_dir",
             "description": "List contents of a directory with [dir] and [file] prefixes.",
             "parameters": {
@@ -489,6 +585,118 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Return concise git status for the workspace repository.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "Return git diff for workspace changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Optional path to limit the diff."},
+                    "staged": {"type": "boolean", "description": "If true, show staged diff."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_show",
+            "description": "Show a git object or commit with optional path filtering.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rev": {"type": "string", "description": "Revision or object to show. Defaults to HEAD."},
+                    "path": {"type": "string", "description": "Optional path to limit output."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_blame",
+            "description": "Show git blame for a file, optionally limited to a line range.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File to blame."},
+                    "start": {"type": "integer", "description": "Optional starting line."},
+                    "end": {"type": "integer", "description": "Optional ending line."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": "Run a test command in the workspace and return output plus exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Test command to run."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_lint",
+            "description": "Run a lint command in the workspace and return output plus exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Lint command to run."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_typecheck",
+            "description": "Run a typecheck command in the workspace and return output plus exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Typecheck command to run."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_format",
+            "description": "Run a formatting command in the workspace and return output plus exit code.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Format command to run."},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                },
+                "required": ["command"],
             },
         },
     },
@@ -1142,6 +1350,30 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         return f"[error: {e}]"
 
 
+async def _exec_read_many_files(args: dict) -> str:
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not paths:
+        return "[error: missing required 'paths' array]"
+    if len(paths) > 20:
+        return "[error: read_many_files accepts at most 20 paths]"
+    offset = args.get("offset", 1)
+    limit = args.get("limit")
+    context = args.get("_context")
+    parts = []
+    for raw_path in paths:
+        if not isinstance(raw_path, str) or not raw_path:
+            parts.append("== <invalid path> ==\n[error: path must be a non-empty string]")
+            continue
+        read_args = {"path": raw_path, "offset": offset}
+        if limit is not None:
+            read_args["limit"] = limit
+        if isinstance(context, ToolExecutionContext):
+            read_args["_context"] = context
+        content = await _exec_read_file(read_args)
+        parts.append(f"== {raw_path} ==\n{content}")
+    return _truncate("\n\n".join(parts), source="read_many_files")
+
+
 def _parse_page_ranges(spec: str, max_page: int) -> list[int]:
     """Parse a page spec like '1', '1-3', '2,5,8' into a sorted list of 0-based indices."""
     pages = set()
@@ -1328,6 +1560,282 @@ async def _exec_edit_file(args: dict) -> str:
         return f"[error: file not found: {path}]"
     except Exception as e:
         return f"[error: {e}]"
+
+
+async def _exec_multi_edit(args: dict) -> str:
+    edits = args.get("edits")
+    if not isinstance(edits, list) or not edits:
+        return "[error: missing required 'edits' array]"
+    if len(edits) > 50:
+        return "[error: multi_edit accepts at most 50 edits]"
+    context = args.get("_context")
+    results = []
+    for idx, edit in enumerate(edits, start=1):
+        if not isinstance(edit, dict):
+            return f"[error: edit {idx} must be an object]"
+        edit_args = dict(edit)
+        if isinstance(context, ToolExecutionContext):
+            edit_args["_context"] = context
+        result = await _exec_edit_file(edit_args)
+        results.append(f"{idx}. {result}")
+        if _is_error_result(result):
+            results.append("Stopped after first failed edit.")
+            break
+    return "\n".join(results)
+
+
+async def _run_exec(
+    argv: list[str],
+    *,
+    source: str,
+    timeout: int = 60,
+    cwd: Path | None = None,
+) -> str:
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    run_cwd = cwd or workspace
+    timeout = min(max(int(timeout), 1), 600)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(run_cwd),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        parts = []
+        if out:
+            parts.append(out.rstrip())
+        if err:
+            parts.append(f"[stderr]\n{err.rstrip()}")
+        parts.append(f"[exit code: {proc.returncode or 0}]")
+        return _truncate("\n".join(parts), source=source)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()  # type: ignore[possibly-undefined]
+            await proc.wait()
+        except (NameError, ProcessLookupError):
+            pass
+        return f"[timed out after {timeout}s]"
+    except FileNotFoundError:
+        return f"[error: command not found: {argv[0]}]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+async def _run_shell_command_tool(args: dict, *, source: str) -> str:
+    command = args.get("command")
+    if not command:
+        return "[error: missing required 'command' parameter]"
+    blocked = _check_bash_safety(command)
+    if blocked:
+        return blocked
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    timeout = min(max(int(args.get("timeout", 120)), 1), 600)
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(workspace),
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        parts = []
+        if out:
+            parts.append(out.rstrip())
+        if err:
+            parts.append(f"[stderr]\n{err.rstrip()}")
+        parts.append(f"[exit code: {proc.returncode or 0}]")
+        return _truncate("\n".join(parts), source=source)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()  # type: ignore[possibly-undefined]
+            await proc.wait()
+        except (NameError, ProcessLookupError):
+            pass
+        return f"[timed out after {timeout}s]"
+    except Exception as e:
+        return f"[error: {e}]"
+
+
+async def _exec_apply_patch(args: dict) -> str:
+    patch = args.get("patch")
+    if not isinstance(patch, str) or not patch.strip():
+        return "[error: missing required 'patch' parameter]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    git = shutil.which("git")
+    if not git:
+        return "[error: git is not installed]"
+    try:
+        _validate_patch_paths(patch, workspace)
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+    except ValueError as e:
+        return f"[error: {e}]"
+
+    check_proc = await asyncio.create_subprocess_exec(
+        git,
+        "apply",
+        "--check",
+        "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
+        cwd=str(workspace),
+    )
+    check_stdout, check_stderr = await asyncio.wait_for(
+        check_proc.communicate(patch.encode()), timeout=30
+    )
+    if check_proc.returncode != 0:
+        detail = (check_stderr or check_stdout).decode("utf-8", errors="replace").strip()
+        return f"[error: patch check failed: {detail}]"
+
+    apply_proc = await asyncio.create_subprocess_exec(
+        git,
+        "apply",
+        "-",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
+        cwd=str(workspace),
+    )
+    stdout, stderr = await asyncio.wait_for(apply_proc.communicate(patch.encode()), timeout=30)
+    if apply_proc.returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        return f"[error: patch apply failed: {detail}]"
+    return "Patch applied"
+
+
+def _validate_patch_paths(patch: str, workspace: Path) -> None:
+    paths: set[str] = set()
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                paths.update(parts[2:4])
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            raw = line[4:].split("\t", 1)[0].strip()
+            paths.add(raw)
+
+    for raw_path in paths:
+        if raw_path == "/dev/null":
+            continue
+        path = raw_path
+        if path.startswith(("a/", "b/")):
+            path = path[2:]
+        if not path or path.startswith("/") or Path(path).is_absolute():
+            raise ValueError(f"patch path escapes workspace: {raw_path}")
+        validate_workspace_path(path, workspace, must_exist=False)
+
+
+def _validate_git_path_arg(path: str | None, workspace: Path) -> str | None:
+    if not path:
+        return None
+    resolved = validate_workspace_path(path, workspace, must_exist=False)
+    return str(resolved.relative_to(workspace))
+
+
+async def _exec_git_status(args: dict) -> str:
+    git = shutil.which("git")
+    if not git:
+        return "[error: git is not installed]"
+    return await _run_exec([git, "status", "--short", "--branch"], source="git_status")
+
+
+async def _exec_git_diff(args: dict) -> str:
+    git = shutil.which("git")
+    if not git:
+        return "[error: git is not installed]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    cmd = [git, "diff"]
+    if args.get("staged"):
+        cmd.append("--cached")
+    try:
+        path = _validate_git_path_arg(args.get("path"), workspace)
+        if path:
+            cmd.extend(["--", path])
+        return await _run_exec(cmd, source="git_diff")
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+
+
+async def _exec_git_show(args: dict) -> str:
+    git = shutil.which("git")
+    if not git:
+        return "[error: git is not installed]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    rev = args.get("rev", "HEAD")
+    if not isinstance(rev, str) or not rev:
+        return "[error: rev must be a non-empty string]"
+    cmd = [git, "show", "--stat", "--patch", "--", rev]
+    try:
+        path = _validate_git_path_arg(args.get("path"), workspace)
+        if path:
+            cmd = [git, "show", "--stat", "--patch", rev, "--", path]
+        else:
+            cmd = [git, "show", "--stat", "--patch", rev]
+        return await _run_exec(cmd, source="git_show")
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+
+
+async def _exec_git_blame(args: dict) -> str:
+    path = args.get("path")
+    if not path:
+        return "[error: missing required 'path' parameter]"
+    git = shutil.which("git")
+    if not git:
+        return "[error: git is not installed]"
+    if not _workspace_path:
+        return "[error: workspace not configured]"
+    workspace = Path(_workspace_path).resolve()
+    try:
+        rel_path = _validate_git_path_arg(path, workspace)
+        cmd = [git, "blame"]
+        start = args.get("start")
+        end = args.get("end")
+        if start is not None:
+            start_i = max(int(start), 1)
+            if end is not None:
+                end_i = max(int(end), start_i)
+                cmd.extend(["-L", f"{start_i},{end_i}"])
+            else:
+                cmd.extend(["-L", f"{start_i},+40"])
+        cmd.extend(["--", rel_path or path])
+        return await _run_exec(cmd, source="git_blame")
+    except PathSecurityError as e:
+        return f"[error: {e}]"
+    except ValueError:
+        return "[error: start/end must be integers]"
+
+
+async def _exec_run_tests(args: dict) -> str:
+    return await _run_shell_command_tool(args, source="run_tests")
+
+
+async def _exec_run_lint(args: dict) -> str:
+    return await _run_shell_command_tool(args, source="run_lint")
+
+
+async def _exec_run_typecheck(args: dict) -> str:
+    return await _run_shell_command_tool(args, source="run_typecheck")
+
+
+async def _exec_run_format(args: dict) -> str:
+    return await _run_shell_command_tool(args, source="run_format")
 
 
 async def _exec_list_dir(args: dict) -> str:
@@ -2116,14 +2624,25 @@ async def shutdown_processes():
 # ── Tool registry ─────────────────────────────────────────────────────
 
 TOOL_HANDLERS: dict[str, callable] = {
+    "apply_patch": _exec_apply_patch,
     "bash": _exec_bash,
     "read_file": _exec_read_file,
+    "read_many_files": _exec_read_many_files,
     "read_pdf": _exec_read_pdf,
     "write_file": _exec_write_file,
     "edit_file": _exec_edit_file,
+    "multi_edit": _exec_multi_edit,
     "list_dir": _exec_list_dir,
     "glob": _exec_glob,
     "grep": _exec_grep,
+    "git_status": _exec_git_status,
+    "git_diff": _exec_git_diff,
+    "git_show": _exec_git_show,
+    "git_blame": _exec_git_blame,
+    "run_tests": _exec_run_tests,
+    "run_lint": _exec_run_lint,
+    "run_typecheck": _exec_run_typecheck,
+    "run_format": _exec_run_format,
     "web_fetch": _exec_web_fetch,
     "search_history": _exec_search_history,
     "web_search": _exec_web_search,
@@ -2142,6 +2661,8 @@ def _tool_available(name: str) -> tuple[bool, str | None]:
         return False, "LIBERTAI_API_KEY is not configured"
     if name == "grep" and shutil.which("rg") is None:
         return False, "ripgrep (rg) is not installed"
+    if name in {"apply_patch", "git_status", "git_diff", "git_show", "git_blame"} and shutil.which("git") is None:
+        return False, "git is not installed"
     return True, None
 
 
