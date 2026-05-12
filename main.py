@@ -132,6 +132,28 @@ async def _load_typed_memory_context(limit: int = 8) -> str:
         lines.append(f"- [{record['kind']}] {content}")
     return "## Typed Memory\n\n" + "\n".join(lines)
 
+
+def _coding_task_context() -> str:
+    return (
+        "## Coding Task Runtime\n\n"
+        "For this turn, run a disciplined coding workflow:\n"
+        "1. Inspect relevant files before editing.\n"
+        "2. State or maintain a short plan when work has multiple steps.\n"
+        "3. Use code-aware tools such as glob, grep, read_many_files, apply_patch, "
+        "multi_edit, git_diff, run_tests, run_lint, and run_typecheck instead of "
+        "ad hoc shell commands when they fit.\n"
+        "4. Make minimal scoped changes.\n"
+        "5. Run targeted verification after edits, or explicitly report why it was skipped.\n"
+        "6. Review the final diff before claiming completion.\n"
+        "7. In the final response, include changed files, verification run, and residual risk."
+    )
+
+
+def _append_context_block(dynamic_context: str, block: str) -> str:
+    if not block:
+        return dynamic_context
+    return dynamic_context + "\n\n---\n\n" + block if dynamic_context else block
+
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
@@ -213,6 +235,7 @@ class ChatRun:
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
     user_message: str | list[dict] = ""
+    mode: str = "chat"
 
 
 _active_runs: dict[str, ChatRun] = {}  # keyed by chat_id
@@ -387,6 +410,7 @@ async def _run_agent_turn(
     system_prompt_override: str | None = None,
     channel_hint: str | None = None,
     platform: str | None = None,
+    mode: str = "chat",
 ) -> str | None:
     """Run a single agentic turn (message -> tool loop -> response).
 
@@ -435,10 +459,9 @@ async def _run_agent_turn(
         )
         typed_memory = await _load_typed_memory_context()
         if typed_memory:
-            dynamic_context = (
-                dynamic_context + "\n\n---\n\n" + typed_memory
-                if dynamic_context else typed_memory
-            )
+            dynamic_context = _append_context_block(dynamic_context, typed_memory)
+        if mode == "coding":
+            dynamic_context = _append_context_block(dynamic_context, _coding_task_context())
         if channel_hint:
             dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
@@ -875,6 +898,7 @@ def _sse_keepalive() -> str:
 class ChatRequest(BaseModel):
     message: str | list[dict]
     chat_id: str
+    mode: str = "chat"
 
     @field_validator("message")
     @classmethod
@@ -900,6 +924,47 @@ class ChatRequest(BaseModel):
         if image_count > 10:
             raise ValueError("message must not contain more than 10 images")
         return v
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, v):
+        if v not in {"chat", "coding"}:
+            raise ValueError("mode must be 'chat' or 'coding'")
+        return v
+
+
+class CodingTaskRequest(BaseModel):
+    task: str
+    task_id: str | None = None
+    mode: str = "implement"
+    context: str = ""
+
+    @field_validator("task")
+    @classmethod
+    def validate_task(cls, v):
+        if not v.strip():
+            raise ValueError("task must not be empty")
+        return v
+
+    @field_validator("mode")
+    @classmethod
+    def validate_coding_mode(cls, v):
+        if v not in {"implement", "inspect"}:
+            raise ValueError("mode must be 'implement' or 'inspect'")
+        return v
+
+
+def _coding_task_chat_id(task_id: str) -> str:
+    return f"coding:{task_id}"
+
+
+def _build_coding_task_message(req: CodingTaskRequest) -> str:
+    context = f"\n\nAdditional context:\n{req.context.strip()}" if req.context.strip() else ""
+    return (
+        f"Coding task mode: {req.mode}\n\n"
+        f"Task:\n{req.task.strip()}"
+        f"{context}"
+    )
 
 
 async def _emit(run: ChatRun, data: dict):
@@ -932,7 +997,13 @@ async def _append_terminal_event(run: ChatRun, data: dict) -> None:
     run.events.append(data)
 
 
-async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[dict]):
+async def _run_chat_background(
+    run: ChatRun,
+    chat_id: str,
+    message: str | list[dict],
+    *,
+    mode: str = "chat",
+):
     """Background agentic loop — emits SSE events to run.events buffer."""
     try:
         # Reload plugins so newly created plugins take effect immediately
@@ -948,6 +1019,18 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
 
         def _stash_images(blocks: list[dict]):
             pending_images.extend(blocks)
+
+        if mode == "coding":
+            await _emit(run, {"type": "coding_task.started", "mode": mode})
+            checkpoint = await execute_tool_result(
+                "checkpoint",
+                {"action": "create", "message": f"pre-coding-task {chat_id}"},
+            )
+            await _emit(run, {
+                "type": "coding_task.checkpoint",
+                "status": "failed" if checkpoint.is_error else "ok",
+                "content": checkpoint.content,
+            })
 
         # Use static prompt + dynamic context injection for KV cache preservation
         system_prompt = build_static_system_prompt(
@@ -965,10 +1048,9 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
         )
         typed_memory = await _load_typed_memory_context()
         if typed_memory:
-            dynamic_context = (
-                dynamic_context + "\n\n---\n\n" + typed_memory
-                if dynamic_context else typed_memory
-            )
+            dynamic_context = _append_context_block(dynamic_context, typed_memory)
+        if mode == "coding":
+            dynamic_context = _append_context_block(dynamic_context, _coding_task_context())
 
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
@@ -1181,6 +1263,15 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                 await _plugin_manager.fire("on_session_end", chat_id)
             except Exception:
                 pass  # never let plugin errors block cleanup
+        if mode == "coding":
+            await _append_terminal_event(
+                run,
+                {
+                    "type": "coding_task.completed",
+                    "mode": mode,
+                    "status": "cancelled" if run.task.cancelled() else "done",
+                },
+            )
         # Always emit done and mark run as finished — force-append to avoid
         # re-cancellation in the finally block leaving run.done=False forever
         await _append_terminal_event(run, {"type": "done"})
@@ -1255,11 +1346,107 @@ async def chat(req: ChatRequest):
         chat_id=req.chat_id,
         task=None,  # type: ignore — will be set immediately below
         user_message=req.message,
+        mode=req.mode,
     )
-    run.task = asyncio.create_task(_run_chat_background(run, req.chat_id, req.message))
+    run.task = asyncio.create_task(
+        _run_chat_background(run, req.chat_id, req.message, mode=req.mode)
+    )
     _active_runs[req.chat_id] = run
 
     return StreamingResponse(_read_run_events(run), media_type="text/event-stream")
+
+
+@app.post("/runtime/coding-tasks")
+async def start_coding_task(req: CodingTaskRequest):
+    """Start a coding-task runtime stream backed by the normal chat loop."""
+    _prune_old_chat_runs()
+    task_id = req.task_id or uuid.uuid4().hex
+    chat_id = _coding_task_chat_id(task_id)
+
+    existing = _active_runs.get(chat_id)
+    if existing and not existing.done and not existing.task.done():
+        existing.task.cancel()
+
+    message = _build_coding_task_message(req)
+    run = ChatRun(
+        chat_id=chat_id,
+        task=None,  # type: ignore — set below
+        user_message=message,
+        mode="coding",
+    )
+    run.task = asyncio.create_task(
+        _run_chat_background(run, chat_id, message, mode="coding")
+    )
+    _active_runs[chat_id] = run
+
+    async def _task_stream():
+        yield _sse_event({
+            "type": "coding_task.meta",
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "mode": req.mode,
+        })
+        async for event in _read_run_events(run):
+            yield event
+
+    return StreamingResponse(_task_stream(), media_type="text/event-stream")
+
+
+@app.get("/runtime/coding-tasks/{task_id}/active")
+async def coding_task_active(task_id: str):
+    chat_id = _coding_task_chat_id(task_id)
+    run = _active_runs.get(chat_id)
+    if run and not run.done:
+        return {"active": True, "task_id": task_id, "chat_id": chat_id}
+    return {"active": False, "task_id": task_id, "chat_id": chat_id}
+
+
+@app.get("/runtime/coding-tasks/{task_id}/stream")
+async def coding_task_stream(task_id: str):
+    chat_id = _coding_task_chat_id(task_id)
+    run = _active_runs.get(chat_id)
+    if run is None or run.done:
+        async def _done_stream():
+            yield _sse_event({"type": "done"})
+        return StreamingResponse(_done_stream(), media_type="text/event-stream")
+
+    async def _reconnect_stream():
+        yield _sse_event({
+            "type": "stream_meta",
+            "task_id": task_id,
+            "chat_id": chat_id,
+            "mode": run.mode,
+            "user_message": run.user_message,
+        })
+        async for event in _read_run_events(run):
+            yield event
+
+    return StreamingResponse(_reconnect_stream(), media_type="text/event-stream")
+
+
+@app.get("/runtime/coding-tasks/{task_id}/events")
+async def coding_task_events(
+    task_id: str,
+    limit: int = 200,
+    after_id: int | None = None,
+):
+    limit = min(max(limit, 1), 1000)
+    chat_id = _coding_task_chat_id(task_id)
+    return {
+        "task_id": task_id,
+        "chat_id": chat_id,
+        "events": await db.get_events(chat_id, limit=limit, after_id=after_id),
+    }
+
+
+@app.delete("/runtime/coding-tasks/{task_id}")
+async def cancel_coding_task(task_id: str):
+    chat_id = _coding_task_chat_id(task_id)
+    return {
+        "task_id": task_id,
+        "chat_id": chat_id,
+        "cancelled": cancel_chat_run(chat_id),
+    }
 
 
 @app.get("/chat/{chat_id}/active")
@@ -1267,8 +1454,8 @@ async def chat_active(chat_id: str):
     """Check if there is an active (in-progress) chat run for this chat_id."""
     run = _active_runs.get(chat_id)
     if run and not run.done:
-        return {"active": True, "user_message": run.user_message}
-    return {"active": False, "user_message": ""}
+        return {"active": True, "user_message": run.user_message, "mode": run.mode}
+    return {"active": False, "user_message": "", "mode": "chat"}
 
 
 @app.get("/chat/{chat_id}/stream")
@@ -1288,7 +1475,11 @@ async def chat_stream(chat_id: str):
 
     async def _reconnect_stream():
         # Send metadata so the frontend knows which message is being processed
-        yield _sse_event({"type": "stream_meta", "user_message": run.user_message})
+        yield _sse_event({
+            "type": "stream_meta",
+            "user_message": run.user_message,
+            "mode": run.mode,
+        })
         async for event in _read_run_events(run):
             yield event
 
@@ -1545,6 +1736,7 @@ async def info():
             "runtime_events": True,
             "context_injection_scanner": True,
             "tool_policy": True,
+            "coding_task_runtime": True,
         },
         "tool_policy": tool_policy.describe(),
         "runtime_health": {
