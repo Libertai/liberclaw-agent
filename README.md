@@ -32,6 +32,7 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 - **Skills**: Markdown skill files at `workspace/skills/*/SKILL.md` — summaries are injected into context, full content loaded on demand
 - **Subagents**: Spawn typed background workers for parallel tasks with their own tool sets (no further spawning)
 - **Heartbeat**: Periodic check of `workspace/HEARTBEAT.md` for autonomous task execution (configurable interval, results stored in chat history)
+- **File watchers**: Poll `workspace/watchers.json` and trigger background tasks when watched files or directories change
 - **Security**: Bearer token auth, workspace path sandboxing, bash command deny patterns, sensitive file protection
 
 ## API

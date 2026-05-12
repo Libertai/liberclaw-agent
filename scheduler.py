@@ -17,6 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Awaitable
 
+from baal_agent.watchers import (
+    load_watcher_state,
+    load_watchers,
+    save_watcher_state,
+    watcher_due,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -220,6 +227,8 @@ class CronScheduler:
         """One scheduler tick: reload jobs, run anything that's due."""
         now = datetime.now(timezone.utc)
 
+        await self._tick_watchers(run_job_callback, now)
+
         # Reload jobs from disk every tick
         self.jobs = self.load_jobs()
 
@@ -237,6 +246,36 @@ class CronScheduler:
                     await run_job_callback(job.task, job.id)
                 except Exception as e:
                     logger.error(f"Cron job {job.id!r} failed: {e}")
+
+    async def _tick_watchers(
+        self,
+        run_job_callback: Callable[[str, str], Awaitable[None]],
+        now: datetime,
+    ) -> None:
+        """Reload file watchers and dispatch changed paths."""
+        watchers = load_watchers(self.workspace_path)
+        if not watchers:
+            return
+
+        state = load_watcher_state(self.workspace_path)
+        changed = False
+        for watcher in watchers:
+            try:
+                if watcher_due(
+                    watcher,
+                    self.workspace_path,
+                    state,
+                    now=now.timestamp(),
+                ):
+                    changed = True
+                    logger.info(f"File watcher {watcher.id!r} changed; dispatching")
+                    await run_job_callback(watcher.task, f"watcher:{watcher.id}")
+                else:
+                    changed = True
+            except Exception as e:
+                logger.error(f"File watcher {watcher.id!r} failed: {e}")
+        if changed:
+            save_watcher_state(self.workspace_path, state)
 
     # ── legacy heartbeat fallback ────────────────────────────────────
 
