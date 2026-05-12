@@ -55,6 +55,7 @@ class CodeExecutor:
     def __init__(self) -> None:
         self._socket_path: str | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._tool_context = None
 
     @property
     def socket_path(self) -> str | None:
@@ -111,7 +112,9 @@ class CodeExecutor:
                     from baal_agent.tools import execute_tool
 
                     try:
-                        result = await execute_tool(tool_name, tool_args)
+                        result = await execute_tool(
+                            tool_name, tool_args, context=self._tool_context
+                        )
                         response = {"result": result, "id": req_id}
                     except Exception as exc:
                         response = {"error": str(exc), "id": req_id}
@@ -144,6 +147,8 @@ class CodeExecutor:
             return "[error: CodeExecutor not started]"
 
         timeout = min(timeout, 300)
+        from baal_agent.tools import ToolExecutionContext
+        self._tool_context = ToolExecutionContext()
 
         # Write combined helper + user code to a temp file
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", prefix="baal_exec_")
@@ -202,6 +207,7 @@ class CodeExecutor:
 
             return result
         finally:
+            self._tool_context = None
             try:
                 os.unlink(tmp_path)
             except OSError:

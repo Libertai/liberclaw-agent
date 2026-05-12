@@ -30,10 +30,12 @@ from baal_agent.telegram_bot import TelegramBot
 from baal_agent.plugins import PluginManager
 from baal_agent.scheduler import CronScheduler
 from baal_agent.tools import (
+    ToolExecutionContext,
     configure_tools,
     execute_tool,
     get_tool_definitions,
     get_unavailable_tools,
+    run_tool_calls_ordered,
     shutdown_code_executor,
     shutdown_mcp,
     shutdown_processes,
@@ -164,7 +166,9 @@ async def _telegram_agent_turn(
 
     async def _do_turn():
         return await _run_agent_turn(
-            message, chat_id, channel_hint=TELEGRAM_CHANNEL_HINT,
+            message, chat_id,
+            channel_hint=TELEGRAM_CHANNEL_HINT,
+            platform="telegram",
             file_events=file_events,
         )
 
@@ -297,6 +301,7 @@ async def _run_agent_turn(
     file_events: list[dict] | None = None,
     system_prompt_override: str | None = None,
     channel_hint: str | None = None,
+    platform: str | None = None,
 ) -> str | None:
     """Run a single agentic turn (message -> tool loop -> response).
 
@@ -310,6 +315,8 @@ async def _run_agent_turn(
         system_prompt_override: If set, use this instead of building the default prompt.
         channel_hint: Optional formatting hint appended to the system prompt
             (e.g. Telegram formatting constraints).
+        platform: Short identifier ("telegram", "api", ...) used to filter
+            skills whose frontmatter declares a `platforms` list.
 
     Returns:
         The final text response, or None if no text was generated.
@@ -317,6 +324,7 @@ async def _run_agent_turn(
     iterations = max_iterations or settings.max_tool_iterations
     tools = get_tool_definitions(include_spawn=not restricted)
     tool_names = [t["function"]["name"] for t in tools]
+    tool_context = ToolExecutionContext()
     pending_images: list[dict] = []
 
     def _stash_images(blocks: list[dict]):
@@ -334,7 +342,11 @@ async def _run_agent_turn(
             heartbeat_interval=settings.heartbeat_interval,
             fqdn=settings.agent_fqdn,
         )
-        dynamic_context = build_dynamic_context(settings.workspace_path)
+        dynamic_context = build_dynamic_context(
+            settings.workspace_path,
+            tool_names=tool_names,
+            platform=platform,
+        )
         if channel_hint:
             dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
         await db.add_message(chat_id, "user", message)
@@ -426,6 +438,7 @@ async def _run_agent_turn(
                 result = await execute_tool(
                     tool_name, arguments,
                     image_callback=_stash_images,
+                    context=tool_context,
                 )
 
             # Plugin post_tool hook
@@ -436,9 +449,7 @@ async def _run_agent_turn(
 
             return result
 
-        results = await asyncio.gather(
-            *[_exec_tool(tc) for tc in tool_calls], return_exceptions=True
-        )
+        results = await run_tool_calls_ordered(tool_calls, _exec_tool)
 
         for tc, result in zip(tool_calls, results):
             if isinstance(result, BaseException):
@@ -793,6 +804,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
 
         tools = get_tool_definitions(include_spawn=True)
         tool_names = [t["function"]["name"] for t in tools]
+        tool_context = ToolExecutionContext()
         pending_images: list[dict] = []
 
         def _stash_images(blocks: list[dict]):
@@ -807,7 +819,11 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
             heartbeat_interval=settings.heartbeat_interval,
             fqdn=settings.agent_fqdn,
         )
-        dynamic_context = build_dynamic_context(settings.workspace_path)
+        dynamic_context = build_dynamic_context(
+            settings.workspace_path,
+            tool_names=tool_names,
+            platform="api",
+        )
 
         await db.add_message(chat_id, "user", message)
         messages = await maybe_compact(
@@ -921,6 +937,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
                     result = await execute_tool(
                         tool_name, arguments,
                         image_callback=_stash_images,
+                        context=tool_context,
                     )
 
                 # Plugin post_tool hook: may modify result
@@ -931,9 +948,7 @@ async def _run_chat_background(run: ChatRun, chat_id: str, message: str | list[d
 
                 return result
 
-            results = await asyncio.gather(
-                *[_exec_tool_sse(tc) for tc in tool_calls], return_exceptions=True
-            )
+            results = await run_tool_calls_ordered(tool_calls, _exec_tool_sse)
 
             # Process results in original order
             for tc, result in zip(tool_calls, results):

@@ -38,6 +38,24 @@ MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
 
 _IMAGE_AWARE_TOOLS = {"read_file", "read_pdf", "web_fetch"}
+_MUTATING_TOOLS = {
+    "bash",
+    "write_file",
+    "edit_file",
+    "send_file",
+    "generate_image",
+    "todo",
+    "execute_code",
+    "checkpoint",
+    "process",
+}
+
+
+@dataclass
+class ToolExecutionContext:
+    """Turn-scoped state shared across tool calls."""
+
+    read_hashes: dict[str, str] = _field(default_factory=dict)
 
 # ── Workspace configuration ──────────────────────────────────────────
 
@@ -990,7 +1008,13 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         if _is_binary(resolved):
             return _binary_file_message(resolved)
         with open(resolved, "r", errors="replace") as f:
-            lines = f.readlines()
+            content = f.read()
+        if context := args.get("_context"):
+            if isinstance(context, ToolExecutionContext):
+                context.read_hashes[str(resolved.resolve())] = hashlib.sha256(
+                    content.encode()
+                ).hexdigest()
+        lines = content.splitlines(keepends=True)
         start = max(0, offset - 1)
         end = start + limit if limit else len(lines)
         numbered = [f"{i + start + 1}\t{line}" for i, line in enumerate(lines[start:end])]
@@ -1138,12 +1162,29 @@ async def _exec_edit_file(args: dict) -> str:
             return f"[error: {path} is a binary file and cannot be edited as text]"
         with open(resolved, "r") as f:
             content = f.read()
+        actual_hash = hashlib.sha256(content.encode()).hexdigest()
         if expected_hash:
-            actual_hash = hashlib.sha256(content.encode()).hexdigest()
             if actual_hash != expected_hash:
                 return (
                     f"[error: stale edit refused for {path}; expected_hash "
                     f"does not match current file hash]"
+                )
+        else:
+            context = args.get("_context")
+            read_hash = (
+                context.read_hashes.get(str(resolved.resolve()))
+                if isinstance(context, ToolExecutionContext)
+                else None
+            )
+            if not read_hash:
+                return (
+                    f"[error: edit refused for {path}; read the file in this "
+                    "turn first or pass expected_hash]"
+                )
+            if read_hash != actual_hash:
+                return (
+                    f"[error: stale edit refused for {path}; file changed "
+                    "since it was read this turn]"
                 )
         occurrences = content.count(old_string)
         if occurrences == 0:
@@ -1158,6 +1199,11 @@ async def _exec_edit_file(args: dict) -> str:
         )
         with open(resolved, "w") as f:
             f.write(content)
+        context = args.get("_context")
+        if isinstance(context, ToolExecutionContext):
+            context.read_hashes[str(resolved.resolve())] = hashlib.sha256(
+                content.encode()
+            ).hexdigest()
         if replace_all:
             return f"Edited {path} ({occurrences} replacements)"
         return f"Edited {path}"
@@ -2008,11 +2054,59 @@ def get_tool_definitions(*, include_spawn: bool = True) -> list[dict]:
     return defs
 
 
+def is_mutating_tool(name: str) -> bool:
+    """Return whether a tool may mutate persistent state or external side effects."""
+    if name.startswith("mcp_"):
+        return True
+    return name in _MUTATING_TOOLS
+
+
+def _tool_call_name(tool_call) -> str:
+    return tool_call.function.name
+
+
+async def run_tool_calls_ordered(tool_calls, executor):
+    """Run read-only tools in parallel and mutating tools sequentially.
+
+    Tool results are returned in the original call order. Consecutive read-only
+    tools are batched with ``asyncio.gather``; each mutating tool waits for any
+    prior read batch and completes before later tools begin.
+    """
+    results: list[object] = [None] * len(tool_calls)
+    readonly_batch: list[tuple[int, object]] = []
+
+    async def _flush_readonly_batch() -> None:
+        if not readonly_batch:
+            return
+        batch = list(readonly_batch)
+        readonly_batch.clear()
+        batch_results = await asyncio.gather(
+            *(executor(tc) for _, tc in batch),
+            return_exceptions=True,
+        )
+        for (idx, _), result in zip(batch, batch_results):
+            results[idx] = result
+
+    for idx, tc in enumerate(tool_calls):
+        if is_mutating_tool(_tool_call_name(tc)):
+            await _flush_readonly_batch()
+            try:
+                results[idx] = await executor(tc)
+            except Exception as exc:
+                results[idx] = exc
+        else:
+            readonly_batch.append((idx, tc))
+
+    await _flush_readonly_batch()
+    return results
+
+
 async def execute_tool(
     name: str,
     arguments: str | dict,
     *,
     image_callback=None,
+    context: ToolExecutionContext | None = None,
 ) -> str:
     """Dispatch a tool call by name. Returns the result string."""
     if isinstance(arguments, str):
@@ -2028,6 +2122,9 @@ async def execute_tool(
     available, reason = _tool_available(name)
     if not available:
         return f"[error: tool '{name}' unavailable: {reason}]"
+    if context is not None:
+        arguments = dict(arguments)
+        arguments["_context"] = context
     if name in _IMAGE_AWARE_TOOLS and image_callback:
         return await handler(arguments, image_callback=image_callback)
     return await handler(arguments)

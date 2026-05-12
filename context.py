@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -196,7 +198,11 @@ def build_static_system_prompt(
     return "\n\n---\n\n".join(sections)
 
 
-def build_dynamic_context(workspace_path: str) -> str:
+def build_dynamic_context(
+    workspace_path: str,
+    tool_names: list[str] | None = None,
+    platform: str | None = None,
+) -> str:
     """Load memory and skills content for injection near end of message list.
 
     Kept separate from the static system prompt so the prefix tokens
@@ -214,7 +220,11 @@ def build_dynamic_context(workspace_path: str) -> str:
     if memory:
         sections.append(f"## Memory\n\n{memory}")
 
-    skills = _load_skills_summary(workspace)
+    skills = _load_skills_summary(
+        workspace,
+        tool_names=set(tool_names or []),
+        platform=platform,
+    )
     if skills:
         sections.append(f"## Available Skills\n\n{skills}")
 
@@ -239,7 +249,7 @@ def build_system_prompt(
         heartbeat_interval=heartbeat_interval,
         fqdn=fqdn,
     )
-    dynamic = build_dynamic_context(workspace_path)
+    dynamic = build_dynamic_context(workspace_path, tool_names=tool_names)
     if dynamic:
         return static + "\n\n---\n\n" + dynamic
     return static
@@ -368,13 +378,30 @@ def _load_memory(workspace: Path) -> str:
     return "\n\n".join(parts)
 
 
-def _load_skills_summary(workspace: Path) -> str:
+@dataclass(frozen=True)
+class SkillMetadata:
+    name: str
+    description: str
+    requires_tools: tuple[str, ...] = ()
+    platforms: tuple[str, ...] = ()
+
+
+_SKILLS_SUMMARY_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], list[tuple[str, SkillMetadata]]]] = {}
+
+
+def _load_skills_summary(
+    workspace: Path,
+    *,
+    tool_names: set[str] | None = None,
+    platform: str | None = None,
+) -> str:
     """Scan workspace/skills/*/SKILL.md and return a summary list."""
     skills_dir = workspace / "skills"
     if not skills_dir.is_dir():
         return ""
 
-    lines = []
+    entries: list[tuple[str, Path]] = []
+    manifest_parts: list[tuple[str, int, int]] = []
     for skill_dir in sorted(skills_dir.iterdir()):
         if not skill_dir.is_dir():
             continue
@@ -382,18 +409,48 @@ def _load_skills_summary(workspace: Path) -> str:
         if not skill_file.exists():
             continue
         try:
-            skill_content = skill_file.read_text()
-        except (OSError, UnicodeDecodeError):
+            stat = skill_file.stat()
+        except OSError:
             continue
-        name, description = _parse_skill_metadata(
-            skill_dir.name, skill_content
+        entries.append((skill_dir.name, skill_file))
+        manifest_parts.append((skill_dir.name, stat.st_mtime_ns, stat.st_size))
+
+    manifest = tuple(manifest_parts)
+    cache_key = str(skills_dir.resolve())
+    cached = _SKILLS_SUMMARY_CACHE.get(cache_key)
+    if cached and cached[0] == manifest:
+        parsed_skills = cached[1]
+    else:
+        parsed_skills = []
+        for dir_name, skill_file in entries:
+            try:
+                skill_content = skill_file.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            parsed_skills.append((dir_name, _parse_skill_metadata(dir_name, skill_content)))
+        _SKILLS_SUMMARY_CACHE[cache_key] = (manifest, parsed_skills)
+
+    lines = []
+    available_tools = tool_names or set()
+    normalized_platform = platform.lower() if platform else None
+    for dir_name, metadata in parsed_skills:
+        if metadata.requires_tools and not set(metadata.requires_tools).issubset(available_tools):
+            continue
+        if metadata.platforms and (
+            not normalized_platform
+            or normalized_platform not in {p.lower() for p in metadata.platforms}
+        ):
+            continue
+        skill_file = skills_dir / dir_name / "SKILL.md"
+        lines.append(
+            f"- **{metadata.name}**: {metadata.description} "
+            f"(read `{skill_file}` for details)"
         )
-        lines.append(f"- **{name}**: {description} (read `{skill_file}` for details)")
 
     return "\n".join(lines) if lines else ""
 
 
-def _parse_skill_metadata(dir_name: str, content: str) -> tuple[str, str]:
+def _parse_skill_metadata(dir_name: str, content: str) -> SkillMetadata:
     """Extract skill name and description from SKILL.md content.
 
     Supports both agentskills.io format (YAML frontmatter with name/description)
@@ -403,32 +460,83 @@ def _parse_skill_metadata(dir_name: str, content: str) -> tuple[str, str]:
 
     # Detect YAML frontmatter (--- delimited block at the start)
     if lines and lines[0].strip() == "---":
-        fm_name = ""
-        fm_description = ""
+        frontmatter_lines: list[str] = []
         for i, line in enumerate(lines[1:], 1):
             if line.strip() == "---":
+                metadata = _parse_frontmatter_metadata(dir_name, frontmatter_lines)
                 # End of frontmatter — use parsed values if we got a description
-                if fm_description:
-                    return fm_name or dir_name, fm_description
+                if metadata.description:
+                    return metadata
                 # No description in frontmatter, fall through to legacy parsing
                 # but skip past the frontmatter block
-                return _parse_legacy_description(dir_name, lines[i + 1 :])
-            stripped = line.strip()
-            if stripped.startswith("name:"):
-                fm_name = stripped[5:].strip().strip("\"'")
-            elif stripped.startswith("description:"):
-                fm_description = stripped[12:].strip().strip("\"'")
+                legacy = _parse_legacy_description(dir_name, lines[i + 1 :])
+                return SkillMetadata(
+                    legacy.name,
+                    legacy.description,
+                    metadata.requires_tools,
+                    metadata.platforms,
+                )
+            frontmatter_lines.append(line)
 
     # No frontmatter — legacy format
     return _parse_legacy_description(dir_name, lines)
 
 
+def _parse_frontmatter_metadata(dir_name: str, lines: list[str]) -> SkillMetadata:
+    fields: dict[str, str | list[str]] = {}
+    current_list_key: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if current_list_key and stripped.startswith("- "):
+            existing = fields.setdefault(current_list_key, [])
+            if isinstance(existing, list):
+                existing.append(stripped[2:].strip().strip("\"'"))
+            continue
+        current_list_key = None
+        if ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if value == "":
+            fields[key] = []
+            current_list_key = key
+        elif value.startswith("[") and value.endswith("]"):
+            try:
+                parsed = json.loads(value.replace("'", '"'))
+                fields[key] = [str(item) for item in parsed] if isinstance(parsed, list) else []
+            except json.JSONDecodeError:
+                fields[key] = [
+                    part.strip().strip("\"'")
+                    for part in value.strip("[]").split(",")
+                    if part.strip()
+                ]
+        else:
+            fields[key] = value.strip("\"'")
+    return SkillMetadata(
+        name=str(fields.get("name") or dir_name),
+        description=str(fields.get("description") or ""),
+        requires_tools=tuple(_as_str_list(fields.get("requires_tools"))),
+        platforms=tuple(_as_str_list(fields.get("platforms"))),
+    )
+
+
+def _as_str_list(value: str | list[str] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item]
+    return [value] if value else []
+
+
 def _parse_legacy_description(
     dir_name: str, lines: list[str]
-) -> tuple[str, str]:
+) -> SkillMetadata:
     """Extract description as the first non-empty, non-heading line."""
     for line in lines:
         stripped = line.strip()
         if stripped and not stripped.startswith("#"):
-            return dir_name, stripped
-    return dir_name, ""
+            return SkillMetadata(dir_name, stripped)
+    return SkillMetadata(dir_name, "")
