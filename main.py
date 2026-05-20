@@ -42,7 +42,6 @@ from baal_agent.tools import (
     ToolPolicy,
     ToolResult,
     configure_tools,
-    execute_tool,
     execute_tool_result,
     get_tool_definitions,
     get_mcp_health,

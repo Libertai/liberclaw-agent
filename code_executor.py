@@ -114,7 +114,6 @@ class CodeExecutor:
                     response = {"error": f"tool '{tool_name}' is not available from execute_code", "id": req_id}
                 else:
                     # Import here to avoid circular import at module level
-                    from baal_agent.tools import execute_tool
 
                     try:
                         # Use the result-shape API so policy enforcement on
