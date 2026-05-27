@@ -7,14 +7,14 @@ description: Research topics online — search the web with web_search, then rea
 Combine the research tools instead of guessing URLs by hand.
 
 ## Workflow
-1. **Search first.** Use `web_search` (LibertAI Search) to discover relevant
+1. **Check what you already know** with `search_history` before going to the
+   internet — you may have covered the topic in a past conversation.
+2. **Search the web.** Use `web_search` (LibertAI Search) to discover relevant
    pages — it returns titles, URLs, and snippets. Only skip this when you already
    know the exact URL.
-2. **Read the promising results** with `web_fetch` (returns page text with HTML
+3. **Read the promising results** with `web_fetch` (returns page text with HTML
    stripped). For PDFs, use `read_pdf` — `web_fetch` saves a PDF as a binary
    download rather than extracting its text.
-3. **Check what you already know** with `search_history` before researching from
-   scratch — you may have covered the topic in a past conversation.
 4. **Analyze and extract** the relevant information.
 5. **Save durable findings** to `MEMORY.md` (and useful URLs for next time).
 
