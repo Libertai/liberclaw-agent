@@ -41,12 +41,14 @@ from baal_agent.tools import (
     ToolExecutionContext,
     ToolPolicy,
     ToolResult,
+    _tool_available,
     configure_tools,
     execute_tool_result,
     get_tool_definitions,
     get_mcp_health,
     get_unavailable_tools,
     run_tool_calls_ordered,
+    shutdown_browser,
     shutdown_code_executor,
     shutdown_mcp,
     shutdown_processes,
@@ -66,6 +68,19 @@ def _current_tool_policy() -> ToolPolicy:
         allowlist=settings.tool_allowlist,
         denylist=settings.tool_denylist,
     )
+
+
+def _capabilities() -> list[str]:
+    """Capabilities advertised on /health and /info.
+
+    `vision` is always present; `browser` appears only when the browser tool is
+    actually usable (enabled + chromium installed), so old/free agents simply
+    omit it without needing an AGENT_VERSION bump.
+    """
+    caps = ["vision"]
+    if _tool_available("browser")[0]:
+        caps.append("browser")
+    return caps
 
 
 def _blocked_tool_result(tool_name: str, policy: ToolPolicy) -> ToolResult | None:
@@ -416,6 +431,7 @@ async def lifespan(app: FastAPI):
     await shutdown_processes()
     await shutdown_code_executor()
     await shutdown_shell()
+    await shutdown_browser()
     await db.close()
 
 
@@ -1822,7 +1838,7 @@ async def upload_file(
 async def health():
     from baal_agent import AGENT_VERSION
 
-    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": ["vision"]}
+    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": _capabilities()}
 
 
 @app.get("/info")
@@ -1838,7 +1854,7 @@ async def info():
         "api_version": 3,
         "model": settings.model,
         "has_system_prompt": bool(settings.system_prompt),
-        "capabilities": ["vision"],
+        "capabilities": _capabilities(),
         "tools": [t["function"]["name"] for t in tools],
         "tool_metadata": tool_metadata(),
         "unavailable_tools": get_unavailable_tools(),
@@ -1856,6 +1872,7 @@ async def info():
             "tool_policy": True,
             "coding_task_runtime": True,
             "file_watchers": True,
+            "browser": _tool_available("browser")[0],
         },
         "tool_policy": tool_policy.describe(),
         "runtime_health": {

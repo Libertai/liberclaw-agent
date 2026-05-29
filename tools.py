@@ -37,7 +37,7 @@ from baal_agent.shell import PersistentShell
 MAX_TOOL_OUTPUT = 30_000
 MAX_WEB_CONTENT = 50_000
 
-_IMAGE_AWARE_TOOLS = {"read_file", "read_pdf", "web_fetch"}
+_IMAGE_AWARE_TOOLS = {"read_file", "read_pdf", "web_fetch", "browser"}
 _MUTATING_TOOLS = {
     "bash",
     "apply_patch",
@@ -60,6 +60,9 @@ _MUTATING_TOOLS = {
     "run_lint",
     "run_typecheck",
     "spawn",
+    # The browser keeps stateful navigation (cookies, current page) across
+    # calls; serialize it so concurrent actions don't race on the shared page.
+    "browser",
 }
 _SHELL_TOOLS = {
     "bash",
@@ -839,6 +842,44 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser",
+            "description": (
+                "Drive a headless Chromium browser to interact with live pages "
+                "(JavaScript-rendered sites, forms, login walls). Actions: "
+                "'goto' loads a URL; 'extract' returns the rendered page text; "
+                "'click' clicks an element by CSS selector; 'type' types text into "
+                "an input by CSS selector; 'screenshot' captures the current page as "
+                "an image; 'back' navigates to the previous page. The browser keeps "
+                "its state (cookies, current page) across calls within a session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["goto", "extract", "click", "type", "screenshot", "back"],
+                        "description": "The browser action to perform.",
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL to navigate to (required for 'goto'; http or https only).",
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for 'click' and 'type'.",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to type (required for 'type').",
+                    },
+                },
+                "required": ["action"],
             },
         },
     },
@@ -2267,6 +2308,128 @@ async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
         return f"[error: {e}]"
 
 
+# ── Browser tool (headless Chromium via Playwright) ───────────────────
+# A single headless browser/context is launched lazily and reused for the
+# whole process so navigation state (cookies, current page) persists across
+# tool calls. A lock serializes concurrent calls; the dispatcher also treats
+# `browser` as mutating so calls run sequentially.
+
+BROWSER_NAV_TIMEOUT_MS = 30_000
+_browser_playwright = None  # the started Playwright context manager
+_browser = None  # launched Chromium Browser
+_browser_page = None  # the single active Page
+_browser_lock = asyncio.Lock()
+
+
+async def _get_browser_page():
+    """Lazily launch (and reuse) a headless Chromium page.
+
+    Raises RuntimeError on launch failure so the caller can translate it into
+    an ``[error: ...]`` result string.
+    """
+    global _browser_playwright, _browser, _browser_page
+    if _browser_page is not None:
+        return _browser_page
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as e:
+        raise RuntimeError(f"playwright is not installed: {e}") from e
+    if _browser_playwright is None:
+        _browser_playwright = await async_playwright().start()
+    if _browser is None:
+        _browser = await _browser_playwright.chromium.launch(headless=True)
+    context = await _browser.new_context()
+    _browser_page = await context.new_page()
+    _browser_page.set_default_timeout(BROWSER_NAV_TIMEOUT_MS)
+    return _browser_page
+
+
+async def shutdown_browser() -> None:
+    """Close the shared browser. Safe to call even if never launched."""
+    global _browser_playwright, _browser, _browser_page
+    try:
+        if _browser is not None:
+            await _browser.close()
+    except Exception:
+        pass
+    try:
+        if _browser_playwright is not None:
+            await _browser_playwright.stop()
+    except Exception:
+        pass
+    _browser_playwright = None
+    _browser = None
+    _browser_page = None
+
+
+async def _exec_browser(args: dict, *, image_callback=None) -> str:
+    action = str(args.get("action", "")).strip()
+    if not action:
+        return "[error: missing required 'action' parameter]"
+    if action not in {"goto", "extract", "click", "type", "screenshot", "back"}:
+        return f"[error: unknown browser action '{action}']"
+
+    if action == "goto":
+        url = args.get("url")
+        if not url:
+            return "[error: 'goto' requires a 'url' parameter]"
+        if not re.match(r"^https?://", url):
+            return "[error: URL must start with http:// or https://]"
+
+    async with _browser_lock:
+        try:
+            page = await _get_browser_page()
+        except RuntimeError as e:
+            return f"[error: {e}]"
+        try:
+            if action == "goto":
+                await page.goto(args["url"], timeout=BROWSER_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                return f"Navigated to {page.url} — \"{await page.title()}\""
+
+            if action == "back":
+                await page.go_back(timeout=BROWSER_NAV_TIMEOUT_MS)
+                return f"Went back to {page.url} — \"{await page.title()}\""
+
+            if action == "click":
+                selector = args.get("selector")
+                if not selector:
+                    return "[error: 'click' requires a 'selector' parameter]"
+                await page.click(selector, timeout=BROWSER_NAV_TIMEOUT_MS)
+                return f"Clicked {selector!r}. Now at {page.url}"
+
+            if action == "type":
+                selector = args.get("selector")
+                text = args.get("text")
+                if not selector:
+                    return "[error: 'type' requires a 'selector' parameter]"
+                if text is None:
+                    return "[error: 'type' requires a 'text' parameter]"
+                await page.fill(selector, str(text), timeout=BROWSER_NAV_TIMEOUT_MS)
+                return f"Typed into {selector!r}."
+
+            if action == "extract":
+                content = await page.content()
+                text = _strip_html(content)
+                if len(text) > MAX_WEB_CONTENT:
+                    text = text[:MAX_WEB_CONTENT] + f"\n\n... truncated ({len(content)} chars total)"
+                return text if text.strip() else "(empty page)"
+
+            if action == "screenshot":
+                png = await page.screenshot(type="png")
+                data_uri = encode_bytes_to_data_uri(png, mime="image/png")
+                blocks: list[dict] = [
+                    {"type": "text", "text": f"[Screenshot: {page.url}]"},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ]
+                if image_callback:
+                    image_callback(blocks)
+                return f"[Captured screenshot of {page.url}]"
+        except Exception as e:
+            return f"[error: {e}]"
+
+    return f"[error: unknown browser action '{action}']"
+
+
 async def _exec_search_history(args: dict) -> str:
     query = args.get("query", "")
     if not query:
@@ -2979,6 +3142,7 @@ TOOL_HANDLERS: dict[str, callable] = {
     "run_typecheck": _exec_run_typecheck,
     "run_format": _exec_run_format,
     "web_fetch": _exec_web_fetch,
+    "browser": _exec_browser,
     "search_history": _exec_search_history,
     "remember_fact": _exec_remember_fact,
     "search_memory": _exec_search_memory,
@@ -2992,6 +3156,24 @@ TOOL_HANDLERS: dict[str, callable] = {
 }
 
 
+def _chromium_present() -> bool:
+    """Return whether a Playwright-managed Chromium build is installed.
+
+    Probes Playwright's executable path first (the normal install location),
+    then falls back to a system chromium on PATH. Failures are treated as
+    "not present" so the tool gates off rather than erroring at call time.
+    """
+    try:
+        from playwright._impl._driver import compute_driver_executable  # noqa: F401
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            return bool(Path(p.chromium.executable_path).exists())
+    except Exception:
+        pass
+    return shutil.which("chromium") is not None or shutil.which("chromium-browser") is not None
+
+
 def _tool_available(name: str) -> tuple[bool, str | None]:
     """Return whether a built-in tool is currently usable."""
     if name in {"web_search", "generate_image"} and not os.environ.get("LIBERTAI_API_KEY", ""):
@@ -3000,6 +3182,11 @@ def _tool_available(name: str) -> tuple[bool, str | None]:
         return False, "ripgrep (rg) is not installed"
     if name in {"apply_patch", "git_status", "git_diff", "git_show", "git_blame"} and shutil.which("git") is None:
         return False, "git is not installed"
+    if name == "browser":
+        if os.environ.get("BROWSER_ENABLED") != "true":
+            return False, "browser is disabled (set BROWSER_ENABLED=true)"
+        if not _chromium_present():
+            return False, "chromium is not installed"
     return True, None
 
 
