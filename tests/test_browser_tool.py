@@ -85,6 +85,8 @@ def mock_page(monkeypatch):
         return page
 
     monkeypatch.setattr(tools, "_get_browser_page", _fake_get_page)
+    # Treat all URLs as public so navigation tests stay hermetic (no real DNS).
+    monkeypatch.setattr(tools, "_validate_public_url", AsyncMock(return_value=None))
     return page
 
 
@@ -101,6 +103,79 @@ async def test_browser_goto_rejects_non_http():
     result = await _exec_browser({"action": "goto", "url": "file:///etc/passwd"})
     assert result.startswith("[error:")
     assert "http" in result
+
+
+# ── SSRF guard ────────────────────────────────────────────────────────
+
+
+def test_ip_is_blocked_classifies_private_and_public():
+    from baal_agent.tools import _ip_is_blocked
+
+    for blocked in (
+        "127.0.0.1",
+        "10.0.0.5",
+        "192.168.1.1",
+        "172.16.0.1",
+        "169.254.169.254",  # cloud metadata
+        "::1",
+        "0.0.0.0",
+        "::ffff:10.0.0.1",  # IPv4-mapped private
+        "not-an-ip",
+    ):
+        assert _ip_is_blocked(blocked) is True, blocked
+    for public in ("8.8.8.8", "1.1.1.1", "93.184.216.34"):
+        assert _ip_is_blocked(public) is False, public
+
+
+@pytest.mark.asyncio
+async def test_validate_public_url_rejects_bad_schemes():
+    from baal_agent.tools import _validate_public_url
+
+    for url in (
+        "file:///etc/passwd",
+        "data:text/html,<h1>x</h1>",
+        "chrome://settings",
+        "view-source:http://example.com",
+        "ftp://example.com/x",
+    ):
+        assert await _validate_public_url(url) is not None, url
+
+
+@pytest.mark.asyncio
+async def test_validate_public_url_blocks_private_resolution(monkeypatch):
+    import baal_agent.tools as t
+
+    def fake_getaddrinfo(host, port, *a, **k):
+        return [(2, 1, 6, "", ("169.254.169.254", port))]
+
+    monkeypatch.setattr(t.socket, "getaddrinfo", fake_getaddrinfo)
+    reason = await t._validate_public_url("http://metadata.internal/latest/")
+    assert reason is not None and "non-public" in reason
+
+
+@pytest.mark.asyncio
+async def test_validate_public_url_allows_public(monkeypatch):
+    import baal_agent.tools as t
+
+    def fake_getaddrinfo(host, port, *a, **k):
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(t.socket, "getaddrinfo", fake_getaddrinfo)
+    assert await t._validate_public_url("https://example.com/") is None
+
+
+@pytest.mark.asyncio
+async def test_browser_goto_blocks_ssrf(monkeypatch, mock_page):
+    # Override the fixture's permissive stub to simulate a blocked target.
+    monkeypatch.setattr(
+        tools,
+        "_validate_public_url",
+        AsyncMock(return_value="blocked: 'x' resolves to non-public address 127.0.0.1"),
+    )
+    result = await _exec_browser({"action": "goto", "url": "http://127.0.0.1:8080/"})
+    assert result.startswith("[error:")
+    assert "non-public" in result
+    mock_page.goto.assert_not_awaited()
 
 
 @pytest.mark.asyncio

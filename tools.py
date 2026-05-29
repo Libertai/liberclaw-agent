@@ -6,11 +6,13 @@ import asyncio
 import base64
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import time as _time
 import uuid
 from dataclasses import dataclass, field as _field
@@ -2320,6 +2322,88 @@ _browser = None  # launched Chromium Browser
 _browser_page = None  # the single active Page
 _browser_lock = asyncio.Lock()
 
+# Only these schemes may be navigated. An explicit allowlist (rather than a
+# regex prefix) keeps file:/data:/chrome:/view-source: and friends out.
+_ALLOWED_BROWSER_SCHEMES = {"http", "https"}
+
+
+def _ip_is_blocked(ip_str: str) -> bool:
+    """True if ``ip_str`` is a non-public SSRF target (private, loopback,
+    link-local, reserved, multicast or unspecified). Unparseable → blocked.
+    IPv4-mapped IPv6 is unwrapped so ``::ffff:10.0.0.1`` is caught."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+async def _validate_public_url(url: str) -> str | None:
+    """SSRF guard for the browser tool. Returns an error reason when ``url`` is
+    not a safe, public http(s) target, else ``None``.
+
+    Rejects non-http(s) schemes and any host that resolves (via getaddrinfo) to
+    a private/loopback/link-local/reserved/multicast address — blocking cloud
+    metadata (169.254.169.254), localhost and RFC1918 pivots. Re-run on every
+    navigation by ``_ssrf_route_guard`` so redirects can't slip past."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "invalid URL"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in _ALLOWED_BROWSER_SCHEMES:
+        return f"scheme '{scheme or '?'}' not allowed — only http/https"
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if not hostname:
+        return "URL has no host"
+    port = parsed.port or (443 if scheme == "https" else 80)
+    loop = asyncio.get_event_loop()
+    try:
+        infos = await loop.run_in_executor(
+            None,
+            lambda: socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP),
+        )
+    except OSError as e:
+        return f"could not resolve host '{hostname}': {e}"
+    addrs = {info[4][0] for info in infos}
+    if not addrs:
+        return f"could not resolve host '{hostname}'"
+    for ip_str in addrs:
+        if _ip_is_blocked(ip_str):
+            return f"blocked: '{hostname}' resolves to non-public address {ip_str}"
+    return None
+
+
+async def _ssrf_route_guard(route) -> None:
+    """Context route handler: re-validate every top-level navigation (initial
+    load, server redirect, history back/forward) against the SSRF policy and
+    abort ones aimed at non-public hosts. Subresources pass through — their
+    bodies are never returned to the model."""
+    request = route.request
+    is_nav = False
+    try:
+        is_nav = request.is_navigation_request()
+        if is_nav and await _validate_public_url(request.url) is not None:
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
+    except Exception:
+        # Fail closed for navigations, fail open for subresources.
+        try:
+            await (route.abort("failed") if is_nav else route.continue_())
+        except Exception:
+            pass
+
 
 async def _get_browser_page():
     """Lazily launch (and reuse) a headless Chromium page.
@@ -2339,6 +2423,9 @@ async def _get_browser_page():
     if _browser is None:
         _browser = await _browser_playwright.chromium.launch(headless=True)
     context = await _browser.new_context()
+    # Re-validate every navigation (incl. redirects/back) against the SSRF
+    # policy, not just the initial goto URL.
+    await context.route("**/*", _ssrf_route_guard)
     _browser_page = await context.new_page()
     _browser_page.set_default_timeout(BROWSER_NAV_TIMEOUT_MS)
     return _browser_page
@@ -2373,8 +2460,9 @@ async def _exec_browser(args: dict, *, image_callback=None) -> str:
         url = args.get("url")
         if not url:
             return "[error: 'goto' requires a 'url' parameter]"
-        if not re.match(r"^https?://", url):
-            return "[error: URL must start with http:// or https://]"
+        nav_error = await _validate_public_url(url)
+        if nav_error is not None:
+            return f"[error: {nav_error}]"
 
     async with _browser_lock:
         try:
