@@ -3245,21 +3245,31 @@ TOOL_HANDLERS: dict[str, callable] = {
 
 
 def _chromium_present() -> bool:
-    """Return whether a Playwright-managed Chromium build is installed.
+    """Return whether a Chromium build the browser tool can launch is installed.
 
-    Probes Playwright's executable path first (the normal install location),
-    then falls back to a system chromium on PATH. Failures are treated as
-    "not present" so the tool gates off rather than erroring at call time.
+    Pure filesystem/PATH probe — deliberately does NOT use Playwright's sync
+    API, which raises ("Sync API inside the asyncio loop") when called from an
+    async context such as the /info and /health handlers or the tool dispatch.
+    That made the gate fail closed even when Chromium was installed.
     """
-    try:
-        from playwright._impl._driver import compute_driver_executable  # noqa: F401
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            return bool(Path(p.chromium.executable_path).exists())
-    except Exception:
-        pass
-    return shutil.which("chromium") is not None or shutil.which("chromium-browser") is not None
+    # System chromium on PATH.
+    if shutil.which("chromium") or shutil.which("chromium-browser"):
+        return True
+    # Playwright-managed browser cache (`playwright install chromium` writes
+    # chromium-<rev>/ and chromium_headless_shell-<rev>/ dirs here).
+    roots: list[Path] = []
+    env_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if env_path and env_path != "0":
+        roots.append(Path(env_path))
+    roots.append(Path.home() / ".cache" / "ms-playwright")
+    roots.append(Path("/root/.cache/ms-playwright"))
+    for root in roots:
+        try:
+            if root.is_dir() and any(root.glob("chromium*-*")):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _tool_available(name: str) -> tuple[bool, str | None]:

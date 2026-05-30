@@ -178,6 +178,41 @@ async def test_browser_goto_blocks_ssrf(monkeypatch, mock_page):
     mock_page.goto.assert_not_awaited()
 
 
+# ── _chromium_present probe (filesystem, async-safe) ──────────────────
+
+
+def test_chromium_present_finds_playwright_cache(tmp_path, monkeypatch):
+    import baal_agent.tools as t
+
+    monkeypatch.setattr(t.shutil, "which", lambda *_: None)  # no system chromium
+    cache = tmp_path / "pw"
+    cache.mkdir()
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(cache))
+    # Isolate HOME so a real ~/.cache/ms-playwright on the test host can't leak in.
+    monkeypatch.setenv("HOME", str(tmp_path / "emptyhome"))
+    assert t._chromium_present() is False
+    (cache / "chromium-1223").mkdir()
+    assert t._chromium_present() is True
+
+
+def test_chromium_present_finds_system_chromium(monkeypatch):
+    import baal_agent.tools as t
+
+    monkeypatch.setattr(t.shutil, "which", lambda name: "/usr/bin/chromium" if name == "chromium" else None)
+    assert t._chromium_present() is True
+
+
+@pytest.mark.asyncio
+async def test_chromium_present_safe_inside_event_loop(monkeypatch):
+    # Regression: the old sync_playwright() probe raised "Sync API inside the
+    # asyncio loop" here, silently gating the tool off. The fs probe must not.
+    import baal_agent.tools as t
+
+    monkeypatch.setattr(t.shutil, "which", lambda *_: None)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
+    assert t._chromium_present() in (True, False)  # returns a bool, never raises
+
+
 @pytest.mark.asyncio
 async def test_browser_extract_strips_html_and_truncates(mock_page):
     result = await _exec_browser({"action": "extract"})
