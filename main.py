@@ -32,6 +32,7 @@ from baal_agent.context import (
     normalize_subagent_role,
 )
 from baal_agent.database import AgentDatabase
+from baal_agent.image_utils import cap_images_in_messages
 from baal_agent.inference import InferenceClient
 from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
 from baal_agent.telegram_bot import TelegramBot
@@ -117,10 +118,13 @@ async def _emit_guardrail_blocked(run: "ChatRun", result: ToolResult) -> None:
 
 
 async def _apply_pre_inference(messages: list[dict]) -> list[dict]:
-    if _plugin_manager is None:
-        return messages
-    modified = await _plugin_manager.fire_modify("pre_inference", messages)
-    return modified if isinstance(modified, list) else messages
+    if _plugin_manager is not None:
+        modified = await _plugin_manager.fire_modify("pre_inference", messages)
+        if isinstance(modified, list):
+            messages = modified
+    # Cap images last so the final payload always respects the limit regardless
+    # of what plugins added — some vision models reject too many images at once.
+    return cap_images_in_messages(messages, settings.max_images_per_request)
 
 
 async def _apply_post_inference(assistant_msg):

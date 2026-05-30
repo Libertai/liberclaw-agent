@@ -19,6 +19,7 @@ class AgentSettings(BaseSettings):
     owner_chat_id: str = ""  # Telegram chat ID for subagent pending message delivery
     heartbeat_interval: int = 1800  # seconds (0 = disabled)
     max_context_tokens: int = 0  # 0 = auto-detect from model name
+    max_images_per_request: int = 4  # cap images sent to inference (0 = no cap); older ones dropped
     generation_reserve: int = 4096  # tokens reserved for model output
     compaction_keep_messages: int = 20  # max recent messages to preserve during compaction
     compaction_keep_min: int = 6  # minimum messages to keep even under extreme context pressure

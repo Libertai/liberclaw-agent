@@ -169,3 +169,70 @@ def strip_images_from_content(content: str | list[dict] | None) -> str | list[di
         else:
             result.append(block)
     return result
+
+
+def count_images_in_messages(messages: list[dict]) -> int:
+    """Count image_url blocks across a list of chat messages."""
+    total = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            total += sum(
+                1
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "image_url"
+            )
+    return total
+
+
+def cap_images_in_messages(
+    messages: list[dict], max_images: int
+) -> list[dict]:
+    """Keep only the most recent ``max_images`` image blocks across a message list.
+
+    Older image_url blocks are replaced with ``[image omitted]`` text placeholders
+    so the model still sees that an image was present, without sending the data.
+    Some LibertAI vision models reject requests carrying more than a handful of
+    images, so this caps the count before inference.
+
+    Returns a new list. Only messages whose images are dropped are shallow-copied
+    (with a fresh content list); untouched messages are passed through by
+    reference, leaving the caller's persisted history unmodified. If the total is
+    already within the cap (or ``max_images`` is non-positive), the original list
+    is returned unchanged.
+    """
+    if max_images <= 0:
+        return messages
+
+    total = count_images_in_messages(messages)
+    if total <= max_images:
+        return messages
+
+    # Drop the oldest images first (earliest message, earliest block within it)
+    # until we are back under the cap, preserving the most recent ones.
+    to_drop = total - max_images
+    dropped = 0
+    result = list(messages)
+    for i, msg in enumerate(messages):
+        if dropped >= to_drop:
+            break
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        if not any(
+            isinstance(b, dict) and b.get("type") == "image_url" for b in content
+        ):
+            continue
+        new_content = []
+        for block in content:
+            if (
+                dropped < to_drop
+                and isinstance(block, dict)
+                and block.get("type") == "image_url"
+            ):
+                new_content.append({"type": "text", "text": "[image omitted]"})
+                dropped += 1
+            else:
+                new_content.append(block)
+        result[i] = {**msg, "content": new_content}
+    return result
