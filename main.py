@@ -1699,6 +1699,17 @@ async def get_pending(chat_id: str | None = None):
     return {"messages": messages}
 
 
+@app.get("/pending/count")
+async def count_pending(chat_id: str | None = None):
+    """Non-destructive count of pending messages — does NOT clear them.
+
+    Lets the control plane check for a backlog (e.g. to send a "your agent
+    finished something" nudge) without draining messages the user never saw.
+    """
+    count = await db.count_pending(chat_id)
+    return {"count": count}
+
+
 @app.get("/files/{file_path:path}")
 async def serve_file(file_path: str):
     """Serve a workspace file (protected by auth middleware)."""

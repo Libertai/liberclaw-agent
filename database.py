@@ -615,6 +615,20 @@ class AgentDatabase:
             await self.db.commit()
         return messages
 
+    async def count_pending(self, chat_id: str | None = None) -> int:
+        """Count pending messages WITHOUT clearing them (non-destructive peek)."""
+        if chat_id:
+            cursor = await self.db.execute(
+                "SELECT COUNT(*) AS c FROM pending_messages WHERE chat_id = ?",
+                (chat_id,),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT COUNT(*) AS c FROM pending_messages"
+            )
+        row = await cursor.fetchone()
+        return int(row["c"]) if row else 0
+
     # ── Telegram contacts ─────────────────────────────────────────────
 
     def _contact_row_to_dict(self, row) -> dict:
