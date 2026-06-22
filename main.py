@@ -342,58 +342,67 @@ async def _delegate_vision(messages: list[dict], chat_id: str) -> list[dict]:
 
     stash = _vision_image_stash.setdefault(chat_id, {"next_id": 1, "images": []})
 
-    for msg in messages:
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        new_blocks: list[dict] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "image_url":
-                image_id = stash["next_id"]
-                stash["next_id"] += 1
-                blocks = [block]
-                try:
-                    response = await inference.chat(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": _VISION_DELEGATION_PROMPT},
-                                    *blocks,
-                                ],
-                            }
-                        ],
-                        model=settings.vision_delegation_model,
-                    )
-                    summary = (response.content or "").strip()
-                except Exception as e:
-                    logger.warning(
-                        f"Vision delegation failed for image {image_id}: {e}"
-                    )
-                    summary = "unavailable"
-                stash["images"].append(
-                    {
-                        "id": image_id,
-                        "blocks": blocks,
-                        "summary": summary,
-                    }
+    # Only delegate image_url blocks in the last user message — historical
+    # images were either already delegated in a prior turn (and stored as
+    # text placeholders in the DB) or will be stripped by compaction.
+    # Processing all messages would re-describe every historical image on
+    # every turn, costing one claw-flash call per image per turn.
+    last_user_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        return events
+
+    msg = messages[last_user_idx]
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return events
+    new_blocks: list[dict] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "image_url":
+            image_id = stash["next_id"]
+            stash["next_id"] += 1
+            blocks = [block]
+            try:
+                response = await inference.chat(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": _VISION_DELEGATION_PROMPT},
+                                *blocks,
+                            ],
+                        }
+                    ],
+                    model=settings.vision_delegation_model,
                 )
-                new_blocks.append(
-                    {"type": "text", "text": f"[Image {image_id}: {summary}]"}
-                )
-                events.append(
-                    {
-                        "type": "vision_delegation",
-                        "image_id": image_id,
-                        "model": settings.vision_delegation_model,
-                        "status": "ok" if summary != "unavailable" else "failed",
-                    }
-                )
-            else:
-                new_blocks.append(block)
-        msg["content"] = new_blocks
+                summary = (response.content or "").strip()
+            except Exception as e:
+                logger.warning(f"Vision delegation failed for image {image_id}: {e}")
+                summary = "unavailable"
+            stash["images"].append(
+                {
+                    "id": image_id,
+                    "blocks": blocks,
+                    "summary": summary,
+                }
+            )
+            new_blocks.append(
+                {"type": "text", "text": f"[Image {image_id}: {summary}]"}
+            )
+            events.append(
+                {
+                    "type": "vision_delegation",
+                    "image_id": image_id,
+                    "model": settings.vision_delegation_model,
+                    "status": "ok" if summary != "unavailable" else "failed",
+                }
+            )
+        else:
+            new_blocks.append(block)
+    msg["content"] = new_blocks
 
     return events
 
