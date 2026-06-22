@@ -17,7 +17,7 @@ class AgentSettings(BaseSettings):
     port: int = 8080
     db_path: str = "agent.db"
     max_history: int = 100
-    max_tool_iterations: int = 50
+    max_tool_iterations: int = 150
     workspace_path: str = "/opt/baal-agent/workspace"
     owner_chat_id: str = ""  # Telegram chat ID for subagent pending message delivery
     heartbeat_interval: int = 1800  # seconds (0 = disabled)

@@ -1071,7 +1071,7 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
                 run.task,
                 chat_id=f"__subagent_{run.id}__",
                 restricted=True,
-                max_iterations=15,
+                max_iterations=45,
                 store_history=False,
                 file_events=files,
                 system_prompt_override=subagent_prompt,

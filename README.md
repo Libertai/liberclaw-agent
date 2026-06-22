@@ -116,7 +116,7 @@ All settings via environment variables:
 | `WORKSPACE_PATH` | `/opt/baal-agent/workspace` | Root directory for files |
 | `OWNER_CHAT_ID` | — | Chat ID for subagent pending message delivery |
 | `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks (0 to disable) |
-| `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
+| `MAX_TOOL_ITERATIONS` | `150` | Max tool calls per turn |
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
 | `INFERENCE_TIMEOUT` | `300` | Seconds before inference timeout |
 
