@@ -22,6 +22,7 @@ _MODEL_CONTEXT_SIZES = {
     "claw-flash": 200_000,
     "claw-core": 200_000,
     "deep-claw": 200_000,
+    "claw-large": 262_144,
 }
 _DEFAULT_CONTEXT_SIZE = 200_000
 
