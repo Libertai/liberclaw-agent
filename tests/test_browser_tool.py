@@ -44,13 +44,16 @@ def test_browser_available_when_enabled_and_present(monkeypatch):
 
 
 def test_capability_list_excludes_then_includes_browser(monkeypatch):
+    from baal_agent.compaction import model_supports_vision
+
     monkeypatch.delenv("BROWSER_ENABLED", raising=False)
-    caps_off = ["vision"] + (["browser"] if _tool_available("browser")[0] else [])
-    assert caps_off == ["vision"]
+    base = "vision" if model_supports_vision("claw-large") else "vision_delegated"
+    caps_off = [base] + (["browser"] if _tool_available("browser")[0] else [])
+    assert caps_off == [base]
 
     monkeypatch.setenv("BROWSER_ENABLED", "true")
     monkeypatch.setattr(tools, "_chromium_present", lambda: True)
-    caps_on = ["vision"] + (["browser"] if _tool_available("browser")[0] else [])
+    caps_on = [base] + (["browser"] if _tool_available("browser")[0] else [])
     assert "browser" in caps_on
 
 
