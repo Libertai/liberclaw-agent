@@ -27,6 +27,23 @@ _MODEL_CONTEXT_SIZES = {
 _DEFAULT_CONTEXT_SIZE = 200_000
 
 
+# Known model vision capabilities (mirrors baal_core.models + Aleph catalog).
+_MODEL_VISION: dict[str, bool] = {
+    "qwen3-coder-next": True,
+    "glm-4.7": True,
+    "hermes-3-8b-tee": False,
+    "claw-flash": True,
+    "claw-core": True,
+    "deep-claw": True,
+    "claw-large": False,
+}
+
+
+def model_supports_vision(model: str) -> bool:
+    """Return whether the given model id supports vision inputs."""
+    return _MODEL_VISION.get(model, True)
+
+
 def get_context_limit(model: str, configured_max: int) -> int:
     """Return the context token limit for the given model."""
     if configured_max > 0:

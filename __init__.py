@@ -1,4 +1,5 @@
 # Bump this when agent code changes in ways that require redeployment.
-# Bumped to 6: cap images sent to inference (keep most recent N, drop older)
-# so vision requests don't fail when more than a handful of images accumulate.
-AGENT_VERSION = 6
+# Bumped to 7: per-model vision capability — non-vision models (claw-large)
+# report "vision_delegated" and auto-describe images via claw-flash, with a
+# vision_query tool for follow-up questions about stashed images.
+AGENT_VERSION = 7

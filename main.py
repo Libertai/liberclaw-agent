@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, field_validator
 
-from baal_agent.compaction import maybe_compact
+from baal_agent.compaction import maybe_compact, model_supports_vision
 from baal_agent.config import AgentSettings
 from baal_agent.context import (
     _scan_context_content,
@@ -74,11 +74,18 @@ def _current_tool_policy() -> ToolPolicy:
 def _capabilities() -> list[str]:
     """Capabilities advertised on /health and /info.
 
-    `vision` is always present; `browser` appears only when the browser tool is
-    actually usable (enabled + chromium installed), so old/free agents simply
-    omit it without needing an AGENT_VERSION bump.
+    `vision` is present when the configured model supports image inputs;
+    `vision_delegated` is present for non-vision models (images are
+    auto-described via claw-flash with a vision_query tool for follow-ups).
+    `browser` appears only when the browser tool is actually usable
+    (enabled + chromium installed), so old/free agents simply omit it
+    without needing an AGENT_VERSION bump.
     """
-    caps = ["vision"]
+    caps: list[str] = []
+    if model_supports_vision(settings.model):
+        caps.append("vision")
+    else:
+        caps.append("vision_delegated")
     if _tool_available("browser")[0]:
         caps.append("browser")
     return caps
@@ -287,6 +294,113 @@ def _prune_old_subagent_runs():
     ]
     for run_id in to_remove:
         del _subagent_runs[run_id]
+
+
+# ── Vision delegation ────────────────────────────────────────────────
+#
+# Non-vision models (claw-large) can't process image_url blocks. When such a
+# model receives images, claw-flash describes each one and the image block is
+# replaced with a [Image N: <summary>] text placeholder. The original blocks
+# are stashed so the vision_query tool can ask follow-up questions.
+
+_vision_image_stash: dict[str, dict] = {}
+# chat_id -> {"next_id": int, "images": [{"id": int, "blocks": list, "summary": str}]}
+
+_VISION_DELEGATION_PROMPT = (
+    "Describe this image concisely so a text-only model can reason about it. "
+    "Focus on visible text, objects, people, layout, colors, and context "
+    "relevant to a conversation. Be factual and specific."
+)
+
+
+def _clear_vision_stash(chat_id: str) -> None:
+    _vision_image_stash.pop(chat_id, None)
+
+
+async def _delegate_vision(messages: list[dict], chat_id: str) -> list[dict]:
+    """Replace image_url blocks with text descriptions for non-vision models.
+
+    Mutates ``messages`` in place. Returns a list of SSE events to emit.
+    For vision-capable models this is a no-op.
+    """
+    events: list[dict] = []
+    if model_supports_vision(settings.model):
+        return events
+
+    stash = _vision_image_stash.setdefault(chat_id, {"next_id": 1, "images": []})
+
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        new_blocks: list[dict] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                image_id = stash["next_id"]
+                stash["next_id"] += 1
+                blocks = [block]
+                try:
+                    response = await inference.chat(
+                        messages=[{"role": "user", "content": [
+                            {"type": "text", "text": _VISION_DELEGATION_PROMPT},
+                            *blocks,
+                        ]}],
+                        model=settings.vision_delegation_model,
+                    )
+                    summary = (response.content or "").strip()
+                except Exception as e:
+                    logger.warning(f"Vision delegation failed for image {image_id}: {e}")
+                    summary = "unavailable"
+                stash["images"].append({
+                    "id": image_id, "blocks": blocks, "summary": summary,
+                })
+                new_blocks.append({"type": "text", "text": f"[Image {image_id}: {summary}]"})
+                events.append({
+                    "type": "vision_delegation",
+                    "image_id": image_id,
+                    "model": settings.vision_delegation_model,
+                    "status": "ok" if summary != "unavailable" else "failed",
+                })
+            else:
+                new_blocks.append(block)
+        msg["content"] = new_blocks
+
+    return events
+
+
+async def _handle_vision_query(arguments: str | dict, chat_id: str) -> str:
+    """Handle vision_query tool — ask a follow-up question about a stashed image."""
+    if model_supports_vision(settings.model):
+        return "Error: vision_query is only available for non-vision models."
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
+    image_id = int(arguments.get("image_id", 0))
+    question = str(arguments.get("question", "")).strip()
+    if not question:
+        return "Error: question is required."
+
+    stash = _vision_image_stash.get(chat_id)
+    if not stash:
+        return "Error: no images available for this conversation."
+    entry = next((img for img in stash["images"] if img["id"] == image_id), None)
+    if not entry:
+        available = [img["id"] for img in stash["images"]]
+        return f"Error: image {image_id} not found. Available image IDs: {available}"
+
+    try:
+        response = await inference.chat(
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": question},
+                *entry["blocks"],
+            ]}],
+            model=settings.vision_delegation_model,
+        )
+        return response.content or "(no answer)"
+    except Exception as e:
+        logger.warning(f"vision_query failed for image {image_id}: {e}")
+        return f"Error: vision query failed: {e}"
 
 
 # ── Chat run registry ────────────────────────────────────────────────
@@ -513,7 +627,11 @@ async def _run_agent_turn(
     """
     iterations = max_iterations or settings.max_tool_iterations
     tool_policy = policy_override if policy_override is not None else _current_tool_policy()
-    tools = get_tool_definitions(include_spawn=not restricted, policy=tool_policy)
+    tools = get_tool_definitions(
+        include_spawn=not restricted,
+        include_vision_query=not model_supports_vision(settings.model),
+        policy=tool_policy,
+    )
     tool_names = [t["function"]["name"] for t in tools]
     tool_context = ToolExecutionContext(chat_id=chat_id, policy=tool_policy)
     pending_images: list[dict] = []
@@ -569,143 +687,151 @@ async def _run_agent_turn(
         messages = [{"role": "system", "content": system_prompt}]
         messages.append({"role": "user", "content": message})
 
-    final_text = None
-    total_tool_calls = 0
+    try:
+        await _delegate_vision(messages, chat_id)
 
-    for _iteration in range(iterations):
-        inference_messages = await _apply_pre_inference(messages)
-        assistant_msg = await inference.chat(
-            messages=inference_messages, model=settings.model, tools=tools
-        )
-        assistant_msg = await _apply_post_inference(assistant_msg)
+        final_text = None
+        total_tool_calls = 0
 
-        text_content = assistant_msg.content
-        tool_calls = assistant_msg.tool_calls
-
-        tc_for_db = None
-        if tool_calls:
-            total_tool_calls += len(tool_calls)
-            tc_for_db = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ]
-
-        if store_history:
-            await db.add_message(chat_id, "assistant", text_content, tool_calls=tc_for_db)
-
-        assistant_dict: dict = {"role": "assistant"}
-        if text_content:
-            assistant_dict["content"] = text_content
-        if tc_for_db:
-            assistant_dict["tool_calls"] = tc_for_db
-        messages.append(assistant_dict)
-
-        if text_content:
-            final_text = text_content
-
-        if not tool_calls:
-            # Auto-skill nudge (Task 1.4): if the turn used many tools,
-            # ask the agent to consider saving the procedure as a skill.
-            skill_text = await _maybe_skill_nudge(
-                total_tool_calls, messages, chat_id, store_history, tools,
+        for _iteration in range(iterations):
+            inference_messages = await _apply_pre_inference(messages)
+            assistant_msg = await inference.chat(
+                messages=inference_messages, model=settings.model, tools=tools
             )
-            if skill_text:
-                final_text = skill_text
-            return final_text
+            assistant_msg = await _apply_post_inference(assistant_msg)
 
-        # Execute tool calls concurrently
-        async def _exec_tool(tc):
-            tool_name = tc.function.name
-            arguments = tc.function.arguments
+            text_content = assistant_msg.content
+            tool_calls = assistant_msg.tool_calls
 
-            blocked = _blocked_tool_result(tool_name, tool_policy)
-            if blocked is not None:
-                return blocked
+            tc_for_db = None
+            if tool_calls:
+                total_tool_calls += len(tool_calls)
+                tc_for_db = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in tool_calls
+                ]
 
-            # Plugin pre_tool hook
-            if _plugin_manager is not None:
-                arguments = await _plugin_manager.fire_modify(
-                    "pre_tool", arguments, tool_name,
+            if store_history:
+                await db.add_message(chat_id, "assistant", text_content, tool_calls=tc_for_db)
+
+            assistant_dict: dict = {"role": "assistant"}
+            if text_content:
+                assistant_dict["content"] = text_content
+            if tc_for_db:
+                assistant_dict["tool_calls"] = tc_for_db
+            messages.append(assistant_dict)
+
+            if text_content:
+                final_text = text_content
+
+            if not tool_calls:
+                # Auto-skill nudge (Task 1.4): if the turn used many tools,
+                # ask the agent to consider saving the procedure as a skill.
+                skill_text = await _maybe_skill_nudge(
+                    total_tool_calls, messages, chat_id, store_history, tools,
                 )
+                if skill_text:
+                    final_text = skill_text
+                return final_text
+
+            # Execute tool calls concurrently
+            async def _exec_tool(tc):
+                tool_name = tc.function.name
+                arguments = tc.function.arguments
+
                 blocked = _blocked_tool_result(tool_name, tool_policy)
                 if blocked is not None:
                     return blocked
 
-            if tool_name == "spawn" and not restricted:
-                result = await _handle_spawn(arguments, chat_id)
-            else:
-                tool_result = await execute_tool_result(
-                    tool_name, arguments,
-                    image_callback=_stash_images,
-                    context=tool_context,
-                    policy=tool_policy,
-                )
-                result = tool_result
+                # Plugin pre_tool hook
+                if _plugin_manager is not None:
+                    arguments = await _plugin_manager.fire_modify(
+                        "pre_tool", arguments, tool_name,
+                    )
+                    blocked = _blocked_tool_result(tool_name, tool_policy)
+                    if blocked is not None:
+                        return blocked
 
-            # Plugin post_tool hook
-            if _plugin_manager is not None:
-                result = await _plugin_manager.fire_modify(
-                    "post_tool", result, tool_name,
-                )
+                if tool_name == "spawn" and not restricted:
+                    result = await _handle_spawn(arguments, chat_id)
+                elif tool_name == "vision_query":
+                    result = await _handle_vision_query(arguments, chat_id)
+                else:
+                    tool_result = await execute_tool_result(
+                        tool_name, arguments,
+                        image_callback=_stash_images,
+                        context=tool_context,
+                        policy=tool_policy,
+                    )
+                    result = tool_result
 
-            return result
+                # Plugin post_tool hook
+                if _plugin_manager is not None:
+                    result = await _plugin_manager.fire_modify(
+                        "post_tool", result, tool_name,
+                    )
 
-        results = await run_tool_calls_ordered(tool_calls, _exec_tool)
+                return result
 
-        for tc, result in zip(tool_calls, results):
-            if isinstance(result, BaseException):
-                result = f"Error executing {tc.function.name}: {result}"
-                tool_metadata_payload = None
-            elif isinstance(result, ToolResult):
-                await _record_skill_loaded(chat_id, result)
-                tool_metadata_payload = {
-                    "name": result.name,
-                    "is_error": result.is_error,
-                    "duration_ms": result.duration_ms,
-                    "truncated": result.truncated,
-                    "metadata": result.metadata,
-                    "artifacts": result.artifacts,
-                }
-                result = result.content
-            else:
-                tool_metadata_payload = None
+            results = await run_tool_calls_ordered(tool_calls, _exec_tool)
 
-            # Detect send_file markers and accumulate for callers
-            if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
-                parts = result.split(":", 2)
-                rel_path = parts[1] if len(parts) > 1 else ""
-                caption = parts[2] if len(parts) > 2 else ""
-                if file_events is not None:
-                    file_events.append({"path": rel_path, "caption": caption})
-                result = f"File sent to user: {rel_path}"
+            for tc, result in zip(tool_calls, results):
+                if isinstance(result, BaseException):
+                    result = f"Error executing {tc.function.name}: {result}"
+                    tool_metadata_payload = None
+                elif isinstance(result, ToolResult):
+                    await _record_skill_loaded(chat_id, result)
+                    tool_metadata_payload = {
+                        "name": result.name,
+                        "is_error": result.is_error,
+                        "duration_ms": result.duration_ms,
+                        "truncated": result.truncated,
+                        "metadata": result.metadata,
+                        "artifacts": result.artifacts,
+                    }
+                    result = result.content
+                else:
+                    tool_metadata_payload = None
 
-            if store_history:
-                await db.add_message(
-                    chat_id,
-                    "tool",
-                    result,
-                    tool_call_id=tc.id,
-                    metadata=tool_metadata_payload,
-                )
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
+                # Detect send_file markers and accumulate for callers
+                if isinstance(result, str) and result.startswith("__SEND_FILE__:"):
+                    parts = result.split(":", 2)
+                    rel_path = parts[1] if len(parts) > 1 else ""
+                    caption = parts[2] if len(parts) > 2 else ""
+                    if file_events is not None:
+                        file_events.append({"path": rel_path, "caption": caption})
+                    result = f"File sent to user: {rel_path}"
 
-        # Inject any images collected from tool results as a user message
-        if pending_images:
-            messages.append({"role": "user", "content": list(pending_images)})
-            pending_images.clear()
+                if store_history:
+                    await db.add_message(
+                        chat_id,
+                        "tool",
+                        result,
+                        tool_call_id=tc.id,
+                        metadata=tool_metadata_payload,
+                    )
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
 
-    return final_text
+            # Inject any images collected from tool results as a user message
+            if pending_images:
+                messages.append({"role": "user", "content": list(pending_images)})
+                pending_images.clear()
+                await _delegate_vision(messages, chat_id)
+
+        return final_text
+    finally:
+        _clear_vision_stash(chat_id)
 
 
 # ── Auto-skill nudge ─────────────────────────────────────────────────
@@ -837,7 +963,9 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         # not the full schema — otherwise the prompt would advertise tools
         # the dispatcher will then refuse.
         tools = get_tool_definitions(
-            include_spawn=False, policy=effective_policy
+            include_spawn=False,
+            include_vision_query=not model_supports_vision(settings.model),
+            policy=effective_policy,
         )
         tool_names = [t["function"]["name"] for t in tools]
         subagent_prompt = build_subagent_prompt(
@@ -1128,7 +1256,11 @@ async def _run_chat_background(
             await _plugin_manager.fire("on_session_start", chat_id)
 
         tool_policy = _current_tool_policy()
-        tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
+        tools = get_tool_definitions(
+            include_spawn=True,
+            include_vision_query=not model_supports_vision(settings.model),
+            policy=tool_policy,
+        )
         tool_names = [t["function"]["name"] for t in tools]
         tool_context = ToolExecutionContext(chat_id=chat_id, policy=tool_policy)
         pending_images: list[dict] = []
@@ -1192,6 +1324,10 @@ async def _run_chat_background(
             db, inference, chat_id, system_prompt, settings.model, settings,
             dynamic_context=dynamic_context,
         )
+
+        # Delegate image description to claw-flash for non-vision models
+        for ev in await _delegate_vision(messages, chat_id):
+            await _emit(run, ev)
 
         inference_timeout = settings.inference_timeout
         total_tool_calls = 0
@@ -1308,6 +1444,8 @@ async def _run_chat_background(
 
                 if tool_name == "spawn":
                     result = await _handle_spawn(arguments, chat_id)
+                elif tool_name == "vision_query":
+                    result = await _handle_vision_query(arguments, chat_id)
                 else:
                     tool_result = await execute_tool_result(
                         tool_name, arguments,
@@ -1377,6 +1515,8 @@ async def _run_chat_background(
             if pending_images:
                 messages.append({"role": "user", "content": list(pending_images)})
                 pending_images.clear()
+                for ev in await _delegate_vision(messages, chat_id):
+                    await _emit(run, ev)
 
         await _emit(run, {"type": "text", "content": "(Reached maximum tool iterations)"})
 
@@ -1399,6 +1539,7 @@ async def _run_chat_background(
                 await _plugin_manager.fire("on_session_end", chat_id)
             except Exception:
                 pass  # never let plugin errors block cleanup
+        _clear_vision_stash(chat_id)
         if mode == "coding":
             await _append_terminal_event(
                 run,
@@ -1861,7 +2002,11 @@ async def info():
     from baal_agent import AGENT_VERSION
 
     tool_policy = _current_tool_policy()
-    tools = get_tool_definitions(include_spawn=True, policy=tool_policy)
+    tools = get_tool_definitions(
+        include_spawn=True,
+        include_vision_query=not model_supports_vision(settings.model),
+        policy=tool_policy,
+    )
     mcp_health = get_mcp_health()
     return {
         "agent_name": settings.agent_name,

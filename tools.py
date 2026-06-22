@@ -157,6 +157,7 @@ _READ_ONLY_TOOLS: frozenset[str] = frozenset({
     "grep",
     "search_history",
     "search_memory",
+    "vision_query",
 })
 
 _SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
@@ -1219,6 +1220,38 @@ SPAWN_TOOL_DEF = {
                 },
             },
             "required": ["task"],
+        },
+    },
+}
+
+
+# Vision query tool — added dynamically in main.py (only for non-vision models).
+# Lets the text-only model ask follow-up questions about images that were
+# auto-described by the vision delegation step.
+VISION_QUERY_TOOL_DEF = {
+    "type": "function",
+    "function": {
+        "name": "vision_query",
+        "description": (
+            "Ask a question about a previously-described image to the vision "
+            "model. Use when you need detail beyond the auto-generated "
+            "description (e.g. read small text, check a specific region, "
+            "identify colors). The image_id comes from the [Image N: ...] "
+            "placeholder in the conversation."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_id": {
+                    "type": "integer",
+                    "description": "The image ID from the [Image N: ...] placeholder.",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask about the image.",
+                },
+            },
+            "required": ["image_id", "question"],
         },
     },
 }
@@ -3309,6 +3342,7 @@ def _policy_allows_tool(policy: ToolPolicy | None, name: str) -> bool:
 def get_tool_definitions(
     *,
     include_spawn: bool = True,
+    include_vision_query: bool = False,
     policy: ToolPolicy | None = None,
 ) -> list[dict]:
     """Return tool definitions, optionally including spawn and MCP tools."""
@@ -3319,6 +3353,8 @@ def get_tool_definitions(
     ]
     if include_spawn and _policy_allows_tool(policy, "spawn"):
         defs.append(SPAWN_TOOL_DEF)
+    if include_vision_query and _policy_allows_tool(policy, "vision_query"):
+        defs.append(VISION_QUERY_TOOL_DEF)
     if _mcp_client is not None:
         defs.extend(
             tool for tool in _mcp_client.get_tool_definitions()
