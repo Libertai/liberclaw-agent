@@ -17,7 +17,12 @@ from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 from pydantic import BaseModel, field_validator
 
 from baal_agent.compaction import maybe_compact, model_supports_vision
@@ -34,7 +39,11 @@ from baal_agent.context import (
 from baal_agent.database import AgentDatabase
 from baal_agent.image_utils import cap_images_in_messages
 from baal_agent.inference import InferenceClient
-from baal_agent.security import MAX_SEND_FILE_SIZE, PathSecurityError, validate_workspace_path
+from baal_agent.security import (
+    MAX_SEND_FILE_SIZE,
+    PathSecurityError,
+    validate_workspace_path,
+)
 from baal_agent.telegram_bot import TelegramBot
 from baal_agent.plugins import PluginManager
 from baal_agent.scheduler import CronScheduler
@@ -115,11 +124,15 @@ async def _emit_guardrail_blocked(run: "ChatRun", result: ToolResult) -> None:
     }
     await _emit(run, {"type": "guardrail_blocked", **payload})
     try:
-        await db.add_event(run.chat_id, "guardrail.blocked", {
-            "type": "guardrail.blocked",
-            **payload,
-            "timestamp_ms": int(time.time() * 1000),
-        })
+        await db.add_event(
+            run.chat_id,
+            "guardrail.blocked",
+            {
+                "type": "guardrail.blocked",
+                **payload,
+                "timestamp_ms": int(time.time() * 1000),
+            },
+        )
     except Exception:
         logger.debug("Failed to persist canonical guardrail event", exc_info=True)
 
@@ -148,9 +161,7 @@ async def _load_typed_memory_context(
     limit: int = 8, *, chat_id: str | None = None
 ) -> str:
     try:
-        records = await db.search_memory_records(
-            "", limit=limit, chat_id=chat_id
-        )
+        records = await db.search_memory_records("", limit=limit, chat_id=chat_id)
     except Exception:
         logger.debug("Failed to load typed memory records", exc_info=True)
         return ""
@@ -229,6 +240,7 @@ async def _record_skill_loaded(chat_id: str, result: ToolResult) -> None:
         except Exception:
             logger.debug("Failed to record skill load", exc_info=True)
 
+
 settings = AgentSettings()
 db = AgentDatabase(db_path=settings.db_path)
 inference = InferenceClient(api_key=settings.libertai_api_key)
@@ -289,7 +301,8 @@ def _prune_old_subagent_runs():
     """Remove completed subagent runs older than _SUBAGENT_RETENTION."""
     cutoff = time.time() - _SUBAGENT_RETENTION
     to_remove = [
-        run_id for run_id, run in _subagent_runs.items()
+        run_id
+        for run_id, run in _subagent_runs.items()
         if run.status != "running" and run.completed_at and run.completed_at < cutoff
     ]
     for run_id in to_remove:
@@ -343,26 +356,41 @@ async def _delegate_vision(messages: list[dict], chat_id: str) -> list[dict]:
                 blocks = [block]
                 try:
                     response = await inference.chat(
-                        messages=[{"role": "user", "content": [
-                            {"type": "text", "text": _VISION_DELEGATION_PROMPT},
-                            *blocks,
-                        ]}],
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": _VISION_DELEGATION_PROMPT},
+                                    *blocks,
+                                ],
+                            }
+                        ],
                         model=settings.vision_delegation_model,
                     )
                     summary = (response.content or "").strip()
                 except Exception as e:
-                    logger.warning(f"Vision delegation failed for image {image_id}: {e}")
+                    logger.warning(
+                        f"Vision delegation failed for image {image_id}: {e}"
+                    )
                     summary = "unavailable"
-                stash["images"].append({
-                    "id": image_id, "blocks": blocks, "summary": summary,
-                })
-                new_blocks.append({"type": "text", "text": f"[Image {image_id}: {summary}]"})
-                events.append({
-                    "type": "vision_delegation",
-                    "image_id": image_id,
-                    "model": settings.vision_delegation_model,
-                    "status": "ok" if summary != "unavailable" else "failed",
-                })
+                stash["images"].append(
+                    {
+                        "id": image_id,
+                        "blocks": blocks,
+                        "summary": summary,
+                    }
+                )
+                new_blocks.append(
+                    {"type": "text", "text": f"[Image {image_id}: {summary}]"}
+                )
+                events.append(
+                    {
+                        "type": "vision_delegation",
+                        "image_id": image_id,
+                        "model": settings.vision_delegation_model,
+                        "status": "ok" if summary != "unavailable" else "failed",
+                    }
+                )
             else:
                 new_blocks.append(block)
         msg["content"] = new_blocks
@@ -391,10 +419,15 @@ async def _handle_vision_query(arguments: str | dict, chat_id: str) -> str:
 
     try:
         response = await inference.chat(
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": question},
-                *entry["blocks"],
-            ]}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": question},
+                        *entry["blocks"],
+                    ],
+                }
+            ],
             model=settings.vision_delegation_model,
         )
         return response.content or "(no answer)"
@@ -428,7 +461,8 @@ def _prune_old_chat_runs():
     """Remove completed chat runs older than _RUN_RETENTION."""
     cutoff = time.time() - _RUN_RETENTION
     to_remove = [
-        chat_id for chat_id, run in _active_runs.items()
+        chat_id
+        for chat_id, run in _active_runs.items()
         if run.done and run.completed_at is not None and run.completed_at < cutoff
     ]
     for chat_id in to_remove:
@@ -436,6 +470,7 @@ def _prune_old_chat_runs():
 
 
 # ── Telegram callback ────────────────────────────────────────────────
+
 
 async def _telegram_agent_turn(
     message: str | list[dict], chat_id: str
@@ -457,7 +492,8 @@ async def _telegram_agent_turn(
 
     async def _do_turn():
         return await _run_agent_turn(
-            message, chat_id,
+            message,
+            chat_id,
             channel_hint=TELEGRAM_CHANNEL_HINT,
             platform="telegram",
             file_events=file_events,
@@ -476,6 +512,7 @@ async def _telegram_agent_turn(
 
 # ── Lifespan ──────────────────────────────────────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler, _plugin_manager, _telegram_bot, _telegram_bot_task
@@ -486,7 +523,9 @@ async def lifespan(app: FastAPI):
             f"Pruned {pruned} runtime_events older than "
             f"{settings.runtime_event_retention_days} days"
         )
-    configure_tools(settings.workspace_path, db=db, inference=inference, model=settings.model)
+    configure_tools(
+        settings.workspace_path, db=db, inference=inference, model=settings.model
+    )
     await start_shell()
     await start_code_executor()
     await start_mcp(settings.mcp_servers)
@@ -580,7 +619,9 @@ async def verify_auth(request: Request, call_next):
 # ── CORS (registered last so it wraps auth as the outermost layer) ─────
 
 if settings.local_ui_enabled:
-    _cors_origins = [o.strip() for o in settings.local_ui_cors_origins.split(",") if o.strip()]
+    _cors_origins = [
+        o.strip() for o in settings.local_ui_cors_origins.split(",") if o.strip()
+    ]
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_cors_origins or ["*"],
@@ -592,6 +633,7 @@ if settings.local_ui_enabled:
 
 
 # ── Core agentic loop ─────────────────────────────────────────────────
+
 
 async def _run_agent_turn(
     message: str | list[dict],
@@ -626,7 +668,9 @@ async def _run_agent_turn(
         The final text response, or None if no text was generated.
     """
     iterations = max_iterations or settings.max_tool_iterations
-    tool_policy = policy_override if policy_override is not None else _current_tool_policy()
+    tool_policy = (
+        policy_override if policy_override is not None else _current_tool_policy()
+    )
     tools = get_tool_definitions(
         include_spawn=not restricted,
         include_vision_query=not model_supports_vision(settings.model),
@@ -660,13 +704,24 @@ async def _run_agent_turn(
         if typed_memory:
             dynamic_context = _append_context_block(dynamic_context, typed_memory)
         if mode == "coding":
-            dynamic_context = _append_context_block(dynamic_context, _coding_task_context())
+            dynamic_context = _append_context_block(
+                dynamic_context, _coding_task_context()
+            )
         if channel_hint:
-            dynamic_context = (dynamic_context + "\n\n" + channel_hint) if dynamic_context else channel_hint
+            dynamic_context = (
+                (dynamic_context + "\n\n" + channel_hint)
+                if dynamic_context
+                else channel_hint
+            )
         await db.add_message(chat_id, "user", message)
         await _record_skill_considered(chat_id, tool_names, platform)
         messages = await maybe_compact(
-            db, inference, chat_id, static_prompt, settings.model, settings,
+            db,
+            inference,
+            chat_id,
+            static_prompt,
+            settings.model,
+            settings,
             dynamic_context=dynamic_context,
         )
     else:
@@ -719,7 +774,9 @@ async def _run_agent_turn(
                 ]
 
             if store_history:
-                await db.add_message(chat_id, "assistant", text_content, tool_calls=tc_for_db)
+                await db.add_message(
+                    chat_id, "assistant", text_content, tool_calls=tc_for_db
+                )
 
             assistant_dict: dict = {"role": "assistant"}
             if text_content:
@@ -735,7 +792,11 @@ async def _run_agent_turn(
                 # Auto-skill nudge (Task 1.4): if the turn used many tools,
                 # ask the agent to consider saving the procedure as a skill.
                 skill_text = await _maybe_skill_nudge(
-                    total_tool_calls, messages, chat_id, store_history, tools,
+                    total_tool_calls,
+                    messages,
+                    chat_id,
+                    store_history,
+                    tools,
                 )
                 if skill_text:
                     final_text = skill_text
@@ -753,7 +814,9 @@ async def _run_agent_turn(
                 # Plugin pre_tool hook
                 if _plugin_manager is not None:
                     arguments = await _plugin_manager.fire_modify(
-                        "pre_tool", arguments, tool_name,
+                        "pre_tool",
+                        arguments,
+                        tool_name,
                     )
                     blocked = _blocked_tool_result(tool_name, tool_policy)
                     if blocked is not None:
@@ -765,7 +828,8 @@ async def _run_agent_turn(
                     result = await _handle_vision_query(arguments, chat_id)
                 else:
                     tool_result = await execute_tool_result(
-                        tool_name, arguments,
+                        tool_name,
+                        arguments,
                         image_callback=_stash_images,
                         context=tool_context,
                         policy=tool_policy,
@@ -775,7 +839,9 @@ async def _run_agent_turn(
                 # Plugin post_tool hook
                 if _plugin_manager is not None:
                     result = await _plugin_manager.fire_modify(
-                        "post_tool", result, tool_name,
+                        "post_tool",
+                        result,
+                        tool_name,
                     )
 
                 return result
@@ -817,11 +883,13 @@ async def _run_agent_turn(
                         tool_call_id=tc.id,
                         metadata=tool_metadata_payload,
                     )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    }
+                )
 
             # Inject any images collected from tool results as a user message
             if pending_images:
@@ -835,6 +903,7 @@ async def _run_agent_turn(
 
 
 # ── Auto-skill nudge ─────────────────────────────────────────────────
+
 
 async def _maybe_skill_nudge(
     total_tool_calls: int,
@@ -865,11 +934,15 @@ async def _maybe_skill_nudge(
         )
 
         text = response.content
-        await db.add_event(chat_id, "skill.draft.proposed", {
-            "type": "skill.draft.proposed",
-            "tool_calls": total_tool_calls,
-            "proposal": text or "",
-        })
+        await db.add_event(
+            chat_id,
+            "skill.draft.proposed",
+            {
+                "type": "skill.draft.proposed",
+                "tool_calls": total_tool_calls,
+                "proposal": text or "",
+            },
+        )
         if store_history:
             await db.add_message(chat_id, "assistant", text)
         return text
@@ -880,6 +953,7 @@ async def _maybe_skill_nudge(
 
 # ── Spawn / subagent ──────────────────────────────────────────────────
 
+
 async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     """Handle the spawn tool call — start a background subagent."""
     if isinstance(arguments, str):
@@ -889,13 +963,16 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     label = arguments.get("label", task[:50])
     persona = arguments.get("persona")
     role = normalize_subagent_role(arguments.get("role"))
-    timeout = min(int(arguments.get("timeout", DEFAULT_SUBAGENT_TIMEOUT)), MAX_SUBAGENT_TIMEOUT)
+    timeout = min(
+        int(arguments.get("timeout", DEFAULT_SUBAGENT_TIMEOUT)), MAX_SUBAGENT_TIMEOUT
+    )
 
     _prune_old_subagent_runs()
 
     # Check concurrency limit for this chat
     active = sum(
-        1 for r in _subagent_runs.values()
+        1
+        for r in _subagent_runs.values()
         if r.chat_id == origin_chat_id and r.status == "running"
     )
     if active >= MAX_CONCURRENT_SUBAGENTS:
@@ -917,14 +994,16 @@ async def _handle_spawn(arguments: str | dict, origin_chat_id: str) -> str:
     # Emit spawned event
     await db.add_pending(
         origin_chat_id,
-        json.dumps({
-            "type": "subagent_spawned",
-            "run_id": run_id,
-            "label": label,
-            "subagent_role": role,
-            "role": role,
-            "status": "running",
-        }),
+        json.dumps(
+            {
+                "type": "subagent_spawned",
+                "run_id": run_id,
+                "label": label,
+                "subagent_role": role,
+                "role": role,
+                "status": "running",
+            }
+        ),
         source="subagent_event",
     )
 
@@ -955,6 +1034,7 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
             intersect_policies,
             subagent_role_policy,
         )
+
         global_policy = _current_tool_policy()
         role_policy = subagent_role_policy(run.role)
         effective_policy = intersect_policies(global_policy, role_policy)
@@ -1003,29 +1083,39 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         # Emit completed event
         await db.add_pending(
             origin_chat_id,
-            json.dumps({
-                "type": "subagent_completed",
-                "run_id": run.id,
-                "label": run.label,
-                "subagent_role": run.role,
-                "role": run.role,
-                "status": "completed",
-            }),
+            json.dumps(
+                {
+                    "type": "subagent_completed",
+                    "run_id": run.id,
+                    "label": run.label,
+                    "subagent_role": run.role,
+                    "role": run.role,
+                    "status": "completed",
+                }
+            ),
             source="subagent_event",
         )
         # Forward file events (pending for web UI + direct Telegram delivery
         # only when the originating chat is itself Telegram — otherwise we'd
         # leak web-UI subagent files to the agent owner's Telegram).
-        tg_target = origin_chat_id.removeprefix("tg:") if origin_chat_id.startswith("tg:") else ""
+        tg_target = (
+            origin_chat_id.removeprefix("tg:")
+            if origin_chat_id.startswith("tg:")
+            else ""
+        )
         for fe in files:
             await db.add_pending(
                 origin_chat_id,
-                json.dumps({"type": "file", "path": fe["path"], "caption": fe["caption"]}),
+                json.dumps(
+                    {"type": "file", "path": fe["path"], "caption": fe["caption"]}
+                ),
                 source="subagent_file",
             )
             if tg_target:
                 await _send_file_via_telegram(
-                    fe["path"], fe.get("caption", ""), chat_id=tg_target,
+                    fe["path"],
+                    fe.get("caption", ""),
+                    chat_id=tg_target,
                 )
 
     except asyncio.TimeoutError:
@@ -1035,15 +1125,17 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         logger.warning(f"Subagent {run.id} ({run.label}) timed out after {timeout}s")
         await db.add_pending(
             origin_chat_id,
-            json.dumps({
-                "type": "subagent_failed",
-                "run_id": run.id,
-                "label": run.label,
-                "subagent_role": run.role,
-                "role": run.role,
-                "status": "timeout",
-                "error": run.error,
-            }),
+            json.dumps(
+                {
+                    "type": "subagent_failed",
+                    "run_id": run.id,
+                    "label": run.label,
+                    "subagent_role": run.role,
+                    "role": run.role,
+                    "status": "timeout",
+                    "error": run.error,
+                }
+            ),
             source="subagent_event",
         )
 
@@ -1054,20 +1146,23 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
         logger.error(f"Subagent {run.id} ({run.label}) failed: {e}")
         await db.add_pending(
             origin_chat_id,
-            json.dumps({
-                "type": "subagent_failed",
-                "run_id": run.id,
-                "label": run.label,
-                "subagent_role": run.role,
-                "role": run.role,
-                "status": "failed",
-                "error": str(e),
-            }),
+            json.dumps(
+                {
+                    "type": "subagent_failed",
+                    "run_id": run.id,
+                    "label": run.label,
+                    "subagent_role": run.role,
+                    "role": run.role,
+                    "status": "failed",
+                    "error": str(e),
+                }
+            ),
             source="subagent_event",
         )
 
 
 # ── Cron job callback ────────────────────────────────────────────────
+
 
 async def _run_cron_job(task: str, job_id: str):
     """Callback invoked by the CronScheduler for each due job."""
@@ -1111,7 +1206,13 @@ async def _record_scheduler_event(event_type: str, payload: dict) -> None:
 # ── SSE helpers ───────────────────────────────────────────────────────
 
 # Retryable inference errors (transient / server-side)
-_RETRYABLE_ERRORS = (asyncio.TimeoutError, APIConnectionError, APITimeoutError, InternalServerError, RateLimitError)
+_RETRYABLE_ERRORS = (
+    asyncio.TimeoutError,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 # Loop-level retries on top of inference.py's own HTTP-level retries
 _LOOP_INFERENCE_RETRIES = 2
@@ -1121,6 +1222,7 @@ _LOOP_RETRY_DELAY = 5  # seconds between loop-level retries
 def _is_retryable(e: Exception) -> bool:
     """Check if an inference error is worth retrying at the loop level."""
     return isinstance(e, _RETRYABLE_ERRORS)
+
 
 # Interval for SSE keepalive events during long-running operations.
 # Sent as real data events (not SSE comments) so that reverse proxies
@@ -1138,6 +1240,7 @@ def _sse_keepalive() -> str:
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────
+
 
 class ChatRequest(BaseModel):
     message: str | list[dict]
@@ -1203,12 +1306,10 @@ def _coding_task_chat_id(task_id: str) -> str:
 
 
 def _build_coding_task_message(req: CodingTaskRequest) -> str:
-    context = f"\n\nAdditional context:\n{req.context.strip()}" if req.context.strip() else ""
-    return (
-        f"Coding task mode: {req.mode}\n\n"
-        f"Task:\n{req.task.strip()}"
-        f"{context}"
+    context = (
+        f"\n\nAdditional context:\n{req.context.strip()}" if req.context.strip() else ""
     )
+    return f"Coding task mode: {req.mode}\n\nTask:\n{req.task.strip()}{context}"
 
 
 async def _emit(run: ChatRun, data: dict):
@@ -1274,27 +1375,33 @@ async def _run_chat_background(
                 "checkpoint",
                 {"action": "create", "message": f"pre-coding-task {chat_id}"},
             )
-            await _emit(run, {
-                "type": "coding_task.checkpoint",
-                "status": "failed" if checkpoint.is_error else "ok",
-                "content": checkpoint.content,
-            })
+            await _emit(
+                run,
+                {
+                    "type": "coding_task.checkpoint",
+                    "status": "failed" if checkpoint.is_error else "ok",
+                    "content": checkpoint.content,
+                },
+            )
             # The whole point of coding mode is the pre-mutation rollback
             # point. If we couldn't create it (no git, restricted policy,
             # disk issue, etc.), running the loop blind would mutate files
             # with no safety net. Bail out and tell the caller; they can
             # retry without coding mode or fix the underlying issue.
             if checkpoint.is_error:
-                await _emit(run, {
-                    "type": "error",
-                    "content": (
-                        "Coding-task aborted: could not create pre-mutation "
-                        "checkpoint. Fix the checkpoint setup (git installed, "
-                        "checkpoint tool not blocked by policy) or retry "
-                        "without coding mode. Details: "
-                        f"{checkpoint.content}"
-                    ),
-                })
+                await _emit(
+                    run,
+                    {
+                        "type": "error",
+                        "content": (
+                            "Coding-task aborted: could not create pre-mutation "
+                            "checkpoint. Fix the checkpoint setup (git installed, "
+                            "checkpoint tool not blocked by policy) or retry "
+                            "without coding mode. Details: "
+                            f"{checkpoint.content}"
+                        ),
+                    },
+                )
                 await _emit(run, {"type": "done"})
                 return
 
@@ -1316,12 +1423,19 @@ async def _run_chat_background(
         if typed_memory:
             dynamic_context = _append_context_block(dynamic_context, typed_memory)
         if mode == "coding":
-            dynamic_context = _append_context_block(dynamic_context, _coding_task_context())
+            dynamic_context = _append_context_block(
+                dynamic_context, _coding_task_context()
+            )
 
         await db.add_message(chat_id, "user", message)
         await _record_skill_considered(chat_id, tool_names, "api")
         messages = await maybe_compact(
-            db, inference, chat_id, system_prompt, settings.model, settings,
+            db,
+            inference,
+            chat_id,
+            system_prompt,
+            settings.model,
+            settings,
             dynamic_context=dynamic_context,
         )
 
@@ -1342,7 +1456,9 @@ async def _run_chat_background(
                     inference_messages = await _apply_pre_inference(messages)
                     assistant_msg = await asyncio.wait_for(
                         inference.chat(
-                            messages=inference_messages, model=settings.model, tools=tools
+                            messages=inference_messages,
+                            model=settings.model,
+                            tools=tools,
                         ),
                         timeout=inference_timeout,
                     )
@@ -1355,17 +1471,24 @@ async def _run_chat_background(
                             f"Inference attempt {_inf_attempt + 1} failed "
                             f"({type(e).__name__}), retrying in {_LOOP_RETRY_DELAY}s"
                         )
-                        await _emit(run, {
-                            "type": "text",
-                            "content": "\n\n*[Inference error, retrying...]*\n\n",
-                        })
+                        await _emit(
+                            run,
+                            {
+                                "type": "text",
+                                "content": "\n\n*[Inference error, retrying...]*\n\n",
+                            },
+                        )
                         await asyncio.sleep(_LOOP_RETRY_DELAY)
                         continue
                     else:
                         break  # non-retryable or exhausted retries
 
             if assistant_msg is None:
-                err_name = type(last_inference_error).__name__ if last_inference_error else "Unknown"
+                err_name = (
+                    type(last_inference_error).__name__
+                    if last_inference_error
+                    else "Unknown"
+                )
                 if isinstance(last_inference_error, asyncio.TimeoutError):
                     msg = "The AI model took too long to respond. Please try again."
                 else:
@@ -1409,8 +1532,11 @@ async def _run_chat_background(
             if not tool_calls:
                 # Auto-skill nudge for SSE path
                 skill_text = await _maybe_skill_nudge(
-                    total_tool_calls, messages, chat_id,
-                    store_history=True, tools=tools,
+                    total_tool_calls,
+                    messages,
+                    chat_id,
+                    store_history=True,
+                    tools=tools,
                 )
                 if skill_text:
                     await _emit(run, {"type": "text", "content": skill_text})
@@ -1418,7 +1544,14 @@ async def _run_chat_background(
 
             # Emit tool_use SSE events for all tools before execution
             for tc in tool_calls:
-                await _emit(run, {"type": "tool_use", "name": tc.function.name, "input": tc.function.arguments})
+                await _emit(
+                    run,
+                    {
+                        "type": "tool_use",
+                        "name": tc.function.name,
+                        "input": tc.function.arguments,
+                    },
+                )
 
             # Execute tool calls concurrently
             async def _exec_tool_sse(tc):
@@ -1434,7 +1567,9 @@ async def _run_chat_background(
                 # Plugin pre_tool hook: may modify arguments
                 if _plugin_manager is not None:
                     arguments = await _plugin_manager.fire_modify(
-                        "pre_tool", arguments, tool_name,
+                        "pre_tool",
+                        arguments,
+                        tool_name,
                     )
                     blocked = _blocked_tool_result(tool_name, tool_policy)
                     if blocked is not None:
@@ -1448,7 +1583,8 @@ async def _run_chat_background(
                     result = await _handle_vision_query(arguments, chat_id)
                 else:
                     tool_result = await execute_tool_result(
-                        tool_name, arguments,
+                        tool_name,
+                        arguments,
                         image_callback=_stash_images,
                         context=tool_context,
                         policy=tool_policy,
@@ -1461,7 +1597,9 @@ async def _run_chat_background(
                 # Plugin post_tool hook: may modify result
                 if _plugin_manager is not None:
                     result = await _plugin_manager.fire_modify(
-                        "post_tool", result, tool_name,
+                        "post_tool",
+                        result,
+                        tool_name,
                     )
 
                 return result
@@ -1495,7 +1633,9 @@ async def _run_chat_background(
                     parts = result.split(":", 2)
                     rel_path = parts[1] if len(parts) > 1 else ""
                     caption = parts[2] if len(parts) > 2 else ""
-                    await _emit(run, {"type": "file", "path": rel_path, "caption": caption})
+                    await _emit(
+                        run, {"type": "file", "path": rel_path, "caption": caption}
+                    )
                     result = f"File sent to user: {rel_path}"
 
                 await db.add_message(
@@ -1505,11 +1645,13 @@ async def _run_chat_background(
                     tool_call_id=tc.id,
                     metadata=tool_metadata_payload,
                 )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    }
+                )
 
             # Inject any images collected from tool results as a user message
             if pending_images:
@@ -1518,7 +1660,9 @@ async def _run_chat_background(
                 for ev in await _delegate_vision(messages, chat_id):
                     await _emit(run, ev)
 
-        await _emit(run, {"type": "text", "content": "(Reached maximum tool iterations)"})
+        await _emit(
+            run, {"type": "text", "content": "(Reached maximum tool iterations)"}
+        )
 
     except asyncio.CancelledError:
         logger.info(f"Chat run cancelled for {chat_id}")
@@ -1578,9 +1722,7 @@ async def _read_run_events(run: ChatRun):
                 if remaining <= 0:
                     break
                 try:
-                    await asyncio.wait_for(
-                        run.condition.wait(), timeout=remaining
-                    )
+                    await asyncio.wait_for(run.condition.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
                     break
 
@@ -1657,12 +1799,14 @@ async def start_coding_task(req: CodingTaskRequest):
     _active_runs[chat_id] = run
 
     async def _task_stream():
-        yield _sse_event({
-            "type": "coding_task.meta",
-            "task_id": task_id,
-            "chat_id": chat_id,
-            "mode": req.mode,
-        })
+        yield _sse_event(
+            {
+                "type": "coding_task.meta",
+                "task_id": task_id,
+                "chat_id": chat_id,
+                "mode": req.mode,
+            }
+        )
         async for event in _read_run_events(run):
             yield event
 
@@ -1683,18 +1827,22 @@ async def coding_task_stream(task_id: str):
     chat_id = _coding_task_chat_id(task_id)
     run = _active_runs.get(chat_id)
     if run is None or run.done:
+
         async def _done_stream():
             yield _sse_event({"type": "done"})
+
         return StreamingResponse(_done_stream(), media_type="text/event-stream")
 
     async def _reconnect_stream():
-        yield _sse_event({
-            "type": "stream_meta",
-            "task_id": task_id,
-            "chat_id": chat_id,
-            "mode": run.mode,
-            "user_message": run.user_message,
-        })
+        yield _sse_event(
+            {
+                "type": "stream_meta",
+                "task_id": task_id,
+                "chat_id": chat_id,
+                "mode": run.mode,
+                "user_message": run.user_message,
+            }
+        )
         async for event in _read_run_events(run):
             yield event
 
@@ -1748,15 +1896,18 @@ async def chat_stream(chat_id: str):
         # No active run — just return done so the client knows
         async def _done_stream():
             yield _sse_event({"type": "done"})
+
         return StreamingResponse(_done_stream(), media_type="text/event-stream")
 
     async def _reconnect_stream():
         # Send metadata so the frontend knows which message is being processed
-        yield _sse_event({
-            "type": "stream_meta",
-            "user_message": run.user_message,
-            "mode": run.mode,
-        })
+        yield _sse_event(
+            {
+                "type": "stream_meta",
+                "user_message": run.user_message,
+                "mode": run.mode,
+            }
+        )
         async for event in _read_run_events(run):
             yield event
 
@@ -1768,6 +1919,7 @@ def _created_at_to_ms(s: str | None) -> int | None:
     if not s:
         return None
     from datetime import datetime, timezone
+
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -1792,19 +1944,28 @@ async def get_chat_history(chat_id: str, limit: int = 50):
         ts_ms = _created_at_to_ms(msg.get("created_at"))
         ts_field = {"timestamp_ms": ts_ms} if ts_ms is not None else {}
         if role == "user":
-            events.append({"type": "text", "content": msg.get("content", ""), "name": "user", **ts_field})
+            events.append(
+                {
+                    "type": "text",
+                    "content": msg.get("content", ""),
+                    "name": "user",
+                    **ts_field,
+                }
+            )
         elif role == "assistant":
             if msg.get("content"):
                 events.append({"type": "text", "content": msg["content"], **ts_field})
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
-                    events.append({
-                        "type": "tool_use",
-                        "name": fn.get("name", ""),
-                        "input": fn.get("arguments", ""),
-                        **ts_field,
-                    })
+                    events.append(
+                        {
+                            "type": "tool_use",
+                            "name": fn.get("name", ""),
+                            "input": fn.get("arguments", ""),
+                            **ts_field,
+                        }
+                    )
         elif role == "tool":
             # Reconstruct file events from stored tool results
             content = msg.get("content", "")
@@ -1925,7 +2086,8 @@ async def direct_download(token: str):
         )
         # Sanitize filename for Content-Disposition header
         import re as _re
-        safe_name = _re.sub(r'[^\w\-. ]', '', resolved.name).strip() or "download"
+
+        safe_name = _re.sub(r"[^\w\-. ]", "", resolved.name).strip() or "download"
         return FileResponse(resolved, filename=safe_name)
     except PathSecurityError:
         return JSONResponse(status_code=403, content={"error": "access denied"})
@@ -1934,21 +2096,45 @@ async def direct_download(token: str):
 @app.get("/workspace/tree")
 async def workspace_tree(max_depth: int = 5):
     """Return recursive workspace file tree."""
-    SKIP_NAMES = {".env", ".git", "agent.db", "agent.db-shm", "agent.db-wal", "__pycache__", "node_modules"}
+    SKIP_NAMES = {
+        ".env",
+        ".git",
+        "agent.db",
+        "agent.db-shm",
+        "agent.db-wal",
+        "__pycache__",
+        "node_modules",
+    }
 
     def walk(path: Path, depth: int) -> list[dict]:
         if depth <= 0 or not path.is_dir():
             return []
         entries = []
         try:
-            for entry in sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            for entry in sorted(
+                path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())
+            ):
                 if entry.name in SKIP_NAMES:
                     continue
                 rel = str(entry.relative_to(workspace_root))
                 if entry.is_dir():
-                    entries.append({"name": entry.name, "path": rel, "type": "dir", "children": walk(entry, depth - 1)})
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "path": rel,
+                            "type": "dir",
+                            "children": walk(entry, depth - 1),
+                        }
+                    )
                 else:
-                    entries.append({"name": entry.name, "path": rel, "type": "file", "size": entry.stat().st_size})
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "path": rel,
+                            "type": "file",
+                            "size": entry.stat().st_size,
+                        }
+                    )
         except PermissionError:
             pass
         return entries
@@ -1977,7 +2163,9 @@ async def upload_file(
 
     content = await file.read()
     if len(content) > MAX_SEND_FILE_SIZE:
-        return JSONResponse(status_code=413, content={"error": "File too large (50MB max)"})
+        return JSONResponse(
+            status_code=413, content={"error": "File too large (50MB max)"}
+        )
 
     # Validate final path is within workspace
     try:
@@ -1994,7 +2182,12 @@ async def upload_file(
 async def health():
     from baal_agent import AGENT_VERSION
 
-    return {"status": "ok", "agent_name": settings.agent_name, "version": AGENT_VERSION, "capabilities": _capabilities()}
+    return {
+        "status": "ok",
+        "agent_name": settings.agent_name,
+        "version": AGENT_VERSION,
+        "capabilities": _capabilities(),
+    }
 
 
 @app.get("/info")
@@ -2048,6 +2241,7 @@ async def info():
 
 # ── Subagent management endpoints ─────────────────────────────────────
 
+
 @app.get("/subagents")
 async def list_subagents():
     """List all subagent runs, running first, then by started_at descending."""
@@ -2069,9 +2263,7 @@ async def list_subagents():
                 "completed_at": r.completed_at,
                 "result_preview": (r.result or "")[:200] if r.result else None,
                 "error": r.error,
-                "duration": (
-                    (r.completed_at or time.time()) - r.started_at
-                ),
+                "duration": ((r.completed_at or time.time()) - r.started_at),
             }
             for r in runs
         ]
@@ -2083,7 +2275,9 @@ async def get_subagent(run_id: str):
     """Get full details of a single subagent run."""
     run = _subagent_runs.get(run_id)
     if run is None:
-        return JSONResponse(status_code=404, content={"error": f"Subagent run '{run_id}' not found"})
+        return JSONResponse(
+            status_code=404, content={"error": f"Subagent run '{run_id}' not found"}
+        )
     return {
         "id": run.id,
         "label": run.label,
@@ -2105,9 +2299,16 @@ async def stop_subagent(run_id: str):
     """Cancel a running subagent."""
     run = _subagent_runs.get(run_id)
     if run is None:
-        return JSONResponse(status_code=404, content={"error": f"Subagent run '{run_id}' not found"})
+        return JSONResponse(
+            status_code=404, content={"error": f"Subagent run '{run_id}' not found"}
+        )
     if run.status != "running":
-        return JSONResponse(status_code=400, content={"error": f"Subagent '{run_id}' is not running (status: {run.status})"})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Subagent '{run_id}' is not running (status: {run.status})"
+            },
+        )
 
     # Cancel the asyncio task
     if run.asyncio_task and not run.asyncio_task.done():
@@ -2120,19 +2321,25 @@ async def stop_subagent(run_id: str):
     # Emit failed event
     await db.add_pending(
         run.chat_id,
-        json.dumps({
-            "type": "subagent_failed",
-            "run_id": run.id,
-            "label": run.label,
-            "subagent_role": run.role,
-            "role": run.role,
-            "status": "failed",
-            "error": run.error,
-        }),
+        json.dumps(
+            {
+                "type": "subagent_failed",
+                "run_id": run.id,
+                "label": run.label,
+                "subagent_role": run.role,
+                "role": run.role,
+                "status": "failed",
+                "error": run.error,
+            }
+        ),
         source="subagent_event",
     )
 
-    return {"status": "ok", "run_id": run_id, "message": f"Subagent '{run.label}' cancelled"}
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "message": f"Subagent '{run.label}' cancelled",
+    }
 
 
 # ── Telegram management endpoints ────────────────────────────────────
@@ -2167,7 +2374,9 @@ async def update_telegram_contact(telegram_id: str, body: TelegramContactUpdate)
     if body.status not in ("allowed", "pending", "blocked"):
         return JSONResponse(
             status_code=400,
-            content={"error": f"Invalid status: {body.status}. Must be allowed, pending, or blocked."},
+            content={
+                "error": f"Invalid status: {body.status}. Must be allowed, pending, or blocked."
+            },
         )
     updated = await db.update_telegram_contact_status(telegram_id, body.status)
     if not updated:

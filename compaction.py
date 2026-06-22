@@ -128,7 +128,10 @@ MEMORY_FLUSH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path relative to workspace."},
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -142,7 +145,10 @@ MEMORY_FLUSH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path relative to workspace."},
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace.",
+                    },
                     "content": {"type": "string", "description": "Content to write."},
                 },
                 "required": ["path", "content"],
@@ -157,9 +163,15 @@ MEMORY_FLUSH_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path relative to workspace."},
+                    "path": {
+                        "type": "string",
+                        "description": "File path relative to workspace.",
+                    },
                     "old_string": {"type": "string", "description": "Text to find."},
-                    "new_string": {"type": "string", "description": "Text to replace with."},
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to replace with.",
+                    },
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -216,11 +228,13 @@ async def _memory_flush(
 
             for tc in tool_calls:
                 result = await execute_tool(tc.function.name, tc.function.arguments)
-                flush_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result,
-                })
+                flush_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    }
+                )
 
         logger.info("Pre-compaction memory flush completed")
     except Exception as e:
@@ -262,9 +276,9 @@ def _load_active_todo_context(workspace_path: str) -> str:
         return ""
 
     active = [
-        task for task in data
-        if isinstance(task, dict)
-        and task.get("status") in {"pending", "in_progress"}
+        task
+        for task in data
+        if isinstance(task, dict) and task.get("status") in {"pending", "in_progress"}
     ]
     if not active:
         return ""
@@ -294,7 +308,9 @@ def _load_active_todo_context(workspace_path: str) -> str:
             lines.append(f"  Notes: {notes}")
 
     if len(active) > _MAX_TODO_CONTEXT_ITEMS:
-        lines.append(f"- ... {len(active) - _MAX_TODO_CONTEXT_ITEMS} more active tasks omitted")
+        lines.append(
+            f"- ... {len(active) - _MAX_TODO_CONTEXT_ITEMS} more active tasks omitted"
+        )
 
     rendered = "\n".join(lines)
     if len(rendered) > _MAX_TODO_CONTEXT_CHARS:
@@ -333,7 +349,10 @@ async def maybe_compact(
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
 
-    budget = get_context_limit(model, settings.max_context_tokens) - settings.generation_reserve
+    budget = (
+        get_context_limit(model, settings.max_context_tokens)
+        - settings.generation_reserve
+    )
     trigger = int(budget * settings.compaction_threshold)
     tokens = estimate_tokens(messages)
 
@@ -408,18 +427,14 @@ async def maybe_compact(
         logger.info(f"Compaction request too large, dropped {dropped} oldest messages")
 
     try:
-        summary_msg = await inference.chat(
-            compaction_messages, model=model, tools=None
-        )
+        summary_msg = await inference.chat(compaction_messages, model=model, tools=None)
         summary = summary_msg.content or "(no summary generated)"
     except Exception as e:
         logger.error(f"Compaction inference failed: {e}")
         # Fall back to un-compacted messages rather than losing the conversation
         return _inject_dynamic_context(messages, dynamic_context)
 
-    await db.compact_history(
-        chat_id, keep_recent=keep, summary=summary
-    )
+    await db.compact_history(chat_id, keep_recent=keep, summary=summary)
 
     # Reload from DB to get the clean state
     history = await db.get_history(chat_id, limit=settings.max_history)

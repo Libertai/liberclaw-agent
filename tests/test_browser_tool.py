@@ -81,7 +81,9 @@ def mock_page(monkeypatch):
     page.click = AsyncMock()
     page.fill = AsyncMock()
     page.title = AsyncMock(return_value="Example Domain")
-    page.content = AsyncMock(return_value="<html><body><p>Hello world</p></body></html>")
+    page.content = AsyncMock(
+        return_value="<html><body><p>Hello world</p></body></html>"
+    )
     page.screenshot = AsyncMock(return_value=b"\x89PNG\r\n\x1a\n fake-png-bytes")
 
     async def _fake_get_page():
@@ -201,7 +203,11 @@ def test_chromium_present_finds_playwright_cache(tmp_path, monkeypatch):
 def test_chromium_present_finds_system_chromium(monkeypatch):
     import baal_agent.tools as t
 
-    monkeypatch.setattr(t.shutil, "which", lambda name: "/usr/bin/chromium" if name == "chromium" else None)
+    monkeypatch.setattr(
+        t.shutil,
+        "which",
+        lambda name: "/usr/bin/chromium" if name == "chromium" else None,
+    )
     assert t._chromium_present() is True
 
 

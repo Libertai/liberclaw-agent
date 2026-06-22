@@ -132,11 +132,17 @@ class ToolPolicy:
             return False, f"tool '{name}' is blocked by locked-down policy"
         if self.mode == "ask-before-write":
             if is_mutating_tool(name):
-                return False, f"tool '{name}' requires approval in ask-before-write mode"
+                return (
+                    False,
+                    f"tool '{name}' requires approval in ask-before-write mode",
+                )
             return True, None
         if self.mode == "ask-before-shell":
             if name in _SHELL_TOOLS:
-                return False, f"tool '{name}' requires approval in ask-before-shell mode"
+                return (
+                    False,
+                    f"tool '{name}' requires approval in ask-before-shell mode",
+                )
             return True, None
         return False, f"unknown tool policy mode '{self.mode}'"
 
@@ -149,16 +155,18 @@ class ToolPolicy:
 # stricter of (parent, role) wins via _intersect_policies.
 
 # Read-only tools available to every constrained role.
-_READ_ONLY_TOOLS: frozenset[str] = frozenset({
-    "read_file",
-    "read_pdf",
-    "list_dir",
-    "glob",
-    "grep",
-    "search_history",
-    "search_memory",
-    "vision_query",
-})
+_READ_ONLY_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "read_pdf",
+        "list_dir",
+        "glob",
+        "grep",
+        "search_history",
+        "search_memory",
+        "vision_query",
+    }
+)
 
 _SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
     "explorer": ToolPolicy(
@@ -167,18 +175,21 @@ _SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
     ),
     "reviewer": ToolPolicy(
         mode="auto-read",
-        allowlist=_READ_ONLY_TOOLS | frozenset({"git_diff", "git_show", "git_blame", "git_status"}),
+        allowlist=_READ_ONLY_TOOLS
+        | frozenset({"git_diff", "git_show", "git_blame", "git_status"}),
     ),
     "verifier": ToolPolicy(
         mode="ask-before-write",
         allowlist=_READ_ONLY_TOOLS
-        | frozenset({
-            "run_tests",
-            "run_lint",
-            "run_typecheck",
-            "git_diff",
-            "git_status",
-        }),
+        | frozenset(
+            {
+                "run_tests",
+                "run_lint",
+                "run_typecheck",
+                "git_diff",
+                "git_status",
+            }
+        ),
     ),
     "researcher": ToolPolicy(
         mode="auto-read",
@@ -287,7 +298,11 @@ def _is_error_result(content: str) -> bool:
 
 def _is_truncated_result(content: str) -> bool:
     lowered = content.lower()
-    return "[large output saved:" in content or "... truncated" in lowered or "omitted" in lowered
+    return (
+        "[large output saved:" in content
+        or "... truncated" in lowered
+        or "omitted" in lowered
+    )
 
 
 def tool_metadata() -> list[dict]:
@@ -296,14 +311,17 @@ def tool_metadata() -> list[dict]:
     for tool in TOOL_DEFINITIONS:
         name = tool["function"]["name"]
         available, reason = _tool_available(name)
-        metadata.append({
-            "name": name,
-            "available": available,
-            "unavailable_reason": reason,
-            "mutating": is_mutating_tool(name),
-            "image_aware": name in _IMAGE_AWARE_TOOLS,
-        })
+        metadata.append(
+            {
+                "name": name,
+                "available": available,
+                "unavailable_reason": reason,
+                "mutating": is_mutating_tool(name),
+                "image_aware": name in _IMAGE_AWARE_TOOLS,
+            }
+        )
     return metadata
+
 
 # ── Workspace configuration ──────────────────────────────────────────
 
@@ -317,7 +335,9 @@ _inference = None  # InferenceClient instance, for LLM-powered tools
 _model: str = ""  # Model name, for LLM-powered tools
 
 
-def configure_tools(workspace_path: str, db=None, inference=None, model: str = "") -> None:
+def configure_tools(
+    workspace_path: str, db=None, inference=None, model: str = ""
+) -> None:
     """Set the workspace root and optional database for tool boundary checks."""
     global _workspace_path, _db, _inference, _model
     _workspace_path = workspace_path
@@ -369,12 +389,14 @@ async def start_mcp(mcp_servers_json: str) -> None:
         servers = json.loads(mcp_servers_json)
     except json.JSONDecodeError as e:
         import logging as _logging
+
         _logging.getLogger(__name__).error(f"Invalid mcp_servers JSON: {e}")
         return
     if not isinstance(servers, list) or not servers:
         return
 
     from baal_agent.mcp_client import MCPClient
+
     _mcp_client = MCPClient()
     for srv in servers:
         name = srv.get("name")
@@ -384,7 +406,10 @@ async def start_mcp(mcp_servers_json: str) -> None:
             await _mcp_client.connect(name, srv)
         except Exception as e:
             import logging as _logging
-            _logging.getLogger(__name__).error(f"MCP server '{name}' connect failed: {e}")
+
+            _logging.getLogger(__name__).error(
+                f"MCP server '{name}' connect failed: {e}"
+            )
 
 
 async def shutdown_mcp() -> None:
@@ -406,6 +431,7 @@ def get_mcp_health() -> dict:
             "servers": [],
         }
     return _mcp_client.get_health()
+
 
 # ── Bash safety guards ────────────────────────────────────────────────
 # Legacy BASH_DENY_PATTERNS kept for backward compatibility with tests.
@@ -735,8 +761,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Optional path to limit the diff."},
-                    "staged": {"type": "boolean", "description": "If true, show staged diff."},
+                    "path": {
+                        "type": "string",
+                        "description": "Optional path to limit the diff.",
+                    },
+                    "staged": {
+                        "type": "boolean",
+                        "description": "If true, show staged diff.",
+                    },
                 },
             },
         },
@@ -749,8 +781,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "rev": {"type": "string", "description": "Revision or object to show. Defaults to HEAD."},
-                    "path": {"type": "string", "description": "Optional path to limit output."},
+                    "rev": {
+                        "type": "string",
+                        "description": "Revision or object to show. Defaults to HEAD.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional path to limit output.",
+                    },
                 },
             },
         },
@@ -764,7 +802,10 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File to blame."},
-                    "start": {"type": "integer", "description": "Optional starting line."},
+                    "start": {
+                        "type": "integer",
+                        "description": "Optional starting line.",
+                    },
                     "end": {"type": "integer", "description": "Optional ending line."},
                 },
                 "required": ["path"],
@@ -779,8 +820,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Test command to run."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                    "command": {
+                        "type": "string",
+                        "description": "Test command to run.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 120, max 600).",
+                    },
                 },
                 "required": ["command"],
             },
@@ -794,8 +841,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Lint command to run."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                    "command": {
+                        "type": "string",
+                        "description": "Lint command to run.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 120, max 600).",
+                    },
                 },
                 "required": ["command"],
             },
@@ -809,8 +862,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Typecheck command to run."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                    "command": {
+                        "type": "string",
+                        "description": "Typecheck command to run.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 120, max 600).",
+                    },
                 },
                 "required": ["command"],
             },
@@ -824,8 +883,14 @@ TOOL_DEFINITIONS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Format command to run."},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)."},
+                    "command": {
+                        "type": "string",
+                        "description": "Format command to run.",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 120, max 600).",
+                    },
                 },
                 "required": ["command"],
             },
@@ -866,7 +931,14 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["goto", "extract", "click", "type", "screenshot", "back"],
+                        "enum": [
+                            "goto",
+                            "extract",
+                            "click",
+                            "type",
+                            "screenshot",
+                            "back",
+                        ],
                         "description": "The browser action to perform.",
                     },
                     "url": {
@@ -1207,7 +1279,14 @@ SPAWN_TOOL_DEF = {
                 },
                 "role": {
                     "type": "string",
-                    "enum": ["default", "explorer", "worker", "reviewer", "verifier", "researcher"],
+                    "enum": [
+                        "default",
+                        "explorer",
+                        "worker",
+                        "reviewer",
+                        "verifier",
+                        "researcher",
+                    ],
                     "description": (
                         "Typed role for the subagent. Use explorer for read-only codebase "
                         "inspection, worker for bounded implementation, reviewer for code "
@@ -1285,8 +1364,7 @@ def _spill_tool_output(text: str, source: str = "") -> str | None:
         if len(text) > preview_budget:
             preview += (
                 f"\n\n... full output saved to {rel} "
-                f"({len(text):,} chars, {line_count:,} lines) ...\n\n"
-                + text[-tail:]
+                f"({len(text):,} chars, {line_count:,} lines) ...\n\n" + text[-tail:]
             )
         return (
             f"[large output saved: {rel} "
@@ -1338,7 +1416,7 @@ def _truncate(text: str, source: str = "") -> str:
 
         head_lines = lines[:head_count]
         tail_lines = lines[-tail_count:]
-        middle_lines = lines[head_count:total_lines - tail_count]
+        middle_lines = lines[head_count : total_lines - tail_count]
 
         # Find error/warning lines in the middle
         error_lines = [line for line in middle_lines if _ERROR_PATTERNS.search(line)]
@@ -1388,7 +1466,9 @@ def _check_bash_safety(command: str) -> str | None:
 def _strip_html(text: str) -> str:
     """Strip HTML tags and decode entities to produce readable text."""
     # Remove script and style blocks
-    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(
+        r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE
+    )
     text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
     # Convert common block elements to newlines
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
@@ -1404,10 +1484,18 @@ def _strip_html(text: str) -> str:
 
 
 _BINARY_MIME_PREFIXES = (
-    "application/octet-stream", "application/zip", "application/gzip",
-    "application/x-tar", "application/pdf", "application/x-executable",
-    "application/x-sharedlib", "application/java-archive",
-    "application/vnd.", "audio/", "video/", "font/",
+    "application/octet-stream",
+    "application/zip",
+    "application/gzip",
+    "application/x-tar",
+    "application/pdf",
+    "application/x-executable",
+    "application/x-sharedlib",
+    "application/java-archive",
+    "application/vnd.",
+    "audio/",
+    "video/",
+    "font/",
 )
 
 
@@ -1423,11 +1511,17 @@ def _save_binary_download(content: bytes, url: str, content_type: str) -> str:
         downloads_dir = Path(_workspace_path) / "downloads"
         downloads_dir.mkdir(parents=True, exist_ok=True)
         url_path = urlparse(url).path
-        filename = Path(url_path).name if Path(url_path).name else f"download_{uuid.uuid4().hex[:8]}"
+        filename = (
+            Path(url_path).name
+            if Path(url_path).name
+            else f"download_{uuid.uuid4().hex[:8]}"
+        )
         filepath = downloads_dir / filename
         filepath.write_bytes(content)
-        hint = "Use read_pdf to read it." if filepath.suffix.lower() == ".pdf" else (
-            "Use read_file, bash, or other tools to inspect it."
+        hint = (
+            "Use read_pdf to read it."
+            if filepath.suffix.lower() == ".pdf"
+            else ("Use read_file, bash, or other tools to inspect it.")
         )
         return (
             f"[Binary file downloaded: downloads/{filename} "
@@ -1439,26 +1533,69 @@ def _save_binary_download(content: bytes, url: str, content_type: str) -> str:
 
 # ── Binary detection ─────────────────────────────────────────────────
 
-_BINARY_EXTENSIONS = frozenset({
-    # Archives
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    # Java / compiled / object
-    ".jar", ".war", ".class", ".o", ".so", ".dylib", ".dll", ".exe",
-    ".pyc", ".pyo", ".wasm",
-    # Databases
-    ".db", ".sqlite", ".sqlite3",
-    # Office / documents (zip-based)
-    ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp", ".epub",
-    # Packages
-    ".apk", ".ipa", ".deb", ".rpm",
-    # Raw binary
-    ".bin", ".dat",
-    # Media (non-image — images handled by is_image())
-    ".ico", ".mp3", ".mp4", ".avi", ".mov", ".wav", ".flac", ".ogg",
-    ".mkv", ".wmv", ".aac", ".m4a",
-    # Fonts
-    ".ttf", ".otf", ".woff", ".woff2", ".eot",
-})
+_BINARY_EXTENSIONS = frozenset(
+    {
+        # Archives
+        ".zip",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        # Java / compiled / object
+        ".jar",
+        ".war",
+        ".class",
+        ".o",
+        ".so",
+        ".dylib",
+        ".dll",
+        ".exe",
+        ".pyc",
+        ".pyo",
+        ".wasm",
+        # Databases
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        # Office / documents (zip-based)
+        ".docx",
+        ".xlsx",
+        ".pptx",
+        ".odt",
+        ".ods",
+        ".odp",
+        ".epub",
+        # Packages
+        ".apk",
+        ".ipa",
+        ".deb",
+        ".rpm",
+        # Raw binary
+        ".bin",
+        ".dat",
+        # Media (non-image — images handled by is_image())
+        ".ico",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".wav",
+        ".flac",
+        ".ogg",
+        ".mkv",
+        ".wmv",
+        ".aac",
+        ".m4a",
+        # Fonts
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        ".eot",
+    }
+)
 
 
 def _is_binary(path: Path) -> bool:
@@ -1503,6 +1640,7 @@ def _binary_file_message(path: Path) -> str:
 
 # ── Tool executors ────────────────────────────────────────────────────
 
+
 async def _exec_bash(args: dict) -> str:
     command = args["command"]
     # Safety check
@@ -1512,7 +1650,9 @@ async def _exec_bash(args: dict) -> str:
     timeout = min(args.get("timeout", 60), 300)
     try:
         if _shell is not None:
-            stdout_str, stderr_str, code = await _shell.execute(command, timeout=timeout)
+            stdout_str, stderr_str, code = await _shell.execute(
+                command, timeout=timeout
+            )
             if code == -1 and not stdout_str and not stderr_str:
                 return f"[timed out after {timeout}s]"
             # Check for binary output (null bytes in raw stdout)
@@ -1528,8 +1668,7 @@ async def _exec_bash(args: dict) -> str:
                     replacement_count = out.count("\ufffd")
                     if replacement_count > 0 and replacement_count / len(out) > 0.05:
                         out = (
-                            out[:200]
-                            + f"\n\n[truncated: output contains binary data "
+                            out[:200] + f"\n\n[truncated: output contains binary data "
                             f"({replacement_count} invalid bytes in {len(out)} chars)]"
                         )
             err = stderr_str
@@ -1554,8 +1693,7 @@ async def _exec_bash(args: dict) -> str:
                     replacement_count = out.count("\ufffd")
                     if replacement_count > 0 and replacement_count / len(out) > 0.05:
                         out = (
-                            out[:200]
-                            + f"\n\n[truncated: output contains binary data "
+                            out[:200] + f"\n\n[truncated: output contains binary data "
                             f"({replacement_count} invalid bytes in {len(out)} chars)]"
                         )
             err = stderr.decode("utf-8", errors="replace")
@@ -1597,7 +1735,7 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
             return f"[Read image: {path}]"
         # PDF: redirect to read_pdf
         if resolved.suffix.lower() == ".pdf":
-            return f"[This is a PDF file. Use the read_pdf tool to read it: read_pdf(path=\"{path}\")]"
+            return f'[This is a PDF file. Use the read_pdf tool to read it: read_pdf(path="{path}")]'
         # Binary detection — after image/PDF checks
         if _is_binary(resolved):
             return _binary_file_message(resolved)
@@ -1611,8 +1749,14 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         lines = content.splitlines(keepends=True)
         start = max(0, offset - 1)
         end = start + limit if limit else len(lines)
-        numbered = [f"{i + start + 1}\t{line}" for i, line in enumerate(lines[start:end])]
-        return _truncate("".join(numbered), source="read_file") if numbered else "(empty file)"
+        numbered = [
+            f"{i + start + 1}\t{line}" for i, line in enumerate(lines[start:end])
+        ]
+        return (
+            _truncate("".join(numbered), source="read_file")
+            if numbered
+            else "(empty file)"
+        )
     except PathSecurityError as e:
         return f"[error: {e}]"
     except FileNotFoundError:
@@ -1633,7 +1777,9 @@ async def _exec_read_many_files(args: dict) -> str:
     parts = []
     for raw_path in paths:
         if not isinstance(raw_path, str) or not raw_path:
-            parts.append("== <invalid path> ==\n[error: path must be a non-empty string]")
+            parts.append(
+                "== <invalid path> ==\n[error: path must be a non-empty string]"
+            )
             continue
         read_args = {"path": raw_path, "offset": offset}
         if limit is not None:
@@ -1707,11 +1853,17 @@ async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
                 pix = page.get_pixmap(dpi=150)
                 img_bytes = pix.tobytes("png")
                 from baal_agent.image_utils import resize_image_bytes
+
                 resized = resize_image_bytes(img_bytes, max_dim=1024)
                 mime = "image/jpeg" if resized is not img_bytes else "image/png"
                 b64 = base64.b64encode(resized).decode("ascii")
                 data_uri = f"data:{mime};base64,{b64}"
-                blocks.append({"type": "text", "text": f"[PDF page {idx + 1}/{total_pages}: {path}]"})
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": f"[PDF page {idx + 1}/{total_pages}: {path}]",
+                    }
+                )
                 blocks.append({"type": "image_url", "image_url": {"url": data_uri}})
 
             doc.close()
@@ -1720,7 +1872,9 @@ async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
                 image_callback(blocks)
 
             rendered = [str(i + 1) for i in page_indices]
-            return f"[Read PDF: {path} — page(s) {', '.join(rendered)} of {total_pages}]"
+            return (
+                f"[Read PDF: {path} — page(s) {', '.join(rendered)} of {total_pages}]"
+            )
         else:
             # Text extraction mode
             parts = []
@@ -1728,10 +1882,16 @@ async def _exec_read_pdf(args: dict, *, image_callback=None) -> str:
                 page = doc[idx]
                 text = page.get_text()
                 header = f"── Page {idx + 1}/{total_pages} ──"
-                parts.append(f"{header}\n{text.strip()}" if text.strip() else f"{header}\n(no text content)")
+                parts.append(
+                    f"{header}\n{text.strip()}"
+                    if text.strip()
+                    else f"{header}\n(no text content)"
+                )
 
             doc.close()
-            result = f"[PDF: {path} — {total_pages} pages total]\n\n" + "\n\n".join(parts)
+            result = f"[PDF: {path} — {total_pages} pages total]\n\n" + "\n\n".join(
+                parts
+            )
             return _truncate(result, source="read_pdf")
     except Exception as e:
         return f"[error reading PDF: {e}]"
@@ -1967,7 +2127,9 @@ async def _exec_apply_patch(args: dict) -> str:
         check_proc.communicate(patch.encode()), timeout=30
     )
     if check_proc.returncode != 0:
-        detail = (check_stderr or check_stdout).decode("utf-8", errors="replace").strip()
+        detail = (
+            (check_stderr or check_stdout).decode("utf-8", errors="replace").strip()
+        )
         return f"[error: patch check failed: {detail}]"
 
     paths_ok, paths_err = await _verify_patch_numstat(git, workspace, patch)
@@ -1983,7 +2145,9 @@ async def _exec_apply_patch(args: dict) -> str:
         stdin=asyncio.subprocess.PIPE,
         cwd=str(workspace),
     )
-    stdout, stderr = await asyncio.wait_for(apply_proc.communicate(patch.encode()), timeout=30)
+    stdout, stderr = await asyncio.wait_for(
+        apply_proc.communicate(patch.encode()), timeout=30
+    )
     if apply_proc.returncode != 0:
         detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
         return f"[error: patch apply failed: {detail}]"
@@ -2187,7 +2351,9 @@ async def _exec_list_dir(args: dict) -> str:
             resolved = Path(path)
         if not resolved.is_dir():
             return f"[error: not a directory: {path}]"
-        entries = sorted(resolved.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
+        entries = sorted(
+            resolved.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())
+        )
         lines = []
         for entry in entries:
             prefix = "[dir]" if entry.is_dir() else "[file]"
@@ -2304,7 +2470,9 @@ async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
     if not re.match(r"^https?://", url):
         return "[error: URL must start with http:// or https://]"
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, max_redirects=5) as client:
+        async with httpx.AsyncClient(
+            timeout=30.0, follow_redirects=True, max_redirects=5
+        ) as client:
             resp = await client.get(url, headers={"User-Agent": "BaalAgent/1.0"})
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
@@ -2335,7 +2503,10 @@ async def _exec_web_fetch(args: dict, *, image_callback=None) -> str:
             elif "html" in content_type:
                 text = _strip_html(text)
             if len(text) > MAX_WEB_CONTENT:
-                text = text[:MAX_WEB_CONTENT] + f"\n\n... truncated ({len(resp.text)} chars total)"
+                text = (
+                    text[:MAX_WEB_CONTENT]
+                    + f"\n\n... truncated ({len(resp.text)} chars total)"
+                )
             return text if text.strip() else "(empty response)"
     except httpx.HTTPStatusError as e:
         return f"[error: HTTP {e.response.status_code}]"
@@ -2504,12 +2675,16 @@ async def _exec_browser(args: dict, *, image_callback=None) -> str:
             return f"[error: {e}]"
         try:
             if action == "goto":
-                await page.goto(args["url"], timeout=BROWSER_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-                return f"Navigated to {page.url} — \"{await page.title()}\""
+                await page.goto(
+                    args["url"],
+                    timeout=BROWSER_NAV_TIMEOUT_MS,
+                    wait_until="domcontentloaded",
+                )
+                return f'Navigated to {page.url} — "{await page.title()}"'
 
             if action == "back":
                 await page.go_back(timeout=BROWSER_NAV_TIMEOUT_MS)
-                return f"Went back to {page.url} — \"{await page.title()}\""
+                return f'Went back to {page.url} — "{await page.title()}"'
 
             if action == "click":
                 selector = args.get("selector")
@@ -2532,7 +2707,10 @@ async def _exec_browser(args: dict, *, image_callback=None) -> str:
                 content = await page.content()
                 text = _strip_html(content)
                 if len(text) > MAX_WEB_CONTENT:
-                    text = text[:MAX_WEB_CONTENT] + f"\n\n... truncated ({len(content)} chars total)"
+                    text = (
+                        text[:MAX_WEB_CONTENT]
+                        + f"\n\n... truncated ({len(content)} chars total)"
+                    )
                 return text if text.strip() else "(empty page)"
 
             if action == "screenshot":
@@ -2576,10 +2754,10 @@ async def _exec_search_history(args: dict) -> str:
     if summarize and _inference and _model:
         try:
             summary_prompt = (
-                f'Based on the following search results from conversation history, '
+                f"Based on the following search results from conversation history, "
                 f'provide a coherent summary that answers the query "{query}":\n\n'
-                f'{raw_output}\n\n'
-                f'Synthesize the key information concisely.'
+                f"{raw_output}\n\n"
+                f"Synthesize the key information concisely."
             )
             response = await _inference.chat(
                 messages=[{"role": "user", "content": summary_prompt}],
@@ -2591,6 +2769,7 @@ async def _exec_search_history(args: dict) -> str:
         except Exception as e:
             # Fall back to raw results on summarization failure
             import logging as _logging
+
             _logging.getLogger(__name__).warning(f"Search summarization failed: {e}")
 
     return _truncate(raw_output, source="search_history")
@@ -2922,7 +3101,9 @@ async def _exec_todo(args: dict) -> str:
         if "priority" in args and args["priority"] is not None:
             new_priority = args["priority"]
             if new_priority not in _TODO_VALID_PRIORITIES:
-                return f"[error: priority must be one of {sorted(_TODO_VALID_PRIORITIES)}]"
+                return (
+                    f"[error: priority must be one of {sorted(_TODO_VALID_PRIORITIES)}]"
+                )
             task["priority"] = new_priority
             changed.append(f"priority={new_priority}")
         if "notes" in args and args["notes"] is not None:
@@ -2962,6 +3143,7 @@ async def _exec_todo(args: dict) -> str:
 
 # ── execute_code handler ─────────────────────────────────────────────
 
+
 async def _exec_execute_code(args: dict) -> str:
     code = args.get("code")
     if not code:
@@ -2981,6 +3163,7 @@ async def _exec_execute_code(args: dict) -> str:
 
 
 # ── Checkpoint tool ──────────────────────────────────────────────────
+
 
 async def _exec_checkpoint(args: dict) -> str:
     global _checkpoint_mgr
@@ -3082,7 +3265,8 @@ def _prune_completed_processes():
     """Remove completed processes older than _PROCESS_RETENTION."""
     cutoff = _time.time() - _PROCESS_RETENTION
     to_remove = [
-        pid for pid, info in _processes.items()
+        pid
+        for pid, info in _processes.items()
         if info.status != "running" and info.completed_at and info.completed_at < cutoff
     ]
     for pid in to_remove:
@@ -3092,6 +3276,7 @@ def _prune_completed_processes():
 async def _process_output_reader(info: ProcessInfo):
     """Background task that reads stdout+stderr and appends to the buffer."""
     try:
+
         async def _read_stream(stream):
             if stream is None:
                 return
@@ -3307,11 +3492,16 @@ def _chromium_present() -> bool:
 
 def _tool_available(name: str) -> tuple[bool, str | None]:
     """Return whether a built-in tool is currently usable."""
-    if name in {"web_search", "generate_image"} and not os.environ.get("LIBERTAI_API_KEY", ""):
+    if name in {"web_search", "generate_image"} and not os.environ.get(
+        "LIBERTAI_API_KEY", ""
+    ):
         return False, "LIBERTAI_API_KEY is not configured"
     if name == "grep" and shutil.which("rg") is None:
         return False, "ripgrep (rg) is not installed"
-    if name in {"apply_patch", "git_status", "git_diff", "git_show", "git_blame"} and shutil.which("git") is None:
+    if (
+        name in {"apply_patch", "git_status", "git_diff", "git_show", "git_blame"}
+        and shutil.which("git") is None
+    ):
         return False, "git is not installed"
     if name == "browser":
         if os.environ.get("BROWSER_ENABLED") != "true":
@@ -3347,7 +3537,8 @@ def get_tool_definitions(
 ) -> list[dict]:
     """Return tool definitions, optionally including spawn and MCP tools."""
     defs = [
-        tool for tool in TOOL_DEFINITIONS
+        tool
+        for tool in TOOL_DEFINITIONS
         if _tool_available(tool["function"]["name"])[0]
         and _policy_allows_tool(policy, tool["function"]["name"])
     ]
@@ -3357,7 +3548,8 @@ def get_tool_definitions(
         defs.append(VISION_QUERY_TOOL_DEF)
     if _mcp_client is not None:
         defs.extend(
-            tool for tool in _mcp_client.get_tool_definitions()
+            tool
+            for tool in _mcp_client.get_tool_definitions()
             if _policy_allows_tool(policy, tool["function"]["name"])
         )
     return defs
@@ -3523,11 +3715,13 @@ async def execute_tool_result(
     artifacts = []
     if isinstance(content, str) and content.startswith("__SEND_FILE__:"):
         parts = content.split(":", 2)
-        artifacts.append({
-            "type": "file",
-            "path": parts[1] if len(parts) > 1 else "",
-            "caption": parts[2] if len(parts) > 2 else "",
-        })
+        artifacts.append(
+            {
+                "type": "file",
+                "path": parts[1] if len(parts) > 1 else "",
+                "caption": parts[2] if len(parts) > 2 else "",
+            }
+        )
     metadata = {"mutating": is_mutating_tool(name)}
     skills_loaded = _skill_load_metadata(name, arguments)
     if skills_loaded:
