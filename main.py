@@ -953,7 +953,9 @@ async def _maybe_skill_nudge(
             },
         )
         if store_history:
-            await db.add_message(chat_id, "assistant", text)
+            await db.add_message(
+                chat_id, "assistant", text, metadata={"skill_proposal": True}
+            )
         return text
     except Exception as e:
         logger.warning(f"Skill draft proposal inference failed: {e}")
@@ -1548,7 +1550,10 @@ async def _run_chat_background(
                     tools=tools,
                 )
                 if skill_text:
-                    await _emit(run, {"type": "text", "content": skill_text})
+                    await _emit(
+                        run,
+                        {"type": "skill.draft.proposed", "content": skill_text},
+                    )
                 return
 
             # Emit tool_use SSE events for all tools before execution
@@ -1946,7 +1951,9 @@ def _created_at_to_ms(s: str | None) -> int | None:
 @app.get("/chat/{chat_id}/history")
 async def get_chat_history(chat_id: str, limit: int = 50):
     """Return conversation history as ChatMessage events for the frontend."""
-    messages = await db.get_history(chat_id, limit=limit, include_timestamps=True)
+    messages = await db.get_history(
+        chat_id, limit=limit, include_timestamps=True, include_metadata=True
+    )
     events = []
     for msg in messages:
         role = msg["role"]
@@ -1963,7 +1970,19 @@ async def get_chat_history(chat_id: str, limit: int = 50):
             )
         elif role == "assistant":
             if msg.get("content"):
-                events.append({"type": "text", "content": msg["content"], **ts_field})
+                meta = msg.get("metadata")
+                if isinstance(meta, dict) and meta.get("skill_proposal"):
+                    events.append(
+                        {
+                            "type": "skill.draft.proposed",
+                            "content": msg["content"],
+                            **ts_field,
+                        }
+                    )
+                else:
+                    events.append(
+                        {"type": "text", "content": msg["content"], **ts_field}
+                    )
             if msg.get("tool_calls"):
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})

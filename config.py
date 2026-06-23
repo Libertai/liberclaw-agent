@@ -36,7 +36,7 @@ class AgentSettings(BaseSettings):
         0.75  # trigger compaction at this fraction of context budget
     )
     compaction_flush_enabled: bool = True  # run memory flush before compaction
-    auto_skill_threshold: int = 5  # tool calls to trigger skill nudge (0 = disabled)
+    auto_skill_threshold: int = 10  # tool calls to trigger skill nudge (0 = disabled)
     inference_timeout: int = 300  # seconds — timeout for inference in the SSE loop
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
