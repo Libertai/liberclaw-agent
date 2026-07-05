@@ -1195,6 +1195,9 @@ async def _run_cron_job(task: str, job_id: str):
             await _send_file_via_telegram(fe["path"], fe.get("caption", ""))
         if result:
             logger.info(f"Cron job {job_id!r} produced output ({len(result)} chars)")
+            # Queue the result so the owner actually sees scheduled work:
+            # the platform polls GET /pending (badge + web delivery).
+            await db.add_pending(chat_id, result, source="cron")
         else:
             logger.debug(f"Cron job {job_id!r}: no output")
     except Exception as e:
