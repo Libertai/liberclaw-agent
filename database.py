@@ -42,6 +42,10 @@ class AgentDatabase:
                 source TEXT NOT NULL DEFAULT 'system',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            CREATE TABLE IF NOT EXISTS pending_cursors (
+                channel TEXT PRIMARY KEY,
+                last_id INTEGER NOT NULL DEFAULT 0
+            );
             CREATE TABLE IF NOT EXISTS telegram_contacts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id TEXT NOT NULL UNIQUE,
@@ -628,6 +632,58 @@ class AgentDatabase:
             )
         row = await cursor.fetchone()
         return int(row["c"]) if row else 0
+
+    async def get_pending_for_channel(
+        self, channel: str, chat_id: str | None = None
+    ) -> list[dict]:
+        """Non-destructive fetch of pending rows this channel has not acked."""
+        cursor = await self.db.execute(
+            "SELECT last_id FROM pending_cursors WHERE channel = ?", (channel,)
+        )
+        row = await cursor.fetchone()
+        last_id = int(row["last_id"]) if row else 0
+        if chat_id:
+            cursor = await self.db.execute(
+                "SELECT id, chat_id, content, source, created_at "
+                "FROM pending_messages WHERE id > ? AND chat_id = ? ORDER BY id",
+                (last_id, chat_id),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT id, chat_id, content, source, created_at "
+                "FROM pending_messages WHERE id > ? ORDER BY id",
+                (last_id,),
+            )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "chat_id": r["chat_id"],
+                "content": r["content"],
+                "source": r["source"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    async def ack_pending(self, channel: str, up_to_id: int) -> int:
+        """Advance a channel cursor (monotonic) and GC rows older than 7 days."""
+        await self.db.execute(
+            "INSERT INTO pending_cursors (channel, last_id) VALUES (?, ?) "
+            "ON CONFLICT(channel) DO UPDATE SET last_id = excluded.last_id "
+            "WHERE excluded.last_id > pending_cursors.last_id",
+            (channel, up_to_id),
+        )
+        await self.db.execute(
+            "DELETE FROM pending_messages "
+            "WHERE created_at < datetime('now', '-7 days')"
+        )
+        await self.db.commit()
+        cursor = await self.db.execute(
+            "SELECT last_id FROM pending_cursors WHERE channel = ?", (channel,)
+        )
+        row = await cursor.fetchone()
+        return int(row["last_id"]) if row else up_to_id
 
     # ── Telegram contacts ─────────────────────────────────────────────
 

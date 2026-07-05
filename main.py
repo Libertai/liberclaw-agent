@@ -2043,6 +2043,29 @@ async def count_pending(chat_id: str | None = None):
     return {"count": count}
 
 
+class PendingAck(BaseModel):
+    channel: str
+    up_to_id: int
+
+
+@app.get("/pending/channel/{channel}")
+async def get_pending_channel(channel: str, chat_id: str | None = None):
+    """Non-destructive per-channel fetch. Rows include ids for later ack.
+
+    Old builds 404 this path — the control plane uses that to detect
+    legacy agents (same pattern as /pending/count).
+    """
+    messages = await db.get_pending_for_channel(channel, chat_id)
+    return {"messages": messages, "channel": channel}
+
+
+@app.post("/pending/ack")
+async def ack_pending(body: PendingAck):
+    """Advance a channel's cursor; acked rows stop appearing for it."""
+    last_id = await db.ack_pending(body.channel, body.up_to_id)
+    return {"status": "ok", "channel": body.channel, "last_id": last_id}
+
+
 @app.get("/files/{file_path:path}")
 async def serve_file(file_path: str):
     """Serve a workspace file (protected by auth middleware)."""
