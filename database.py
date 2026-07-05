@@ -619,16 +619,32 @@ class AgentDatabase:
             await self.db.commit()
         return messages
 
-    async def count_pending(self, chat_id: str | None = None) -> int:
-        """Count pending messages WITHOUT clearing them (non-destructive peek)."""
+    async def count_pending(
+        self, chat_id: str | None = None, channel: str | None = None
+    ) -> int:
+        """Count pending messages WITHOUT clearing them (non-destructive peek).
+
+        With ``channel``, only rows that channel has not acked are counted —
+        otherwise cursor-based consumers (which never delete rows) would show
+        a stale unread count until the 7-day GC runs.
+        """
+        last_id = 0
+        if channel:
+            cursor = await self.db.execute(
+                "SELECT last_id FROM pending_cursors WHERE channel = ?", (channel,)
+            )
+            row = await cursor.fetchone()
+            last_id = int(row["last_id"]) if row else 0
         if chat_id:
             cursor = await self.db.execute(
-                "SELECT COUNT(*) AS c FROM pending_messages WHERE chat_id = ?",
-                (chat_id,),
+                "SELECT COUNT(*) AS c FROM pending_messages "
+                "WHERE id > ? AND chat_id = ?",
+                (last_id, chat_id),
             )
         else:
             cursor = await self.db.execute(
-                "SELECT COUNT(*) AS c FROM pending_messages"
+                "SELECT COUNT(*) AS c FROM pending_messages WHERE id > ?",
+                (last_id,),
             )
         row = await cursor.fetchone()
         return int(row["c"]) if row else 0

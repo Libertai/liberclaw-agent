@@ -2033,13 +2033,15 @@ async def get_pending(chat_id: str | None = None):
 
 
 @app.get("/pending/count")
-async def count_pending(chat_id: str | None = None):
+async def count_pending(chat_id: str | None = None, channel: str | None = None):
     """Non-destructive count of pending messages — does NOT clear them.
 
     Lets the control plane check for a backlog (e.g. to send a "your agent
     finished something" nudge) without draining messages the user never saw.
+    With ``channel``, rows already acked by that channel's cursor are
+    excluded, so cursor-based consumers see the count drop after acking.
     """
-    count = await db.count_pending(chat_id)
+    count = await db.count_pending(chat_id, channel=channel)
     return {"count": count}
 
 

@@ -50,6 +50,21 @@ async def test_legacy_destructive_path_unchanged(db):
 
 
 @pytest.mark.asyncio
+async def test_count_is_cursor_aware_per_channel(db):
+    await db.add_pending("__owner__", "hello")
+    assert await db.count_pending() == 1
+    assert await db.count_pending(channel="web") == 1
+
+    rows = await db.get_pending_for_channel("web")
+    await db.ack_pending("web", rows[-1]["id"])
+
+    # web channel has read everything; the raw queue still holds the row
+    assert await db.count_pending(channel="web") == 0
+    assert await db.count_pending(channel="telegram") == 1
+    assert await db.count_pending() == 1
+
+
+@pytest.mark.asyncio
 async def test_gc_deletes_old_rows_only(db):
     await db.add_pending("__owner__", "old")
     await db.db.execute(
