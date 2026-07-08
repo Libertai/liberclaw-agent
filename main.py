@@ -1677,9 +1677,20 @@ async def _run_chat_background(
                 for ev in await _delegate_vision(messages, chat_id):
                     await _emit(run, ev)
 
-        await _emit(
-            run, {"type": "text", "content": "(Reached maximum tool iterations)"}
+        # Persist the notice as an assistant message so users who reconnect
+        # later (history is rebuilt from the messages table, not the live
+        # event buffer) can see why the task stopped — and so the model
+        # knows to resume when the user says "continue".
+        limit_notice = (
+            f"⚠️ I stopped after reaching the limit of "
+            f"{settings.max_tool_iterations} tool calls for a single message. "
+            'Say "continue" and I\'ll pick up where I left off.'
         )
+        try:
+            await db.add_message(chat_id, "assistant", limit_notice)
+        except Exception:
+            logger.warning("Failed to persist max-iterations notice", exc_info=True)
+        await _emit(run, {"type": "text", "content": limit_notice})
 
     except asyncio.CancelledError:
         logger.info(f"Chat run cancelled for {chat_id}")
@@ -1689,6 +1700,13 @@ async def _run_chat_background(
         )
     except Exception as e:
         logger.error(f"Chat run error for {chat_id}: {e}", exc_info=True)
+        # Persist to history so a disconnected user sees why the run stopped
+        try:
+            await db.add_message(
+                chat_id, "assistant", f"⚠️ This run stopped early due to an error: {e}"
+            )
+        except Exception:
+            logger.debug("Failed to persist error notice", exc_info=True)
         try:
             await _emit(run, {"type": "error", "content": str(e)})
         except asyncio.CancelledError:
