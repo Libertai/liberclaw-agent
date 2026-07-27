@@ -15,25 +15,27 @@ import signal
 import socket
 import time as _time
 import uuid
-from dataclasses import dataclass, field as _field
+from dataclasses import dataclass
+from dataclasses import field as _field
+from datetime import UTC
 from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 
+from baal_agent.checkpoints import CheckpointManager
+from baal_agent.code_executor import CodeExecutor
 from baal_agent.image_utils import (
     build_image_content_blocks,
     encode_bytes_to_data_uri,
     is_image,
 )
-from baal_agent.checkpoints import CheckpointManager
 from baal_agent.security import (
     MAX_SEND_FILE_SIZE,
     PathSecurityError,
     check_command_safety,
     validate_workspace_path,
 )
-from baal_agent.code_executor import CodeExecutor
 from baal_agent.shell import PersistentShell
 
 MAX_TOOL_OUTPUT = 30_000
@@ -102,7 +104,7 @@ class ToolPolicy:
         mode: str = "full-auto",
         allowlist: str = "",
         denylist: str = "",
-    ) -> "ToolPolicy":
+    ) -> ToolPolicy:
         normalized = (mode or "full-auto").strip()
         return cls(
             mode=normalized,
@@ -168,7 +170,7 @@ _READ_ONLY_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-_SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
+_SUBAGENT_ROLE_POLICIES: dict[str, ToolPolicy] = {
     "explorer": ToolPolicy(
         mode="auto-read",
         allowlist=_READ_ONLY_TOOLS,
@@ -198,7 +200,7 @@ _SUBAGENT_ROLE_POLICIES: dict[str, "ToolPolicy"] = {
 }
 
 
-def subagent_role_policy(role: str | None) -> "ToolPolicy | None":
+def subagent_role_policy(role: str | None) -> ToolPolicy | None:
     """Return the per-role ToolPolicy, or None for unrestricted roles.
 
     `default` and `worker` get no extra restriction; the parent agent's
@@ -211,8 +213,8 @@ def subagent_role_policy(role: str | None) -> "ToolPolicy | None":
 
 
 def intersect_policies(
-    base: "ToolPolicy | None", overlay: "ToolPolicy | None"
-) -> "ToolPolicy | None":
+    base: ToolPolicy | None, overlay: ToolPolicy | None
+) -> ToolPolicy | None:
     """Return a policy at least as strict as both inputs.
 
     Used to stack a subagent role policy on top of the global agent
@@ -261,7 +263,7 @@ class ToolExecutionContext:
     # The active ToolPolicy for this turn. Carried through ToolExecutionContext
     # so that nested dispatchers (notably execute_code's sandbox bridge) can
     # re-apply policy on inner tool calls instead of running unchecked.
-    policy: "ToolPolicy | None" = None
+    policy: ToolPolicy | None = None
 
 
 @dataclass
@@ -293,7 +295,7 @@ class ToolResult:
 
 
 def _is_error_result(content: str) -> bool:
-    return content.startswith("[error:") or content.startswith("Error executing ")
+    return content.startswith(("[error:", "Error executing "))
 
 
 def _is_truncated_result(content: str) -> bool:
@@ -1705,7 +1707,7 @@ async def _exec_bash(args: dict) -> str:
             parts.append(f"[stderr]\n{err}")
         parts.append(f"[exit code: {code}]")
         return _truncate("\n".join(parts), source="bash")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             proc.kill()  # type: ignore[possibly-undefined]
             await proc.wait()
@@ -1739,13 +1741,14 @@ async def _exec_read_file(args: dict, *, image_callback=None) -> str:
         # Binary detection — after image/PDF checks
         if _is_binary(resolved):
             return _binary_file_message(resolved)
-        with open(resolved, "r", errors="replace") as f:
+        with open(resolved, "r", errors="replace") as f:  # noqa: ASYNC230 - small workspace files; see follow-up
             content = f.read()
-        if context := args.get("_context"):
-            if isinstance(context, ToolExecutionContext):
-                context.read_hashes[str(resolved.resolve())] = hashlib.sha256(
-                    content.encode()
-                ).hexdigest()
+        if (context := args.get("_context")) and isinstance(
+            context, ToolExecutionContext
+        ):
+            context.read_hashes[str(resolved.resolve())] = hashlib.sha256(
+                content.encode()
+            ).hexdigest()
         lines = content.splitlines(keepends=True)
         start = max(0, offset - 1)
         end = start + limit if limit else len(lines)
@@ -1910,7 +1913,7 @@ async def _exec_write_file(args: dict) -> str:
         else:
             resolved = Path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        with open(resolved, "w") as f:
+        with open(resolved, "w") as f:  # noqa: ASYNC230 - small workspace files; see follow-up
             f.write(content)
         return f"Wrote {len(content)} bytes to {path}"
     except PathSecurityError as e:
@@ -1938,7 +1941,7 @@ async def _exec_edit_file(args: dict) -> str:
             resolved = Path(path)
         if _is_binary(resolved):
             return f"[error: {path} is a binary file and cannot be edited as text]"
-        with open(resolved, "r") as f:
+        with open(resolved, "r") as f:  # noqa: ASYNC230 - small workspace files; see follow-up
             content = f.read()
         actual_hash = hashlib.sha256(content.encode()).hexdigest()
         if expected_hash:
@@ -1975,7 +1978,7 @@ async def _exec_edit_file(args: dict) -> str:
         content = content.replace(
             old_string, new_string, occurrences if replace_all else 1
         )
-        with open(resolved, "w") as f:
+        with open(resolved, "w") as f:  # noqa: ASYNC230 - small workspace files; see follow-up
             f.write(content)
         context = args.get("_context")
         if isinstance(context, ToolExecutionContext):
@@ -2044,7 +2047,7 @@ async def _run_exec(
             parts.append(f"[stderr]\n{err.rstrip()}")
         parts.append(f"[exit code: {proc.returncode or 0}]")
         return _truncate("\n".join(parts), source=source)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             proc.kill()  # type: ignore[possibly-undefined]
             await proc.wait()
@@ -2085,7 +2088,7 @@ async def _run_shell_command_tool(args: dict, *, source: str) -> str:
             parts.append(f"[stderr]\n{err.rstrip()}")
         parts.append(f"[exit code: {proc.returncode or 0}]")
         return _truncate("\n".join(parts), source=source)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         try:
             proc.kill()  # type: ignore[possibly-undefined]
             await proc.wait()
@@ -2202,7 +2205,7 @@ def _validate_patch_paths(patch: str, workspace: Path) -> None:
             parts = line.split()
             if len(parts) >= 4:
                 paths.update(parts[2:4])
-        elif line.startswith("--- ") or line.startswith("+++ "):
+        elif line.startswith(("--- ", "+++ ")):
             raw = line[4:].split("\t", 1)[0].strip()
             paths.add(raw)
 
@@ -2457,7 +2460,7 @@ async def _exec_grep(args: dict) -> str:
             out = "\n".join(lines[:limit])
             out += f"\n... {len(lines) - limit} more lines omitted"
         return _truncate(out, source="grep") if out.strip() else "(no matches)"
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return "[timed out after 30s]"
     except PathSecurityError as e:
         return f"[error: {e}]"
@@ -3044,7 +3047,7 @@ async def _exec_todo(args: dict) -> str:
     if not _workspace_path:
         return "[error: workspace not configured]"
 
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     try:
         tasks = _load_todos()
@@ -3063,7 +3066,7 @@ async def _exec_todo(args: dict) -> str:
             "title": title,
             "status": "pending",
             "priority": priority,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "completed_at": None,
             "notes": args.get("notes", ""),
         }
@@ -3122,7 +3125,7 @@ async def _exec_todo(args: dict) -> str:
         if not task:
             return f"[error: task #{task_id} not found]"
         task["status"] = "done"
-        task["completed_at"] = datetime.now(timezone.utc).isoformat()
+        task["completed_at"] = datetime.now(UTC).isoformat()
         _save_todos(tasks)
         return f"Completed task #{task_id}: {task.get('title', '')}"
 
@@ -3396,7 +3399,7 @@ async def _exec_process(args: dict) -> str:
         # Wait up to 5s for graceful shutdown
         try:
             await asyncio.wait_for(info.process.wait(), timeout=5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Force kill
             try:
                 info.process.kill()

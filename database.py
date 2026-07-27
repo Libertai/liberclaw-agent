@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -143,20 +143,20 @@ class AgentDatabase:
     def _parse_created_at(self, value: str | None) -> datetime:
         """Parse both current ISO timestamps and older SQLite datetime strings."""
         if not value:
-            return datetime.now(timezone.utc)
+            return datetime.now(UTC)
         try:
             dt = datetime.fromisoformat(value)
             if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.replace(tzinfo=UTC)
             return dt
         except (ValueError, TypeError):
             pass
         try:
             return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(
-                tzinfo=timezone.utc
+                tzinfo=UTC
             )
         except (ValueError, TypeError):
-            return datetime.now(timezone.utc)
+            return datetime.now(UTC)
 
     async def _index_message_fts(
         self, rowid: int | None, content: str | list[dict] | None
@@ -181,7 +181,7 @@ class AgentDatabase:
         tool_call_id: str | None = None,
         metadata: dict | None = None,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         tc_json = json.dumps(tool_calls) if tool_calls else None
         metadata_json = json.dumps(metadata) if metadata else None
         # Serialize list content to JSON for storage
@@ -203,7 +203,7 @@ class AgentDatabase:
                 chat_id,
                 event_type,
                 json.dumps(payload),
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         await self.db.commit()
@@ -223,7 +223,7 @@ class AgentDatabase:
         ``chat_id=None`` makes the record visible to every conversation
         (legacy behaviour). Pass the current chat_id to scope it.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         cursor = await self.db.execute(
             "INSERT INTO memory_records "
             "(kind, content, source, metadata, chat_id, created_at, updated_at) "
@@ -284,7 +284,7 @@ class AgentDatabase:
         return [self._memory_row_to_dict(row) for row in rows]
 
     async def archive_memory_record(self, record_id: int) -> bool:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         cursor = await self.db.execute(
             "UPDATE memory_records SET archived = 1, updated_at = ? WHERE id = ?",
             (now, record_id),
@@ -308,7 +308,7 @@ class AgentDatabase:
         if retention_days <= 0:
             return 0
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=retention_days)
+            datetime.now(UTC) - timedelta(days=retention_days)
         ).isoformat()
         cursor = await self.db.execute(
             "DELETE FROM runtime_events WHERE created_at < ?", (cutoff,)
@@ -577,7 +577,7 @@ class AgentDatabase:
         self, chat_id: str, content: str, source: str = "system"
     ) -> None:
         """Insert a pending proactive message."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self.db.execute(
             "INSERT INTO pending_messages (chat_id, content, source, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -732,7 +732,7 @@ class AgentDatabase:
         username: str | None,
         status: str = "pending",
     ) -> dict:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self.db.execute(
             "INSERT INTO telegram_contacts "
             "(telegram_id, chat_id, chat_type, display_name, username, status, created_at, updated_at) "
@@ -762,7 +762,7 @@ class AgentDatabase:
     async def update_telegram_contact_status(
         self, telegram_id: str, status: str
     ) -> bool:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         cursor = await self.db.execute(
             "UPDATE telegram_contacts SET status = ?, updated_at = ? WHERE telegram_id = ?",
             (status, now, telegram_id),

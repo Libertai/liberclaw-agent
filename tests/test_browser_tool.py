@@ -13,7 +13,6 @@ import pytest
 from baal_agent import tools
 from baal_agent.tools import _exec_browser, _tool_available, execute_tool_result
 
-
 # ── Gating ────────────────────────────────────────────────────────────
 
 

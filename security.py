@@ -105,9 +105,8 @@ def check_command_safety(command: str) -> str | None:
     # Check first token and all tokens after pipe/semicolon/&& for dangerous commands
     cmd_positions = {0}  # First token is always a command
     for i, token in enumerate(tokens):
-        if token in ("|", ";", "&&", "||"):
-            if i + 1 < len(tokens):
-                cmd_positions.add(i + 1)
+        if token in ("|", ";", "&&", "||") and i + 1 < len(tokens):
+            cmd_positions.add(i + 1)
 
     for pos in cmd_positions:
         if pos >= len(tokens):

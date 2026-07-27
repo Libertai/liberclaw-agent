@@ -290,7 +290,7 @@ class MCPClient:
         try:
             result = await asyncio.wait_for(future, timeout=timeout)
             return result
-        except asyncio.TimeoutError:
+        except TimeoutError:
             conn._pending.pop(req_id, None)
             logger.warning(f"MCP request '{method}' to '{conn.name}' timed out")
             return None
@@ -349,7 +349,7 @@ class MCPClient:
                 conn.process.terminate()
                 try:
                     await asyncio.wait_for(conn.process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     conn.process.kill()
                     await conn.process.wait()
             except ProcessLookupError:
@@ -594,4 +594,3 @@ def _mcp_image_blocks(content_blocks: list, server_name: str, tool_name: str) ->
 
 class MCPError(Exception):
     """Error from an MCP server."""
-    pass

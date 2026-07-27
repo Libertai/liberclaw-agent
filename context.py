@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -23,7 +23,7 @@ def build_static_system_prompt(
     Those are injected via build_dynamic_context() near the end of the
     message list so the KV cache prefix stays stable.
     """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
 
     sections = []
 
@@ -301,7 +301,7 @@ def build_subagent_prompt(
     Excludes user instructions, memory, and skills to keep the subagent
     focused and cheap.  Optionally accepts a persona for specialization.
     """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
 
     sections = []
 
@@ -477,7 +477,7 @@ def _load_memory(workspace: Path) -> str:
         pass
 
     # Today's daily notes
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     daily_file = workspace / "memory" / f"{today}.md"
     try:
         if daily_file.exists():

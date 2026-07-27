@@ -126,7 +126,7 @@ class PersistentShell:
                     timeout=timeout,
                 )
                 return stdout, stderr, exit_code
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Command timed out after %ds, restarting shell", timeout)
                 await self._kill()
                 await self._spawn()
@@ -191,7 +191,7 @@ class PersistentShell:
         if not stdout_done:
             try:
                 await asyncio.wait_for(stdout_task, timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 stdout_task.cancel()
                 try:
                     await stdout_task

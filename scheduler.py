@@ -12,10 +12,10 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Awaitable
 
 from baal_agent.watchers import (
     load_watcher_state,
@@ -194,7 +194,7 @@ class CronScheduler:
         if not job.enabled:
             return False
         if now is None:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
         if not cron_matches(job.schedule, now):
             return False
         # Prevent double-execution within the same minute
@@ -207,13 +207,13 @@ class CronScheduler:
     async def _loop(self, run_job_callback: Callable[[str, str], Awaitable[None]]):
         """Tick every 60 s, check due jobs, and dispatch them."""
         # Align to the start of the next minute (± 1 s tolerance)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         seconds_to_next_minute = 60 - now.second
         if seconds_to_next_minute > 1:
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=seconds_to_next_minute)
                 return  # stop requested during initial wait
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
         while not self._stop_event.is_set():
@@ -226,12 +226,12 @@ class CronScheduler:
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=60)
                 return  # stop requested
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def _tick(self, run_job_callback: Callable[[str, str], Awaitable[None]]):
         """One scheduler tick: reload jobs, run anything that's due."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         await self._tick_watchers(run_job_callback, now)
 

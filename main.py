@@ -11,6 +11,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -39,14 +40,14 @@ from baal_agent.context import (
 from baal_agent.database import AgentDatabase
 from baal_agent.image_utils import cap_images_in_messages
 from baal_agent.inference import InferenceClient
+from baal_agent.plugins import PluginManager
+from baal_agent.scheduler import CronScheduler
 from baal_agent.security import (
     MAX_SEND_FILE_SIZE,
     PathSecurityError,
     validate_workspace_path,
 )
 from baal_agent.telegram_bot import TelegramBot
-from baal_agent.plugins import PluginManager
-from baal_agent.scheduler import CronScheduler
 from baal_agent.tools import (
     ToolExecutionContext,
     ToolPolicy,
@@ -54,8 +55,8 @@ from baal_agent.tools import (
     _tool_available,
     configure_tools,
     execute_tool_result,
-    get_tool_definitions,
     get_mcp_health,
+    get_tool_definitions,
     get_unavailable_tools,
     run_tool_calls_ordered,
     shutdown_browser,
@@ -1129,7 +1130,7 @@ async def _run_subagent(run: SubagentRun, timeout: int, origin_chat_id: str):
                     chat_id=tg_target,
                 )
 
-    except asyncio.TimeoutError:
+    except TimeoutError:
         run.status = "timeout"
         run.error = f"Timed out after {timeout}s"
         run.completed_at = time.time()
@@ -1699,7 +1700,7 @@ async def _run_chat_background(
             run, {"type": "error", "content": "Chat run was cancelled."}
         )
     except Exception as e:
-        logger.error(f"Chat run error for {chat_id}: {e}", exc_info=True)
+        logger.exception(f"Chat run error for {chat_id}")
         # Persist to history so a disconnected user sees why the run stopped
         try:
             await db.add_message(
@@ -1758,7 +1759,7 @@ async def _read_run_events(run: ChatRun):
                     break
                 try:
                     await asyncio.wait_for(run.condition.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
 
         # Yield any buffered events from cursor onward
@@ -1953,17 +1954,17 @@ def _created_at_to_ms(s: str | None) -> int | None:
     """Parse stored UTC timestamps into a Unix ms timestamp."""
     if not s:
         return None
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return int(dt.timestamp() * 1000)
     except Exception:
         pass
     try:
-        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
         return int(dt.timestamp() * 1000)
     except Exception:
         return None

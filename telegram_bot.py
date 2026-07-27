@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Callable, Awaitable
 
 import httpx
 
 from baal_agent.database import AgentDatabase
-from baal_agent.image_utils import is_image, build_image_content_blocks
+from baal_agent.image_utils import build_image_content_blocks, is_image
 
 logger = logging.getLogger(__name__)
 
@@ -352,7 +352,7 @@ class TelegramBot:
             elif not file_events:
                 await self._send_message(chat_id, "(No response generated)")
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 f"Agent turn timed out for {tg_chat_id} after {AGENT_TURN_TIMEOUT}s"
             )
@@ -360,8 +360,8 @@ class TelegramBot:
                 chat_id,
                 "Sorry, the response took too long. Please try again.",
             )
-        except Exception as e:
-            logger.error(f"Agent turn error for {tg_chat_id}: {e}", exc_info=True)
+        except Exception:
+            logger.exception(f"Agent turn error for {tg_chat_id}")
             await self._send_message(
                 chat_id,
                 "Sorry, an error occurred processing your message.",
@@ -617,5 +617,5 @@ class TelegramBot:
                         self._chat_locks.pop(tg_chat_id, None)
                         self._chat_queue_depth.pop(tg_chat_id, None)
 
-        except Exception as e:
-            logger.error(f"Telegram update handling error: {e}", exc_info=True)
+        except Exception:
+            logger.exception("Telegram update handling error")

@@ -50,7 +50,7 @@ class CheckpointManager:
             return out, err, code
         except FileNotFoundError:
             return "", "git is not installed", 127
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return "", "git command timed out", -1
 
     async def init(self) -> None:
@@ -59,7 +59,7 @@ class CheckpointManager:
             return
 
         # Check if git is available
-        out, err, code = await self._run("--version", check=False)
+        _out, err, code = await self._run("--version", check=False)
         if code != 0:
             logger.warning("git not available for checkpoints: %s", err)
             return
@@ -71,7 +71,7 @@ class CheckpointManager:
 
             # Create .gitignore for sensitive/transient files
             gitignore_path = os.path.join(self.workspace, ".baal-history-gitignore")
-            with open(gitignore_path, "w") as f:
+            with open(gitignore_path, "w") as f:  # noqa: ASYNC230 - small workspace files; see follow-up
                 # `.git` and `.git/` exclude any nested user git repo so we don't
                 # snapshot its internal state and later trample it on `restore`.
                 f.write(
@@ -98,7 +98,7 @@ class CheckpointManager:
         if code == 0:
             return "no changes"
 
-        out, err, code = await self._run("commit", "-m", message)
+        _out, err, code = await self._run("commit", "-m", message)
         if code != 0:
             return f"error: {err}"
 
@@ -110,7 +110,7 @@ class CheckpointManager:
         """List recent checkpoints. Returns [{id, message, timestamp}]."""
         await self.init()
 
-        out, err, code = await self._run(
+        out, _err, code = await self._run(
             "log", "--pretty=format:%h\t%s\t%ci", f"-n{limit}",
             check=False,
         )
@@ -158,7 +158,7 @@ class CheckpointManager:
         await self.init()
 
         # Validate the checkpoint ID exists
-        _, err, code = await self._run("cat-file", "-t", checkpoint_id, check=False)
+        _, _err, code = await self._run("cat-file", "-t", checkpoint_id, check=False)
         if code != 0:
             return f"error: checkpoint '{checkpoint_id}' not found"
 
