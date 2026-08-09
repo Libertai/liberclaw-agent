@@ -9,6 +9,32 @@ import aiosqlite
 
 from baal_agent.image_utils import extract_text_from_content
 
+# Content-part kinds the chat API accepts, mapped to the key each one must
+# carry. Anything else in a list makes the whole payload invalid, so a JSON
+# array that isn't exclusively these blocks must stay the text it was stored as.
+_CONTENT_PART_KEYS = {"text": "text", "image_url": "image_url"}
+
+
+def _is_content_part(part: object) -> bool:
+    if not isinstance(part, dict):
+        return False
+    required = _CONTENT_PART_KEYS.get(part.get("type"))
+    return required is not None and required in part
+
+
+def _is_content_parts(value: object) -> bool:
+    """Whether a decoded JSON value is a multimodal content-part list.
+
+    Tool results are frequently JSON arrays (API listings, search hits). They
+    decode to a list too, so `isinstance(x, list)` alone is not enough to tell
+    them apart from content parts.
+    """
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(_is_content_part(part) for part in value)
+    )
+
 
 class AgentDatabase:
     """Async SQLite wrapper for per-agent conversation history."""
@@ -411,7 +437,7 @@ class AgentDatabase:
                 # Deserialize multimodal content stored as JSON list
                 try:
                     parsed = json.loads(content)
-                    if isinstance(parsed, list):
+                    if _is_content_parts(parsed):
                         content = parsed
                 except (json.JSONDecodeError, TypeError):
                     pass
