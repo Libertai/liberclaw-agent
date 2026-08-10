@@ -2307,7 +2307,11 @@ async def info():
         "runtime_health": {
             "database": "configured" if db is not None else "unavailable",
             "workspace": "configured" if settings.workspace_path else "unavailable",
-            "mcp": "configured" if settings.mcp_servers.strip() else "disabled",
+            "mcp": (
+                "configured"
+                if resolve_mcp_servers_json(settings).strip()
+                else "disabled"
+            ),
             "mcp_detail": mcp_health,
             "heartbeat": "enabled" if settings.heartbeat_interval > 0 else "disabled",
         },

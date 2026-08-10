@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: pytest
@@ -19,6 +26,6 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install pydantic-settings fastapi uvicorn openai httpx aiosqlite python-multipart Pillow pytest pytest-asyncio pytest-timeout
+          pip install pydantic-settings openai httpx aiosqlite Pillow pytest pytest-asyncio pytest-timeout
       - name: Test
         run: PYTHONPATH=$GITHUB_WORKSPACE pytest baal_agent/tests -q --timeout=60
