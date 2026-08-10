@@ -382,6 +382,27 @@ async def shutdown_code_executor() -> None:
         _code_executor = None
 
 
+def resolve_mcp_servers_json(settings) -> str:
+    """Return the MCP server JSON, preferring the base64 form.
+
+    systemd's EnvironmentFile parser decodes backslash escapes in bare values,
+    so the plain MCP_SERVERS var is only trustworthy for pure-ASCII configs
+    with no quotes or backslashes. An undecodable base64 value falls back to
+    the plain one rather than dropping every server.
+    """
+    encoded = (getattr(settings, "mcp_servers_b64", "") or "").strip()
+    if encoded:
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except Exception:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "MCP_SERVERS_B64 is not valid base64; using MCP_SERVERS"
+            )
+    return settings.mcp_servers
+
+
 async def start_mcp(mcp_servers_json: str) -> None:
     """Parse MCP server config and connect to all configured servers."""
     global _mcp_client

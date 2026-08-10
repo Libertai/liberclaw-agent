@@ -41,6 +41,7 @@ class AgentSettings(BaseSettings):
     telegram_bot_token: str = ""  # Empty = Telegram disabled
     owner_telegram_id: str = ""  # Auto-allowed in contact list
     mcp_servers: str = ""  # JSON: [{"name": "...", "transport": "stdio", "command": "...", "args": [...], "env": {...}}]
+    mcp_servers_b64: str = ""  # base64 of the mcp_servers JSON; preferred over mcp_servers
     local_ui_enabled: bool = True
     local_ui_cors_origins: str = "*"  # comma-separated
     local_ui_dist_path: str = ""  # empty = <package>/webui/dist

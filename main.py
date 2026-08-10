@@ -58,6 +58,7 @@ from baal_agent.tools import (
     get_mcp_health,
     get_tool_definitions,
     get_unavailable_tools,
+    resolve_mcp_servers_json,
     run_tool_calls_ordered,
     shutdown_browser,
     shutdown_code_executor,
@@ -538,7 +539,7 @@ async def lifespan(app: FastAPI):
     )
     await start_shell()
     await start_code_executor()
-    await start_mcp(settings.mcp_servers)
+    await start_mcp(resolve_mcp_servers_json(settings))
 
     # Ensure workspace directories exist
     workspace = Path(settings.workspace_path)
