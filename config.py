@@ -1,3 +1,7 @@
+import base64
+import logging
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -8,6 +12,7 @@ class AgentSettings(BaseSettings):
 
     agent_name: str = "Agent"
     system_prompt: str = "You are a helpful assistant."
+    system_prompt_b64: str = ""
     model: str = "claw-large"
     vision_delegation_model: str = (
         "claw-flash"  # model used to describe images for non-vision agents
@@ -61,3 +66,23 @@ class AgentSettings(BaseSettings):
     runtime_event_retention_days: int = (
         30  # rolling window for runtime_events; 0 disables pruning
     )
+
+    @model_validator(mode="after")
+    def _prefer_b64_system_prompt(self):
+        """Take the prompt from SYSTEM_PROMPT_B64 when the deployer sent one.
+
+        systemd's EnvironmentFile parser keeps the backslash on \\n/\\r/\\t, so a
+        multi-paragraph prompt cannot survive the plain variable. Base64 has no
+        character systemd treats specially.
+        """
+        encoded = self.system_prompt_b64.strip()
+        if encoded:
+            try:
+                self.system_prompt = base64.b64decode(
+                    encoded, validate=True
+                ).decode("utf-8")
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "SYSTEM_PROMPT_B64 is not valid base64; using SYSTEM_PROMPT"
+                )
+        return self

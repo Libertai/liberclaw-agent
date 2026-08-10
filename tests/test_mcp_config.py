@@ -26,6 +26,10 @@ def _b64(obj):
     return base64.b64encode(json.dumps(obj).encode()).decode()
 
 
+def _b64_text(text):
+    return base64.b64encode(text.encode()).decode()
+
+
 def test_prefers_b64_and_round_trips_exactly():
     settings = _Settings(mcp_servers_b64=_b64(SERVERS))
     assert json.loads(resolve_mcp_servers_json(settings)) == SERVERS
@@ -48,3 +52,35 @@ def test_empty_when_neither_set():
 def test_undecodable_b64_falls_back_rather_than_crashing():
     settings = _Settings(mcp_servers='[{"name":"plain"}]', mcp_servers_b64="!!!not-base64!!!")
     assert json.loads(resolve_mcp_servers_json(settings))[0]["name"] == "plain"
+
+
+def test_system_prompt_b64_is_decoded_into_settings(monkeypatch):
+    """A multi-paragraph prompt must arrive with real newlines."""
+    from baal_agent.config import AgentSettings
+
+    prompt = "Line one.\nLine two.\n\nFinal paragraph."
+    monkeypatch.setenv("LIBERTAI_API_KEY", "k")
+    monkeypatch.setenv("AGENT_SECRET_HASH", "h")
+    monkeypatch.setenv("SYSTEM_PROMPT", "ignored")
+    monkeypatch.setenv("SYSTEM_PROMPT_B64", _b64_text(prompt))
+    assert AgentSettings().system_prompt == prompt
+
+
+def test_plain_system_prompt_used_when_b64_absent(monkeypatch):
+    from baal_agent.config import AgentSettings
+
+    monkeypatch.setenv("LIBERTAI_API_KEY", "k")
+    monkeypatch.setenv("AGENT_SECRET_HASH", "h")
+    monkeypatch.setenv("SYSTEM_PROMPT", "be helpful")
+    monkeypatch.delenv("SYSTEM_PROMPT_B64", raising=False)
+    assert AgentSettings().system_prompt == "be helpful"
+
+
+def test_undecodable_system_prompt_b64_keeps_plain(monkeypatch):
+    from baal_agent.config import AgentSettings
+
+    monkeypatch.setenv("LIBERTAI_API_KEY", "k")
+    monkeypatch.setenv("AGENT_SECRET_HASH", "h")
+    monkeypatch.setenv("SYSTEM_PROMPT", "fallback text")
+    monkeypatch.setenv("SYSTEM_PROMPT_B64", "!!!not-base64!!!")
+    assert AgentSettings().system_prompt == "fallback text"
