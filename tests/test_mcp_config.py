@@ -57,6 +57,18 @@ def test_undecodable_b64_falls_back_rather_than_crashing():
     assert json.loads(resolve_mcp_servers_json(settings))[0]["name"] == "plain"
 
 
+def test_mcp_servers_b64_wins_on_real_settings(monkeypatch):
+    """Exercises the real AgentSettings.mcp_servers_b64 field, not a duck-typed stand-in."""
+    from baal_agent.config import AgentSettings
+
+    monkeypatch.setenv("LIBERTAI_API_KEY", "k")
+    monkeypatch.setenv("AGENT_SECRET_HASH", "h")
+    monkeypatch.setenv("MCP_SERVERS", '[{"name":"stale"}]')
+    monkeypatch.setenv("MCP_SERVERS_B64", _b64(SERVERS))
+    settings = AgentSettings()
+    assert json.loads(resolve_mcp_servers_json(settings)) == SERVERS
+
+
 def test_system_prompt_b64_is_decoded_into_settings(monkeypatch):
     """A multi-paragraph prompt must arrive with real newlines."""
     from baal_agent.config import AgentSettings
