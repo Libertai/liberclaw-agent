@@ -1,13 +1,16 @@
 """MCP server config decoding.
 
 The deployer writes MCP_SERVERS_B64 because systemd's EnvironmentFile parser
-decodes backslash escapes in bare values and would mutate raw JSON.
+drops the backslash on bare-value escapes (\\u00e9 becomes u00e9) and would
+mutate raw JSON.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+
+import pytest
 
 from baal_agent.tools import resolve_mcp_servers_json
 
@@ -66,21 +69,30 @@ def test_system_prompt_b64_is_decoded_into_settings(monkeypatch):
     assert AgentSettings().system_prompt == prompt
 
 
-def test_plain_system_prompt_used_when_b64_absent(monkeypatch):
+@pytest.mark.parametrize("absent", ["unset", "empty"])
+def test_plain_system_prompt_used_when_b64_absent(monkeypatch, absent):
     from baal_agent.config import AgentSettings
 
     monkeypatch.setenv("LIBERTAI_API_KEY", "k")
     monkeypatch.setenv("AGENT_SECRET_HASH", "h")
     monkeypatch.setenv("SYSTEM_PROMPT", "be helpful")
-    monkeypatch.delenv("SYSTEM_PROMPT_B64", raising=False)
+    if absent == "unset":
+        monkeypatch.delenv("SYSTEM_PROMPT_B64", raising=False)
+    else:
+        monkeypatch.setenv("SYSTEM_PROMPT_B64", "")
     assert AgentSettings().system_prompt == "be helpful"
 
 
-def test_undecodable_system_prompt_b64_keeps_plain(monkeypatch):
+def test_undecodable_system_prompt_b64_keeps_plain(monkeypatch, caplog):
+    import logging
+
     from baal_agent.config import AgentSettings
 
     monkeypatch.setenv("LIBERTAI_API_KEY", "k")
     monkeypatch.setenv("AGENT_SECRET_HASH", "h")
     monkeypatch.setenv("SYSTEM_PROMPT", "fallback text")
     monkeypatch.setenv("SYSTEM_PROMPT_B64", "!!!not-base64!!!")
-    assert AgentSettings().system_prompt == "fallback text"
+    with caplog.at_level(logging.WARNING):
+        settings = AgentSettings()
+    assert settings.system_prompt == "fallback text"
+    assert "not valid base64" in caplog.text
