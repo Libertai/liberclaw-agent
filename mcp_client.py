@@ -139,7 +139,14 @@ class MCPClient:
 
         try:
             import os
-            _sensitive = {"AGENT_SECRET_HASH", "LIBERTAI_API_KEY", "TELEGRAM_BOT_TOKEN", "OWNER_TELEGRAM_ID"}
+            _sensitive = {
+                "AGENT_SECRET_HASH",
+                "LIBERTAI_API_KEY",
+                "TELEGRAM_BOT_TOKEN",
+                "OWNER_TELEGRAM_ID",
+                "MCP_SERVERS",
+                "MCP_SERVERS_B64",
+            }
             proc_env = {k: v for k, v in os.environ.items() if k not in _sensitive}
             proc_env.update(env or {})
 
