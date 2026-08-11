@@ -150,7 +150,7 @@ class HttpTransport(Transport):
                 await self._client.delete(
                     self._url, headers=self._headers("delete")
                 )
-            except Exception:
+            except (httpx.HTTPError, ValueError):
                 pass
         await self._client.aclose()
         self._client = None
