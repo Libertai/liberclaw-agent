@@ -7,12 +7,14 @@ readline() until the request timeout.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
 import pytest
 
 from baal_agent.mcp_client import MCPClient
+from baal_agent.mcp_stdio import StdioTransport
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "fake_mcp_server.py")
 
@@ -198,3 +200,69 @@ async def test_tool_metadata_is_bounded(monkeypatch):
     assert "mcp_probe_ok" in registered
     assert len(registered["mcp_probe_ok"].description) <= 1024 + len("[MCP: probe] ")
     assert not any("bad name" in k for k in registered)
+
+
+_ENV_ECHO_SCRIPT = (
+    "import sys, json, os\n"
+    "for line in sys.stdin:\n"
+    "    req = json.loads(line)\n"
+    "    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': dict(os.environ)}))\n"
+    "    sys.stdout.flush()\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_sensitive_env_vars_excluded_but_per_server_env_can_reset_one(monkeypatch):
+    monkeypatch.setenv("LIBERTAI_API_KEY", "should-not-leak")
+    monkeypatch.setenv("AGENT_SECRET_HASH", "should-not-leak")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "should-not-leak")
+    monkeypatch.setenv("OWNER_TELEGRAM_ID", "should-not-leak")
+    monkeypatch.setenv("MCP_SERVERS", "should-not-leak")
+    monkeypatch.setenv("MCP_SERVERS_B64", "should-not-leak")
+
+    t = StdioTransport(
+        sys.executable, ["-u", "-c", _ENV_ECHO_SCRIPT],
+        env={"LIBERTAI_API_KEY": "explicitly-configured"},
+    )
+    await t.open()
+    try:
+        result = await t.send_request("probe", {}, timeout=5.0)
+        assert "AGENT_SECRET_HASH" not in result
+        assert "TELEGRAM_BOT_TOKEN" not in result
+        assert "OWNER_TELEGRAM_ID" not in result
+        assert "MCP_SERVERS" not in result
+        assert "MCP_SERVERS_B64" not in result
+        # A per-server `env` entry can still re-add a withheld name.
+        assert result["LIBERTAI_API_KEY"] == "explicitly-configured"
+    finally:
+        await t.close()
+
+
+@pytest.mark.asyncio
+async def test_close_cancels_a_hung_reader_task():
+    """The reader loop blocks on stdout.readline() forever if the process
+    never closes its pipes; close() must cancel it rather than leave it
+    running past teardown."""
+    t = StdioTransport("unused", [])
+
+    class HangingStdout:
+        async def readline(self):
+            await asyncio.Event().wait()  # never resolves except via cancellation
+
+    class FakeProcess:
+        stdin = None
+        stdout = HangingStdout()
+        returncode = None
+
+        def terminate(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    t._process = FakeProcess()
+    t._reader_task = asyncio.create_task(t._reader())
+    await asyncio.sleep(0)  # let the reader task start awaiting readline()
+
+    await asyncio.wait_for(t.close(), timeout=2.0)
+    assert t._reader_task.done()

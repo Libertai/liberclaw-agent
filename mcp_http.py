@@ -90,15 +90,10 @@ class HttpTransport(Transport):
         self._recovering_task: asyncio.Task | None = None
 
     async def open(self) -> None:
-        client = httpx.AsyncClient(
+        self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0),
             follow_redirects=False,
         )
-        try:
-            self._client = client
-        except Exception:
-            await client.aclose()
-            raise
 
     def _headers(self, method: str) -> httpx.Headers:
         # httpx.Headers merges case-insensitively, so a user-supplied
@@ -195,7 +190,10 @@ class HttpTransport(Transport):
                 try:
                     await response.aread()
                     data = response.json()
-                except (httpx.HTTPError, json.JSONDecodeError) as e:
+                except httpx.HTTPError as e:
+                    self._healthy = False
+                    raise MCPError(f"request '{method}' failed to read response: {e}") from e
+                except json.JSONDecodeError as e:
                     raise MCPError(f"request '{method}' failed to read response: {e}") from e
             else:
                 raise MCPError(
@@ -259,6 +257,7 @@ class HttpTransport(Transport):
                 )
             raise MCPError(f"request '{method}' timed out") from None
         except httpx.HTTPError as e:
+            self._healthy = False
             raise MCPError(f"SSE stream for '{method}' failed: {e}") from e
 
         raise MCPError(f"SSE stream for '{method}' ended without a matching response")
@@ -282,6 +281,8 @@ class HttpTransport(Transport):
                     "message": f"Method not found: {msg.get('method')}",
                 },
             }
+        if self._client is None:
+            return
         try:
             await self._client.post(
                 self._url, json=reply, headers=self._headers("notification")
@@ -296,7 +297,8 @@ class HttpTransport(Transport):
         and closes it, since an SSE body must be consumed incrementally
         rather than buffered whole.
         """
-        assert self._client is not None
+        if self._client is None:
+            raise MCPError(f"request '{method}' failed: transport is closed")
         url = self._url
         for _ in range(_MAX_REDIRECTS + 1):
             request = self._client.build_request(

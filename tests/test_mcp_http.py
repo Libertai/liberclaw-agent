@@ -66,6 +66,9 @@ async def test_protocol_version_absent_on_initialize_present_after():
         return json_rpc_result(request, {"protocolVersion": "2025-06-18"})
 
     t = transport_with(handler)
+    # A stale value from a prior session: without the "initialize" exclusion
+    # this would leak onto the initialize request too.
+    t._protocol_version = "2024-11-05"
     await t.send_request("initialize", {}, 5.0)
     await t.send_request("tools/list", {}, 5.0)
     assert "mcp-protocol-version" not in seen[0]
@@ -84,6 +87,9 @@ async def test_session_id_captured_and_echoed():
         )
 
     t = transport_with(handler)
+    # A stale value from a prior session: without the "initialize" exclusion
+    # this would leak onto the initialize request too.
+    t._session_id = "STALE"
     await t.send_request("initialize", {}, 5.0)
     await t.send_request("tools/list", {}, 5.0)
     assert "mcp-session-id" not in seen[0]
@@ -183,15 +189,27 @@ async def test_sse_ignores_comments_and_other_fields():
 
 
 @pytest.mark.asyncio
-async def test_sse_joins_multiline_data_into_one_document():
+async def test_sse_joins_multiline_data_into_one_document(monkeypatch):
+    # Any split point that keeps the reconstructed text valid JSON parses to
+    # the same value whether the lines are joined with "\n" or "" (JSON
+    # whitespace is insignificant between tokens) -- so the join character
+    # itself has to be observed directly, not inferred from the parsed value.
+    from baal_agent import mcp_http as mcp_http_module
+
+    captured = []
+
+    def fake_loads(text):
+        captured.append(text)
+        return {"jsonrpc": "2.0", "id": 1, "result": {"v": 3}}
+
+    monkeypatch.setattr(mcp_http_module.json, "loads", fake_loads)
+
     def handler(request):
-        body = json.loads(request.content.decode())
-        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 3}})
-        half = len(payload) // 2
-        return sse(f"data: {payload[:half]}\ndata: {payload[half:]}\n\n")
+        return sse("data: line-one\ndata: line-two\n\n")
 
     t = transport_with(handler)
     assert await t.send_request("tools/list", {}, 5.0) == {"v": 3}
+    assert captured[-1] == "line-one\nline-two"
     await t.close()
 
 
@@ -330,6 +348,10 @@ async def test_sse_stream_read_error_raises_mcp_error():
     with pytest.raises(MCPError):
         await t.send_request("tools/list", {}, 5.0)
     assert holder["response"].is_closed
+    # A connection that dies mid-stream must be reported dead: the reconnect
+    # predicate elsewhere reads `connected`, and a server whose responses
+    # reset mid-body would otherwise still look healthy.
+    assert not t.connected
     await t.close()
 
 
@@ -626,6 +648,7 @@ async def test_json_response_read_failure_raises_mcp_error():
     with pytest.raises(MCPError):
         await t.send_request("tools/list", {}, 5.0)
     assert holder["response"].is_closed
+    assert not t.connected
     await t.close()
 
 
@@ -637,6 +660,10 @@ async def test_json_response_malformed_body_raises_mcp_error():
     t = transport_with(handler)
     with pytest.raises(MCPError):
         await t.send_request("tools/list", {}, 5.0)
+    # The bytes arrived fine; only their content was malformed. A truncated
+    # response counts as a transport failure (test above), a badly-formed
+    # one that arrived complete does not.
+    assert t.connected
     await t.close()
 
 
@@ -699,3 +726,108 @@ async def test_health_reports_http_transport_and_error():
     assert server["transport"] == "http"
     assert server["connected"] is False
     assert server["error"]
+
+
+@pytest.mark.asyncio
+async def test_post_with_no_client_raises_mcp_error():
+    # StdioTransport raises MCPError for the equivalent condition ("has no
+    # active stdin"); the two transports must answer the same question the
+    # same way, not one with MCPError and the other with AssertionError.
+    t = HttpTransport(URL)
+    with pytest.raises(MCPError):
+        await t._post("tools/list", {"jsonrpc": "2.0"}, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_recovery_with_client_torn_down_raises_mcp_error():
+    # A maintenance _disconnect_server landing while a turn is inside
+    # _recover_session clears self._client from under the retry. It must
+    # raise MCPError, not AssertionError (or AttributeError under -O).
+    def handler(request):
+        body = json.loads(request.content.decode())
+        if body.get("method") == "tools/list":
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(
+            request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+        )
+
+    t = transport_with(handler)
+    t._session_id = "S1"
+
+    async def hook():
+        await t.send_request("initialize", {}, 5.0)
+        await t._client.aclose()
+        t._client = None
+
+    t.set_reinit_hook(hook)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_interleaved_reply_with_no_client_is_a_noop():
+    # Same condition reached through _reply_to_interleaved_request, which
+    # _consume_sse only shields against TimeoutError and httpx.HTTPError --
+    # an AttributeError from a bare self._client.post would otherwise escape.
+    t = HttpTransport(URL)
+    assert t._client is None
+    await t._reply_to_interleaved_request({"id": "p1", "method": "ping"})
+
+
+@pytest.mark.asyncio
+async def test_close_closes_the_httpx_client():
+    def handler(request):
+        return json_rpc_result(request, {})
+
+    t = transport_with(handler)
+    client = t._client
+    await t.close()
+    assert client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_mcp_client_recovers_from_404_without_installing_a_hook(monkeypatch):
+    # MCPClient wires set_reinit_hook itself in _connect_transport; this test
+    # never calls it, so a mutation that unplugs that wiring must fail here.
+    from baal_agent import mcp_http as mcp_http_module
+    from baal_agent.mcp_client import MCPClient
+
+    calls = []
+    tools_list_calls = {"n": 0}
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        calls.append(method)
+        if method == "initialize":
+            session_id = f"S{calls.count('initialize')}"
+            return json_rpc_result(
+                request,
+                {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}},
+                headers={"Mcp-Session-Id": session_id},
+            )
+        if method == "tools/list":
+            tools_list_calls["n"] += 1
+            # The second tools/list call (the first happens during connect())
+            # hits the expired session; recovery must re-initialise and retry.
+            if tools_list_calls["n"] == 2:
+                return httpx.Response(404, text="session expired")
+            return json_rpc_result(request, {"tools": []})
+        return httpx.Response(202)
+
+    async def fake_open(self):
+        self._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_http_module.HttpTransport, "open", fake_open)
+
+    client = MCPClient()
+    await client.connect("api", {"transport": "http", "url": URL})
+    try:
+        conn = client.registry.servers["api"]
+        assert conn.transport._session_id == "S1"
+
+        result = await conn.transport.send_request("tools/list", {}, 5.0)
+        assert result == {"tools": []}
+        assert conn.transport._session_id == "S2"
+    finally:
+        await client.disconnect_all()

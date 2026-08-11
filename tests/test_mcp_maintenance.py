@@ -76,19 +76,31 @@ async def test_refresh_keeps_tools_when_listing_fails():
 
 @pytest.mark.asyncio
 async def test_overlapping_maintain_does_not_double_run():
+    """The lock alone still serialises an overlapping tick behind the one in
+    flight -- it just makes the second tick wait, then run for real, seeing
+    whatever state the first tick left behind (e.g. already connected,
+    already backed off). That's not the guard; it's incidental and hides a
+    removed guard. So the body maintain() calls is patched directly, with
+    nothing else -- like backoff or a connected check -- that could mask a
+    second call: only the `_maintaining` checks can suppress it.
+    """
     import asyncio
 
     client = MCPClient(now=Clock())
-    running = []
+    calls = []
 
-    async def slow_connect(name, config):
-        running.append(1)
+    async def slow_reconnect():
+        calls.append(1)
         await asyncio.sleep(0.05)
 
-    client.connect = slow_connect
-    client._configured["srv"] = {"transport": "http", "url": "https://x/mcp"}
+    async def noop_refresh():
+        pass
+
+    client._reconnect_unreachable = slow_reconnect
+    client._refresh_stale_tools = noop_refresh
+
     await asyncio.gather(client.maintain(), client.maintain())
-    assert len(running) == 1
+    assert len(calls) == 1
 
 
 @pytest.mark.asyncio
