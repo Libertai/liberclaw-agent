@@ -9,6 +9,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
+from baal_agent.mcp_http import HttpTransport
 from baal_agent.mcp_registry import ToolRegistry
 from baal_agent.mcp_stdio import StdioTransport
 from baal_agent.mcp_transport import MCPError, Transport
@@ -127,9 +128,7 @@ class MCPClient:
         if transport == "stdio":
             await self._connect_stdio(name, config)
         elif transport == "http":
-            message = "HTTP transport not yet implemented"
-            self._errors[name] = message
-            logger.warning(f"MCP HTTP transport not yet implemented for server '{name}'")
+            await self._connect_http(name, config)
         else:
             self._errors[name] = f"unknown transport '{transport}'"
             logger.error(f"Unknown MCP transport '{transport}' for server '{name}'")
@@ -145,14 +144,34 @@ class MCPClient:
             logger.error(f"MCP server '{name}' missing 'command' in config")
             return
 
-        transport = StdioTransport(command, args, env)
+        await self._connect_transport(
+            name, "stdio", StdioTransport(command, args, env)
+        )
 
+    async def _connect_http(self, name: str, config: dict) -> None:
+        """Connect to an MCP server via Streamable HTTP."""
+        url = config.get("url")
+
+        if not url:
+            self._errors[name] = "missing url"
+            logger.error(f"MCP server '{name}' missing 'url' in config")
+            return
+
+        await self._connect_transport(
+            name, "http", HttpTransport(url, config.get("headers"))
+        )
+
+    async def _connect_transport(
+        self, name: str, kind: str, transport: Transport
+    ) -> None:
+        """Handshake shared by every transport: initialize, capability check,
+        paginated tools/list. Transport-specific setup lives in the caller."""
         try:
             await transport.open()
 
             conn = MCPServerConnection(
                 name=name,
-                transport_kind="stdio",
+                transport_kind=kind,
                 transport=transport,
             )
             # Register before initialize so a failure below still lets
@@ -202,7 +221,10 @@ class MCPClient:
                     return
                 tools.update(self._tools_from_list_result(name, tools_result))
                 cursor = tools_result.get("nextCursor")
-                if not cursor:
+                # Stop paginating once the cap is already met — a server that
+                # never stops advertising a cursor would otherwise force up
+                # to _MAX_TOOLS_LIST_PAGES round-trips before truncation.
+                if not cursor or len(tools) >= _MAX_TOOLS_PER_SERVER:
                     break
 
             if len(tools) > _MAX_TOOLS_PER_SERVER:
