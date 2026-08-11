@@ -13,6 +13,14 @@ class ToolRegistry:
         return self._servers
 
     def register(self, conn, tools: dict) -> None:
+        prior = self._servers.get(conn.name)
+        if prior is not None:
+            # A same-named conn already held a slot (reconnect). Drop only
+            # the tools it no longer offers — a key kept by both stays in
+            # its slot, since dict.update() below won't move it.
+            for key in list(getattr(prior, "tools", {})):
+                if key not in tools:
+                    self._tools.pop(key, None)
         self._servers[conn.name] = conn
         conn.tools = dict(tools)  # replace_tools and remove both read this back
         self._tools.update(tools)
@@ -30,9 +38,6 @@ class ToolRegistry:
         """
         if self._servers.get(conn.name) is not conn:
             return False
-        old_keys = [k for k in self._tools if k in conn.tools]
-        if old_keys and list(tools) == old_keys:
-            return True  # unchanged: leave ordering untouched
         rebuilt = {}
         replaced = False
         for key, value in self._tools.items():
