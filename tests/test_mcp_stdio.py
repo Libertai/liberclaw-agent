@@ -91,5 +91,6 @@ async def test_disconnect_stops_the_subprocess():
     client = MCPClient()
     await client.connect("probe", stdio_config())
     conn = client._servers["probe"]
+    process = conn.transport._process
     await client.disconnect_all()
-    assert conn.process.returncode is not None
+    assert process.returncode is not None

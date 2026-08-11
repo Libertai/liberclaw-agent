@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import itertools
 import json
 import logging
 import time
 from dataclasses import dataclass, field
+
+from baal_agent.mcp_stdio import StdioTransport
+from baal_agent.mcp_transport import MCPError, Transport
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +45,10 @@ class MCPServerConnection:
     """An active connection to an MCP server."""
 
     name: str
-    transport: str  # "stdio" or "http"
-    process: asyncio.subprocess.Process | None = None
+    transport_kind: str  # "stdio" | "http", for health reporting
+    transport: Transport
     tools: dict[str, MCPToolInfo] = field(default_factory=dict)
-    _read_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    _pending: dict[int, asyncio.Future] = field(default_factory=dict)
-    _reader_task: asyncio.Task | None = None
-    url: str | None = None  # for http transport
-    error: str | None = None
+    tools_listed_at: float = 0.0
 
 
 class MCPClient:
@@ -62,16 +59,9 @@ class MCPClient:
         self._tools: dict[str, MCPToolInfo] = {}  # namespaced_name -> info
         self._configured: dict[str, str] = {}  # server name -> transport
         self._errors: dict[str, str] = {}
-        # Per-instance request id counter. Was a module-global before, which
-        # caused id collisions if two MCPClient instances coexisted (mostly an
-        # issue in tests, but conceptually wrong).
-        self._id_counter = itertools.count(1)
         # Circuit breaker state per server.
         self._failure_counts: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}
-
-    def _next_request_id(self) -> int:
-        return next(self._id_counter)
 
     def _circuit_state(self, server_name: str) -> tuple[bool, float]:
         """Return (open, seconds_remaining) for a server."""
@@ -137,193 +127,59 @@ class MCPClient:
             logger.error(f"MCP server '{name}' missing 'command' in config")
             return
 
-        try:
-            import os
-            _sensitive = {
-                "AGENT_SECRET_HASH",
-                "LIBERTAI_API_KEY",
-                "TELEGRAM_BOT_TOKEN",
-                "OWNER_TELEGRAM_ID",
-                "MCP_SERVERS",
-                "MCP_SERVERS_B64",
-            }
-            proc_env = {k: v for k, v in os.environ.items() if k not in _sensitive}
-            proc_env.update(env or {})
+        transport = StdioTransport(command, args, env)
 
-            process = await asyncio.create_subprocess_exec(
-                command, *args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-            )
+        try:
+            await transport.open()
 
             conn = MCPServerConnection(
                 name=name,
-                transport="stdio",
-                process=process,
+                transport_kind="stdio",
+                transport=transport,
             )
             self._servers[name] = conn
 
-            # Start background reader for responses
-            conn._reader_task = asyncio.create_task(
-                self._stdio_reader(conn),
-                name=f"mcp-reader-{name}",
-            )
-
             # Initialize the server
-            init_result = await self._send_request(conn, "initialize", {
+            await transport.send_request("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "baal-agent", "version": "1.0.0"},
             })
 
-            if init_result is None:
-                self._errors[name] = "initialization failed"
-                logger.error(f"MCP server '{name}' initialization failed")
-                await self._disconnect_server(name)
-                return
-
             # Send initialized notification (no response expected)
-            await self._send_notification(conn, "notifications/initialized", {})
-
-            # Discover tools
-            tools_result = await self._send_request(conn, "tools/list", {})
-            if tools_result is None:
-                logger.warning(f"MCP server '{name}' tools/list returned nothing")
-                return
-
-            tools_list = tools_result.get("tools", [])
-            for tool_def in tools_list:
-                tool_name = tool_def.get("name", "")
-                namespaced = f"mcp_{name}_{tool_name}"
-                info = MCPToolInfo(
-                    server_name=name,
-                    original_name=tool_name,
-                    namespaced_name=namespaced,
-                    description=tool_def.get("description", ""),
-                    input_schema=tool_def.get("inputSchema", {}),
-                )
-                conn.tools[namespaced] = info
-                self._tools[namespaced] = info
-
-            logger.info(
-                f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
-            )
-            self._errors.pop(name, None)
-
-        except FileNotFoundError:
-            self._errors[name] = f"command '{command}' not found"
-            logger.error(f"MCP server '{name}': command '{command}' not found")
-        except Exception as e:
+            await transport.send_notification("notifications/initialized", {})
+        except MCPError as e:
             self._errors[name] = str(e)
             logger.error(f"MCP server '{name}' connection failed: {e}")
             await self._disconnect_server(name)
-
-    async def _stdio_reader(self, conn: MCPServerConnection) -> None:
-        """Background task that reads JSON-RPC responses from stdout."""
-        assert conn.process and conn.process.stdout
-        try:
-            while True:
-                line = await conn.process.stdout.readline()
-                if not line:
-                    # Process closed stdout
-                    logger.warning(f"MCP server '{conn.name}' closed stdout")
-                    break
-
-                line_str = line.decode("utf-8", errors="replace").strip()
-                if not line_str:
-                    continue
-
-                try:
-                    msg = json.loads(line_str)
-                except json.JSONDecodeError:
-                    continue
-
-                msg_id = msg.get("id")
-                if msg_id is not None and msg_id in conn._pending:
-                    future = conn._pending.pop(msg_id)
-                    if not future.done():
-                        if "error" in msg:
-                            future.set_exception(
-                                MCPError(msg["error"].get("message", "unknown error"))
-                            )
-                        else:
-                            future.set_result(msg.get("result"))
-                # Notifications and other messages are ignored for now
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"MCP reader for '{conn.name}' crashed: {e}")
-        finally:
-            # Resolve any pending futures with errors
-            for future in conn._pending.values():
-                if not future.done():
-                    future.set_exception(
-                        MCPError(f"Server '{conn.name}' disconnected")
-                    )
-            conn._pending.clear()
-
-    async def _send_request(
-        self, conn: MCPServerConnection, method: str, params: dict,
-        timeout: float = 30.0,
-    ) -> dict | None:
-        """Send a JSON-RPC request and wait for the response."""
-        if not conn.process or not conn.process.stdin:
-            return None
-
-        req_id = self._next_request_id()
-        msg = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": req_id,
-        }
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        conn._pending[req_id] = future
-
-        try:
-            data = json.dumps(msg) + "\n"
-            conn.process.stdin.write(data.encode("utf-8"))
-            await conn.process.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            conn._pending.pop(req_id, None)
-            logger.error(f"MCP server '{conn.name}' write failed: {e}")
-            return None
-
-        try:
-            result = await asyncio.wait_for(future, timeout=timeout)
-            return result
-        except TimeoutError:
-            conn._pending.pop(req_id, None)
-            logger.warning(f"MCP request '{method}' to '{conn.name}' timed out")
-            return None
-        except MCPError as e:
-            logger.warning(f"MCP request '{method}' to '{conn.name}' failed: {e}")
-            return None
-
-    async def _send_notification(
-        self, conn: MCPServerConnection, method: str, params: dict,
-    ) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
-        if not conn.process or not conn.process.stdin:
             return
 
-        msg = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-        }
-
+        # Discover tools. A failure here leaves the connection open with zero
+        # tools rather than tearing down a server that initialized fine.
         try:
-            data = json.dumps(msg) + "\n"
-            conn.process.stdin.write(data.encode("utf-8"))
-            await conn.process.stdin.drain()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+            tools_result = await transport.send_request("tools/list", {})
+        except MCPError:
+            logger.warning(f"MCP server '{name}' tools/list returned nothing")
+            return
+
+        tools_list = tools_result.get("tools", [])
+        for tool_def in tools_list:
+            tool_name = tool_def.get("name", "")
+            namespaced = f"mcp_{name}_{tool_name}"
+            info = MCPToolInfo(
+                server_name=name,
+                original_name=tool_name,
+                namespaced_name=namespaced,
+                description=tool_def.get("description", ""),
+                input_schema=tool_def.get("inputSchema", {}),
+            )
+            conn.tools[namespaced] = info
+            self._tools[namespaced] = info
+
+        logger.info(
+            f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
+        )
+        self._errors.pop(name, None)
 
     async def disconnect_all(self) -> None:
         """Disconnect from all servers."""
@@ -341,28 +197,7 @@ class MCPClient:
         for tool_name in list(conn.tools.keys()):
             self._tools.pop(tool_name, None)
 
-        # Cancel reader task
-        if conn._reader_task and not conn._reader_task.done():
-            conn._reader_task.cancel()
-            try:
-                await conn._reader_task
-            except asyncio.CancelledError:
-                pass
-
-        # Terminate process
-        if conn.process:
-            try:
-                conn.process.stdin.close() if conn.process.stdin else None
-                conn.process.terminate()
-                try:
-                    await asyncio.wait_for(conn.process.wait(), timeout=5.0)
-                except TimeoutError:
-                    conn.process.kill()
-                    await conn.process.wait()
-            except ProcessLookupError:
-                pass
-            except Exception as e:
-                logger.warning(f"Error stopping MCP server '{name}': {e}")
+        await conn.transport.close()
 
         logger.info(f"MCP server '{name}' disconnected")
 
@@ -371,16 +206,13 @@ class MCPClient:
         servers = []
         for name in sorted(set(self._configured) | set(self._servers)):
             conn = self._servers.get(name)
-            connected = bool(conn)
-            if conn and conn.transport == "stdio" and conn.process:
-                connected = conn.process.returncode is None
             servers.append({
                 "name": name,
-                "transport": conn.transport if conn else self._configured.get(name, "unknown"),
-                "connected": connected,
+                "transport": conn.transport_kind if conn else self._configured.get(name, "unknown"),
+                "connected": conn.transport.connected if conn else False,
                 "tool_count": len(conn.tools) if conn else 0,
-                "pending_requests": len(conn._pending) if conn else 0,
-                "error": self._errors.get(name) or (conn.error if conn else None),
+                "pending_requests": conn.transport.pending_count if conn else 0,
+                "error": self._errors.get(name),
             })
 
         return {
@@ -463,18 +295,10 @@ class MCPClient:
             )
 
         try:
-            result = await self._send_request(conn, "tools/call", {
+            result = await conn.transport.send_request("tools/call", {
                 "name": info.original_name,
                 "arguments": arguments,
             }, timeout=60.0)
-
-            if result is None:
-                self._record_failure(info.server_name)
-                return MCPToolCallResult(
-                    content="[error: MCP tool call returned no result]",
-                    is_error=True,
-                    metadata=base_metadata,
-                )
 
             # MCP tool results have a "content" array with text/image blocks
             content_blocks = result.get("content", [])
@@ -597,7 +421,3 @@ def _mcp_image_blocks(content_blocks: list, server_name: str, tool_name: str) ->
             "image_url": {"url": data_uri},
         })
     return blocks
-
-
-class MCPError(Exception):
-    """Error from an MCP server."""
