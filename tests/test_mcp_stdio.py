@@ -90,7 +90,7 @@ async def test_unknown_transport_is_recorded():
 async def test_disconnect_stops_the_subprocess():
     client = MCPClient()
     await client.connect("probe", stdio_config())
-    conn = client._servers["probe"]
+    conn = client.registry.servers["probe"]
     process = conn.transport._process
     await client.disconnect_all()
     assert process.returncode is not None
@@ -131,7 +131,7 @@ async def test_malformed_tool_entry_disconnects_and_records_error():
     # _disconnect_server pops the entry and awaits transport.close(), which
     # blocks until the subprocess is reaped — so by the time connect()
     # returned, nothing was left running.
-    assert "probe" not in client._servers
+    assert "probe" not in client.registry.servers
 
 
 @pytest.mark.asyncio
@@ -145,4 +145,4 @@ async def test_non_string_arg_records_error_without_orphaning_process():
     server = next(s for s in health["servers"] if s["name"] == "probe")
     assert server["connected"] is False
     assert server["error"]
-    assert "probe" not in client._servers
+    assert "probe" not in client.registry.servers

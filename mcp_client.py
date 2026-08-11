@@ -8,6 +8,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from baal_agent.mcp_registry import ToolRegistry
 from baal_agent.mcp_stdio import StdioTransport
 from baal_agent.mcp_transport import MCPError, Transport
 
@@ -55,9 +56,8 @@ class MCPClient:
     """Connects to MCP servers and registers their tools."""
 
     def __init__(self):
-        self._servers: dict[str, MCPServerConnection] = {}
-        self._tools: dict[str, MCPToolInfo] = {}  # namespaced_name -> info
-        self._configured: dict[str, str] = {}  # server name -> transport
+        self.registry = ToolRegistry()
+        self._configured: dict[str, dict] = {}  # server name -> config
         self._errors: dict[str, str] = {}
         # Circuit breaker state per server.
         self._failure_counts: dict[str, int] = {}
@@ -104,7 +104,7 @@ class MCPClient:
             url: server URL (http)
         """
         transport = config.get("transport", "stdio")
-        self._configured[name] = transport
+        self._configured[name] = dict(config)
 
         if transport == "stdio":
             await self._connect_stdio(name, config)
@@ -137,7 +137,9 @@ class MCPClient:
                 transport_kind="stdio",
                 transport=transport,
             )
-            self._servers[name] = conn
+            # Register before initialize so a failure below still lets
+            # _disconnect_server find and close this connection.
+            self.registry.register(conn, {})
 
             # Initialize the server
             await transport.send_request("initialize", {
@@ -166,21 +168,21 @@ class MCPClient:
         # harder failure than an empty one — record it and disconnect.
         try:
             tools_list = tools_result.get("tools", [])
+            tools = {}
             for tool_def in tools_list:
                 tool_name = tool_def.get("name", "")
                 namespaced = f"mcp_{name}_{tool_name}"
-                info = MCPToolInfo(
+                tools[namespaced] = MCPToolInfo(
                     server_name=name,
                     original_name=tool_name,
                     namespaced_name=namespaced,
                     description=tool_def.get("description", ""),
                     input_schema=tool_def.get("inputSchema", {}),
                 )
-                conn.tools[namespaced] = info
-                self._tools[namespaced] = info
+            self.registry.register(conn, tools)
 
             logger.info(
-                f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
+                f"MCP server '{name}' connected: {len(tools)} tools discovered"
             )
             self._errors.pop(name, None)
         except Exception as e:
@@ -190,20 +192,16 @@ class MCPClient:
 
     async def disconnect_all(self) -> None:
         """Disconnect from all servers."""
-        for name in list(self._servers.keys()):
+        for name in list(self.registry.servers.keys()):
             await self._disconnect_server(name)
-        self._tools.clear()
 
     async def _disconnect_server(self, name: str) -> None:
         """Disconnect from a single server."""
-        conn = self._servers.pop(name, None)
+        conn = self.registry.servers.get(name)
         if conn is None:
             return
 
-        # Remove tools from the global index
-        for tool_name in list(conn.tools.keys()):
-            self._tools.pop(tool_name, None)
-
+        self.registry.remove(name)
         await conn.transport.close()
 
         logger.info(f"MCP server '{name}' disconnected")
@@ -211,11 +209,12 @@ class MCPClient:
     def get_health(self) -> dict:
         """Return lightweight MCP health for /info and runtime diagnostics."""
         servers = []
-        for name in sorted(set(self._configured) | set(self._servers)):
-            conn = self._servers.get(name)
+        all_names = sorted(set(self._configured) | set(self.registry.servers))
+        for name in all_names:
+            conn = self.registry.servers.get(name)
             servers.append({
                 "name": name,
-                "transport": conn.transport_kind if conn else self._configured.get(name, "unknown"),
+                "transport": conn.transport_kind if conn else self._configured.get(name, {}).get("transport", "unknown"),
                 "connected": conn.transport.connected if conn else False,
                 "tool_count": len(conn.tools) if conn else 0,
                 "pending_requests": conn.transport.pending_count if conn else 0,
@@ -223,17 +222,17 @@ class MCPClient:
             })
 
         return {
-            "enabled": bool(self._configured or self._servers),
-            "server_count": len(set(self._configured) | set(self._servers)),
+            "enabled": bool(self._configured or self.registry.servers),
+            "server_count": len(all_names),
             "connected_count": sum(1 for server in servers if server["connected"]),
-            "tool_count": len(self._tools),
+            "tool_count": len(self.registry.all_tools()),
             "servers": servers,
         }
 
     def get_tool_definitions(self) -> list[dict]:
         """Return OpenAI-format tool definitions for all discovered MCP tools."""
         defs = []
-        for info in self._tools.values():
+        for info in self.registry.all_tools().values():
             # Convert MCP JSON Schema to OpenAI function-calling format
             parameters = dict(info.input_schema) if info.input_schema else {
                 "type": "object",
@@ -263,7 +262,7 @@ class MCPClient:
         image_callback=None,
     ) -> MCPToolCallResult:
         """Call an MCP tool and return text plus structured metadata."""
-        info = self._tools.get(namespaced_name)
+        info = self.registry.get(namespaced_name)
         base_metadata = {
             "provider": "mcp",
             "server": info.server_name if info else None,
@@ -273,13 +272,23 @@ class MCPClient:
             "mcp_is_error": False,
         }
         if info is None:
+            # A mid-turn tool refresh (maintenance loop) can retire a tool the
+            # model was already offered — distinguish that from a name it
+            # never had, which points at a model hallucination instead.
+            retired_by = _server_name_from_namespaced(namespaced_name, self.registry.servers)
+            if retired_by is not None:
+                return MCPToolCallResult(
+                    content=f"[error: tool no longer offered by server '{retired_by}']",
+                    is_error=True,
+                    metadata={**base_metadata, "server": retired_by},
+                )
             return MCPToolCallResult(
                 content=f"[error: unknown MCP tool '{namespaced_name}']",
                 is_error=True,
                 metadata=base_metadata,
             )
 
-        conn = self._servers.get(info.server_name)
+        conn = self.registry.servers.get(info.server_name)
         if conn is None:
             return MCPToolCallResult(
                 content=f"[error: MCP server '{info.server_name}' not connected]",
@@ -396,6 +405,15 @@ class MCPClient:
         """Call an MCP tool and return the result as a string."""
         result = await self.call_tool_result(namespaced_name, arguments)
         return result.content
+
+
+def _server_name_from_namespaced(namespaced_name: str, servers: dict) -> str | None:
+    """Recover the owning server name from `mcp_{server}_{tool}` when the
+    tool itself isn't registered (e.g. retired by a mid-turn refresh)."""
+    for name in servers:
+        if namespaced_name.startswith(f"mcp_{name}_"):
+            return name
+    return None
 
 
 def _mcp_image_blocks(content_blocks: list, server_name: str, tool_name: str) -> list:
