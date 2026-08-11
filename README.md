@@ -120,6 +120,21 @@ All settings via environment variables:
 | `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
 | `INFERENCE_TIMEOUT` | `300` | Seconds before inference timeout |
 
+### MCP servers
+
+`MCP_SERVERS` (or its base64 form, `MCP_SERVERS_B64`, which is preferred when set) is a JSON array of server configs, each connected at startup and exposed as namespaced tools:
+
+```json
+[
+  {"name": "fs", "transport": "stdio", "command": "npx", "args": ["-y", "@some/mcp-server"], "env": {}},
+  {"name": "api", "transport": "http", "url": "https://example.com/mcp", "headers": {"Authorization": "Bearer ..."}}
+]
+```
+
+`transport` is `"stdio"` (default) or `"http"`. An `"http"` entry requires `url`; `headers` is optional and sent on every request. Authentication is static headers only — there is no OAuth flow. The client speaks MCP protocol version `2025-06-18`; a server that only supports a newer version is refused with a clear "unsupported protocol version" error rather than failing silently.
+
+A connected server's transport, connection state, tool count, and last error are reported per-server in `get_health()` / `/info`.
+
 ## License
 
 AGPL-3.0

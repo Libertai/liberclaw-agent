@@ -165,6 +165,34 @@ async def test_dead_http_transport_gets_reconnected():
 
 
 @pytest.mark.asyncio
+async def test_reinit_resets_tools_listed_at():
+    """A session-recovery re-init must reset the TTL clock, or the next
+    maintenance tick re-lists the same server again shortly after.
+    """
+    clock = Clock()
+    client = MCPClient(now=clock)
+
+    class FakeTransport:
+        async def send_request(self, method, params, timeout=30.0):
+            return {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}}
+
+        async def send_notification(self, method, params):
+            pass
+
+    conn = type("C", (), {"name": "srv", "tools": {}, "tools_listed_at": 0.0})()
+    client.registry.register(conn, {})
+
+    async def fake_list_all_tools(name, transport):
+        return {"mcp_srv_a": {}}
+
+    client._list_all_tools = fake_list_all_tools
+
+    clock.advance(500)
+    await client._reinit_server("srv", FakeTransport(), conn)
+    assert conn.tools_listed_at == clock()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_cancels_maintenance_before_disconnect(monkeypatch):
     """Mirrors the reviewer's probe: a tick blocked mid-reconnect must be
     cancelled and awaited before disconnect_all() runs, so it can never

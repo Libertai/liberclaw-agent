@@ -686,3 +686,16 @@ async def test_connected_recovers_after_a_later_successful_response():
     await t.send_request("tools/list", {}, 5.0)
     assert t.connected
     await t.close()
+
+
+@pytest.mark.asyncio
+async def test_health_reports_http_transport_and_error():
+    from baal_agent.mcp_client import MCPClient
+
+    client = MCPClient()
+    await client.connect("api", {"transport": "http", "url": "https://unreachable.invalid/mcp"})
+    health = client.get_health()
+    server = next(s for s in health["servers"] if s["name"] == "api")
+    assert server["transport"] == "http"
+    assert server["connected"] is False
+    assert server["error"]

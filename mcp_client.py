@@ -406,6 +406,7 @@ class MCPClient:
             logger.warning(f"MCP server '{name}' tools/list returned nothing during reinit")
             return
         self.registry.replace_tools(conn, tools)
+        conn.tools_listed_at = self._now()
 
     def _tools_from_list_result(
         self, server_name: str, result: dict
