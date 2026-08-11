@@ -178,6 +178,13 @@ class MCPClient:
             # _disconnect_server find and close this connection.
             self.registry.register(conn, {})
 
+            # HTTP sessions can expire (404) mid-turn; only HttpTransport knows
+            # this hook, so stdio and any other transport skip the wiring.
+            if hasattr(transport, "set_reinit_hook"):
+                transport.set_reinit_hook(
+                    lambda: self._reinit_server(name, transport, conn)
+                )
+
             # Initialize the server. Empty capabilities is deliberate: it's
             # what makes omitting sampling/roots/elicitation conformant —
             # don't declare a capability this client can't service.
@@ -210,29 +217,11 @@ class MCPClient:
         # cursor. A request failure here leaves the connection open with zero
         # tools rather than tearing down a server that initialized fine.
         try:
-            tools: dict[str, MCPToolInfo] = {}
-            cursor = None
-            for _ in range(_MAX_TOOLS_LIST_PAGES):
-                params = {"cursor": cursor} if cursor else {}
-                try:
-                    tools_result = await transport.send_request("tools/list", params)
-                except MCPError:
-                    logger.warning(f"MCP server '{name}' tools/list returned nothing")
-                    return
-                tools.update(self._tools_from_list_result(name, tools_result))
-                cursor = tools_result.get("nextCursor")
-                # Stop paginating once the cap is already met — a server that
-                # never stops advertising a cursor would otherwise force up
-                # to _MAX_TOOLS_LIST_PAGES round-trips before truncation.
-                if not cursor or len(tools) >= _MAX_TOOLS_PER_SERVER:
-                    break
-
-            if len(tools) > _MAX_TOOLS_PER_SERVER:
-                logger.warning(
-                    f"MCP server '{name}' offered more than {_MAX_TOOLS_PER_SERVER} "
-                    f"tools; keeping the first {_MAX_TOOLS_PER_SERVER}"
-                )
-                tools = dict(list(tools.items())[:_MAX_TOOLS_PER_SERVER])
+            try:
+                tools = await self._list_all_tools(name, transport)
+            except MCPError:
+                logger.warning(f"MCP server '{name}' tools/list returned nothing")
+                return
 
             self.registry.register(conn, tools)
 
@@ -244,6 +233,63 @@ class MCPClient:
             self._errors[name] = str(e)
             logger.error(f"MCP server '{name}' connection failed: {e}")
             await self._disconnect_server(name)
+
+    async def _list_all_tools(
+        self, name: str, transport: Transport
+    ) -> dict[str, MCPToolInfo]:
+        """Paginate tools/list until the server stops returning a cursor.
+
+        Raises MCPError if any page fails — the caller decides how a partial
+        listing should be handled. Shared by the initial connect and by
+        session-recovery re-init, so both discover tools the same way.
+        """
+        tools: dict[str, MCPToolInfo] = {}
+        cursor = None
+        for _ in range(_MAX_TOOLS_LIST_PAGES):
+            params = {"cursor": cursor} if cursor else {}
+            tools_result = await transport.send_request("tools/list", params)
+            tools.update(self._tools_from_list_result(name, tools_result))
+            cursor = tools_result.get("nextCursor")
+            # Stop paginating once the cap is already met — a server that
+            # never stops advertising a cursor would otherwise force up to
+            # _MAX_TOOLS_LIST_PAGES round-trips before truncation.
+            if not cursor or len(tools) >= _MAX_TOOLS_PER_SERVER:
+                break
+
+        if len(tools) > _MAX_TOOLS_PER_SERVER:
+            logger.warning(
+                f"MCP server '{name}' offered more than {_MAX_TOOLS_PER_SERVER} "
+                f"tools; keeping the first {_MAX_TOOLS_PER_SERVER}"
+            )
+            tools = dict(list(tools.items())[:_MAX_TOOLS_PER_SERVER])
+        return tools
+
+    async def _reinit_server(
+        self, name: str, transport: Transport, conn: MCPServerConnection
+    ) -> None:
+        """Re-run the handshake for HttpTransport's 404 session recovery, then
+        refresh tools — a restarted server may advertise a different set, so
+        without this the tool list stays stale until the maintenance TTL.
+        """
+        init_result = await transport.send_request("initialize", {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "baal-agent", "version": "1.0.0"},
+        })
+        version = init_result.get("protocolVersion")
+        if version not in self._SUPPORTED_PROTOCOL_VERSIONS:
+            raise MCPError(f"unsupported protocol version {version}")
+        await transport.send_notification("notifications/initialized", {})
+
+        if "tools" not in init_result.get("capabilities", {}):
+            return
+
+        try:
+            tools = await self._list_all_tools(name, transport)
+        except MCPError:
+            logger.warning(f"MCP server '{name}' tools/list returned nothing during reinit")
+            return
+        self.registry.replace_tools(conn, tools)
 
     def _tools_from_list_result(
         self, server_name: str, result: dict

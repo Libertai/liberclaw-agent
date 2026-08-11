@@ -295,12 +295,16 @@ class _RaisingStream(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 async def test_error_body_read_failure_raises_mcp_error():
+    holder = {}
+
     def handler(request):
-        return httpx.Response(500, stream=_RaisingStream())
+        holder["response"] = httpx.Response(500, stream=_RaisingStream())
+        return holder["response"]
 
     t = transport_with(handler)
     with pytest.raises(MCPError, match="500"):
         await t.send_request("tools/list", {}, 5.0)
+    assert holder["response"].is_closed
     await t.close()
 
 
@@ -314,14 +318,18 @@ class _BrokenSseStream(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 async def test_sse_stream_read_error_raises_mcp_error():
+    holder = {}
+
     def handler(request):
-        return httpx.Response(
+        holder["response"] = httpx.Response(
             200, headers={"Content-Type": "text/event-stream"}, stream=_BrokenSseStream()
         )
+        return holder["response"]
 
     t = transport_with(handler)
     with pytest.raises(MCPError):
         await t.send_request("tools/list", {}, 5.0)
+    assert holder["response"].is_closed
     await t.close()
 
 
@@ -353,4 +361,280 @@ async def test_sse_timeout_bounds_a_dribbling_stream():
         await t.send_request("tools/list", {}, 0.3)
     elapsed = time.monotonic() - start
     assert 0.2 <= elapsed < 2.0
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_404_with_session_reinitialises_then_retries():
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        calls.append((body.get("method"), request.headers.get("mcp-session-id")))
+        if body.get("method") == "initialize":
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+            )
+        if len([c for c in calls if c[0] == "tools/list"]) == 1:
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(request, {"retried": True})
+
+    t = transport_with(handler)
+    t.set_reinit_hook(lambda: t.send_request("initialize", {}, 5.0))
+    await t.send_request("initialize", {}, 5.0)
+    assert await t.send_request("tools/list", {}, 5.0) == {"retried": True}
+    assert [c[0] for c in calls].count("initialize") == 2
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_second_404_fails():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        if body.get("method") == "initialize":
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S3"}
+            )
+        return httpx.Response(404, text="gone")
+
+    t = transport_with(handler)
+    t.set_reinit_hook(lambda: t.send_request("initialize", {}, 5.0))
+    await t.send_request("initialize", {}, 5.0)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_itself_does_not_recurse_on_404():
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content.decode()).get("method"))
+        return httpx.Response(404, text="nope")
+
+    t = transport_with(handler)
+    t._session_id = "S4"
+    with pytest.raises(MCPError):
+        await t.send_request("initialize", {}, 5.0)
+    assert calls.count("initialize") == 1
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_close_sends_delete_with_session():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.headers.get("mcp-session-id")))
+        if request.method == "DELETE":
+            return httpx.Response(200)
+        return json_rpc_result(
+            request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S5"}
+        )
+
+    t = transport_with(handler)
+    await t.send_request("initialize", {}, 5.0)
+    await t.close()
+    assert ("DELETE", "S5") in seen
+
+
+@pytest.mark.asyncio
+async def test_404_without_reinit_hook_raises_named_error():
+    def handler(request):
+        return httpx.Response(404, text="session expired")
+
+    t = transport_with(handler)
+    t._session_id = "S6"
+    with pytest.raises(MCPError, match="no re-init hook"):
+        await t.send_request("tools/list", {}, 5.0)
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_404_recovers_once_and_both_retries_succeed():
+    # Both requests observe the same expired session and 404 concurrently.
+    # Only one may run the hook; the other must wait for it and retry
+    # against the session it produced, rather than hard-failing because the
+    # loser's eligibility check read state the winner had already cleared.
+    calls = []
+
+    async def handler(request):
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        sid = request.headers.get("mcp-session-id")
+        calls.append((method, sid))
+        # Every response yields once immediately: with a synchronous 404
+        # neither task ever suspends before the first one reaches recovery
+        # and mutates shared state, so the second task's pre-request
+        # snapshot would just see the mutated state instead of racing it.
+        await asyncio.sleep(0)
+        if method == "initialize":
+            # Delay the response so the second 404 has time to race in
+            # while this recovery is still in flight.
+            await asyncio.sleep(0.05)
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+            )
+        if sid != "S2":
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(request, {"echo": method})
+
+    t = transport_with(handler)
+    t.set_reinit_hook(lambda: t.send_request("initialize", {}, 5.0))
+    t._session_id = "S1"
+
+    results = await asyncio.gather(
+        t.send_request("tools/list", {}, 5.0),
+        t.send_request("tools/call", {}, 5.0),
+    )
+    assert results[0] == {"echo": "tools/list"}
+    assert results[1] == {"echo": "tools/call"}
+    assert [c[0] for c in calls].count("initialize") == 1
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_own_404_does_not_deadlock():
+    # The hook's own tools/list refresh 404s on the freshly-issued session.
+    # That request runs on the same task already holding the recovery lock;
+    # if it tried to re-enter recovery it would deadlock on that lock
+    # forever, so this must fail fast (swallowed by the hook) instead.
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        sid = request.headers.get("mcp-session-id")
+        calls.append((method, sid))
+        if method == "initialize":
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+            )
+        if sid != "S2":
+            return httpx.Response(404, text="session expired")
+        if method == "tools/list":
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(request, {"echo": method})
+
+    t = transport_with(handler)
+
+    async def hook():
+        await t.send_request("initialize", {}, 5.0)
+        try:
+            await t.send_request("tools/list", {}, 5.0)
+        except MCPError:
+            pass  # mirrors _reinit_server swallowing a failed tool refresh
+
+    t.set_reinit_hook(hook)
+    t._session_id = "S1"
+
+    result = await asyncio.wait_for(t.send_request("tools/call", {}, 5.0), timeout=2.0)
+    assert result == {"echo": "tools/call"}
+    assert [c[0] for c in calls].count("initialize") == 1
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_request_entering_during_recovery_does_not_hard_fail():
+    # A request that starts fresh WHILE another task's recovery is already
+    # in flight — not one that raced in at the same instant — must still
+    # see a real session and queue on the lock, not a cleared one that
+    # makes it give up immediately.
+    calls = []
+    late = {}
+
+    async def handler(request):
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        sid = request.headers.get("mcp-session-id")
+        calls.append((method, sid))
+        if method == "initialize":
+            # Start a brand new request exactly while this recovery
+            # handshake is in flight, before responding to it.
+            late["task"] = asyncio.create_task(t.send_request("tools/call", {}, 5.0))
+            await asyncio.sleep(0.05)
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+            )
+        if sid != "S2":
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(request, {"echo": method})
+
+    t = transport_with(handler)
+    t.set_reinit_hook(lambda: t.send_request("initialize", {}, 5.0))
+    t._session_id = "S1"
+
+    first = await t.send_request("tools/list", {}, 5.0)
+    late_result = await late["task"]
+    assert first == {"echo": "tools/list"}
+    assert late_result == {"echo": "tools/call"}
+    assert [c[0] for c in calls].count("initialize") == 1
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_hook_leaves_session_recoverable():
+    # A hook that fails (network drop, 500 on initialize) must not brick the
+    # transport: the session and generation must be left exactly as they
+    # were, so a later request — once the server is healthy again — can
+    # still recover instead of short-circuiting forever.
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        method = body.get("method")
+        sid = request.headers.get("mcp-session-id")
+        calls.append((method, sid))
+        if method == "initialize":
+            if [c[0] for c in calls].count("initialize") == 1:
+                return httpx.Response(500, text="server hiccup")
+            return json_rpc_result(
+                request, {"protocolVersion": "2025-06-18"}, headers={"Mcp-Session-Id": "S2"}
+            )
+        if sid != "S2":
+            return httpx.Response(404, text="session expired")
+        return json_rpc_result(request, {"echo": method})
+
+    t = transport_with(handler)
+    t.set_reinit_hook(lambda: t.send_request("initialize", {}, 5.0))
+    t._session_id = "S1"
+
+    generation_before = t._session_generation
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    assert t._session_id == "S1"
+    assert t._session_generation == generation_before
+
+    result = await t.send_request("tools/call", {}, 5.0)
+    assert result == {"echo": "tools/call"}
+    assert [c[0] for c in calls].count("initialize") == 2
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_json_response_read_failure_raises_mcp_error():
+    holder = {}
+
+    def handler(request):
+        holder["response"] = httpx.Response(
+            200, headers={"Content-Type": "application/json"}, stream=_RaisingStream()
+        )
+        return holder["response"]
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    assert holder["response"].is_closed
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_json_response_malformed_body_raises_mcp_error():
+    def handler(request):
+        return httpx.Response(200, headers={"Content-Type": "application/json"}, text="not json")
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
     await t.close()

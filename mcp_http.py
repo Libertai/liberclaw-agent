@@ -18,6 +18,10 @@ _MAX_REDIRECTS = 3
 _MAX_ERROR_BODY_LEN = 500
 
 
+class _SessionExpiredError(MCPError):
+    """404 for a request that carried Mcp-Session-Id: the session expired server-side."""
+
+
 def _origin(url: str) -> tuple[str, str, int | None]:
     parts = urlsplit(url)
     return parts.scheme, parts.hostname or "", parts.port
@@ -65,6 +69,19 @@ class HttpTransport(Transport):
         self._session_id: str | None = None
         self._protocol_version: str | None = None
         self._id_counter = itertools.count(1)
+        # MCPClient installs this via set_reinit_hook: re-run initialize (with
+        # protocolVersion validation) + notifications/initialized. Recovery
+        # raises rather than guessing at a handshake if nothing is installed.
+        self._reinit_hook = None
+        self._reinit_lock = asyncio.Lock()
+        # Bumped once a re-init succeeds. Lets a second caller racing on the
+        # same expired session detect that another caller already
+        # recovered, so it doesn't re-initialise twice.
+        self._session_generation = 0
+        # Task currently running the recovery hook, while _reinit_lock is
+        # held. A 404 raised by a request the hook itself makes (same task)
+        # must bail instead of trying to re-acquire this non-reentrant lock.
+        self._recovering_task: asyncio.Task | None = None
 
     async def open(self) -> None:
         client = httpx.AsyncClient(
@@ -85,15 +102,82 @@ class HttpTransport(Transport):
         # would otherwise break every request.
         headers["Content-Type"] = "application/json"
         headers["Accept"] = "application/json, text/event-stream"
-        if self._session_id is not None:
+        # Never on initialize, even if self._session_id still holds a stale
+        # value: the spec requires a new session's InitializeRequest to
+        # carry no session id at all.
+        if self._session_id is not None and method != "initialize":
             headers["Mcp-Session-Id"] = self._session_id
         if self._protocol_version is not None and method != "initialize":
             headers["MCP-Protocol-Version"] = self._protocol_version
         return headers
 
+    def set_reinit_hook(self, hook) -> None:
+        """Install the 404-recovery handshake.
+
+        `hook` is an async callable taking no arguments, re-running
+        `initialize` (with protocolVersion validation) +
+        `notifications/initialized`, plus whatever else the caller needs
+        (MCPClient also refreshes the tool registry) — the transport has no
+        handshake logic of its own, so a 404 recovers only if this is set.
+        """
+        self._reinit_hook = hook
+
     async def send_request(self, method: str, params: dict, timeout: float = 30.0) -> dict:
         req_id = next(self._id_counter)
         body = {"jsonrpc": "2.0", "method": method, "params": params, "id": req_id}
+        generation = self._session_generation
+        # Captured now, not read live in the except clause below: another
+        # task's recovery can clear self._session_id while this request is
+        # in flight, and that must not change what THIS request is eligible
+        # for — it observed a real session when it was sent.
+        had_session = self._session_id is not None
+        try:
+            return await self._send_and_parse(method, body, req_id, timeout)
+        except _SessionExpiredError:
+            # initialize excluded so a 404 there can never re-enter recovery.
+            # A 404 from a request the recovery hook itself makes runs on
+            # this same task while _recovering_task holds the lock — must
+            # bail rather than re-acquire a lock it's already holding.
+            if (
+                method == "initialize"
+                or not had_session
+                or asyncio.current_task() is self._recovering_task
+            ):
+                raise
+            await self._recover_session(generation)
+            return await self._send_and_parse(method, body, req_id, timeout)
+
+    async def _recover_session(self, generation: int) -> None:
+        """Re-run the handshake once; leave the old session in place until it
+        succeeds.
+
+        Two concurrent requests can both 404 on the same expired session. The
+        lock serialises recovery; the generation check lets whichever caller
+        loses the race see that another caller already re-initialised, so it
+        retries against the new session instead of re-initialising again.
+        Not clearing `_session_id` up front (it's excluded from `initialize`
+        regardless, in `_headers`) means a third request that starts fresh
+        while this is in flight still observes a real session and queues on
+        the lock too, instead of seeing none and giving up immediately. It
+        also means a failing hook (network drop, 500 on `initialize`) leaves
+        the transport exactly as able to recover as before the attempt —
+        nothing to restore.
+        """
+        async with self._reinit_lock:
+            if generation != self._session_generation:
+                return
+            if self._reinit_hook is None:
+                raise MCPError("session expired and no re-init hook is installed")
+            self._recovering_task = asyncio.current_task()
+            try:
+                await self._reinit_hook()
+                self._session_generation += 1
+            finally:
+                self._recovering_task = None
+
+    async def _send_and_parse(
+        self, method: str, body: dict, req_id: int, timeout: float
+    ) -> dict:
         response = await self._post(method, body, timeout)
 
         # _post only returns on status 200; other statuses already raised.
@@ -102,8 +186,11 @@ class HttpTransport(Transport):
             if "text/event-stream" in content_type:
                 data = await self._consume_sse(response, req_id, method, timeout)
             elif "application/json" in content_type:
-                await response.aread()
-                data = response.json()
+                try:
+                    await response.aread()
+                    data = response.json()
+                except (httpx.HTTPError, json.JSONDecodeError) as e:
+                    raise MCPError(f"request '{method}' failed to read response: {e}") from e
             else:
                 raise MCPError(
                     f"unexpected content-type '{content_type}' for '{method}'"
@@ -240,9 +327,10 @@ class HttpTransport(Transport):
             finally:
                 await response.aclose()
             text = response.text[:_MAX_ERROR_BODY_LEN]
-            raise MCPError(
-                f"request '{method}' failed: HTTP {response.status_code}: {text}"
-            )
+            message = f"request '{method}' failed: HTTP {response.status_code}: {text}"
+            if response.status_code == 404:
+                raise _SessionExpiredError(message)
+            raise MCPError(message)
 
         raise MCPError(f"request '{method}' exceeded {_MAX_REDIRECTS} redirects")
 
