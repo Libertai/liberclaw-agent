@@ -98,7 +98,7 @@ For LiberClaw-orchestrated deploys, the build runs automatically as a pre-deploy
 
 `AGENT_VERSION` in `baal_agent/__init__.py` is bumped whenever a feature requires server-side support — new endpoints, auth changes, API shape changes, etc. LiberClaw checks this value via `/health` to decide whether to offer features like direct chat.
 
-**When bumping `AGENT_VERSION`, also update `MIN_DIRECT_CHAT_VERSION` in `src/liberclaw/routers/agents.py` to match** — otherwise LiberClaw will refuse to offer direct chat against agents at the new version.
+**`MIN_DIRECT_CHAT_VERSION` in `src/liberclaw/routers/agents.py` must never exceed `AGENT_VERSION`** — a freshly deployed agent would otherwise be refused direct chat by its own control plane. It may lag it, since not every agent-side bump affects direct chat: raise it only when direct chat itself needs the newer runtime.
 
 Old agents (version < 4) do not have the `/info` endpoint, CORS, or the static SPA mount. The LiberClaw frontend handles this by showing an "Update your agent" modal instead of breaking.
 
