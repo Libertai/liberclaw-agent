@@ -66,6 +66,12 @@ class HttpTransport(Transport):
         self._url = url
         self._user_headers = dict(headers or {})
         self._client: httpx.AsyncClient | None = None
+        # A 4xx/5xx is a server response, not a transport failure, and must
+        # not clear this — only a request that never got a response
+        # (connection refused, DNS failure, timeout) does. `connected`
+        # otherwise can't distinguish a down host from a live one, since
+        # self._client stays set until close().
+        self._healthy = True
         self._session_id: str | None = None
         self._protocol_version: str | None = None
         self._id_counter = itertools.count(1)
@@ -299,7 +305,12 @@ class HttpTransport(Transport):
             try:
                 response = await self._client.send(request, stream=True)
             except httpx.HTTPError as e:
+                # .send() only raises on a transport-level failure — a
+                # 4xx/5xx is read as a normal response below, not an
+                # exception here (no raise_for_status()).
+                self._healthy = False
                 raise MCPError(f"request '{method}' failed: {e}") from e
+            self._healthy = True
 
             if response.status_code in (301, 302, 303, 307, 308):
                 await response.aclose()
@@ -369,4 +380,4 @@ class HttpTransport(Transport):
 
     @property
     def connected(self) -> bool:
-        return self._client is not None
+        return self._client is not None and self._healthy

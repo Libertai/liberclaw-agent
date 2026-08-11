@@ -299,11 +299,9 @@ class MCPClient:
         """Reconnect unreachable servers with backoff, refresh tool lists
         past their TTL.
 
-        This is the first background caller into MCP request paths — every
-        prior call came from a chat turn. self._maintaining is checked
-        before the lock so an overlapping tick (loop tick racing another
-        loop tick, or a manual call) returns immediately rather than
-        queueing behind one already running.
+        self._maintaining is checked before the lock so an overlapping tick
+        (loop tick racing another loop tick, or a manual call) returns
+        immediately rather than queueing behind one already running.
         """
         if self._maintaining:
             return
@@ -323,7 +321,8 @@ class MCPClient:
         for name, config in list(self._configured.items()):
             if self._closed:
                 return
-            if name in self.registry.servers:
+            conn = self.registry.servers.get(name)
+            if conn is not None and conn.transport.connected:
                 continue
             is_open, _ = self._circuit_state(name)
             if is_open:
@@ -331,10 +330,12 @@ class MCPClient:
             if self._now() < self._retry_at.get(name, 0.0):
                 continue
 
-            # Unconditional: a prior failed attempt can leave a transport
-            # half-open (registered before initialize, per _connect_transport's
-            # own teardown), and skipping this orphans that httpx.AsyncClient
-            # or subprocess on every retry cycle.
+            # Unconditional: a conn that's still registered but dead
+            # (transport.connected False), or a prior failed attempt
+            # (registered before initialize, per _connect_transport's own
+            # teardown), must be torn down before reconnecting — skipping
+            # this orphans the previous httpx.AsyncClient or subprocess on
+            # every retry cycle.
             await self._disconnect_server(name)
             if self._closed:
                 return

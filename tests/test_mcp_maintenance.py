@@ -89,3 +89,135 @@ async def test_overlapping_maintain_does_not_double_run():
     client._configured["srv"] = {"transport": "http", "url": "https://x/mcp"}
     await asyncio.gather(client.maintain(), client.maintain())
     assert len(running) == 1
+
+
+@pytest.mark.asyncio
+async def test_dead_connected_server_gets_reconnected():
+    """A server that connects, then drops (transport.connected flips False
+    without the conn ever leaving the registry), must be reconnected — not
+    skipped just because a (dead) conn is still in registry.servers.
+    """
+    clock = Clock()
+    client = MCPClient(now=clock)
+    closed = []
+
+    class DeadTransport:
+        connected = False
+
+        async def close(self):
+            closed.append("srv")
+
+    conn = type("C", (), {"name": "srv", "tools": {}, "tools_listed_at": 0.0})()
+    conn.transport = DeadTransport()
+    client.registry.register(conn, {})
+    client._configured["srv"] = {"transport": "http", "url": "https://x/mcp"}
+
+    attempts = []
+
+    async def fake_connect(name, config):
+        attempts.append(name)
+
+    client.connect = fake_connect
+
+    await client.maintain()
+    assert closed == ["srv"], "the dead transport was never torn down"
+    assert attempts == ["srv"], "reconnect wasn't attempted for a registered-but-dead server"
+
+
+@pytest.mark.asyncio
+async def test_dead_http_transport_gets_reconnected():
+    """Same as above but the "dead" signal comes from a real HttpTransport
+    whose connected flips False after an actual connection-level failure,
+    not a stub — proves the transport's own health flag, not just the
+    maintenance predicate.
+    """
+    import httpx
+
+    from baal_agent.mcp_http import HttpTransport
+    from baal_agent.mcp_transport import MCPError as _MCPError
+
+    def failing_handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = HttpTransport("https://x/mcp")
+    transport._client = httpx.AsyncClient(transport=httpx.MockTransport(failing_handler))
+    with pytest.raises(_MCPError):
+        await transport.send_request("tools/list", {}, 5.0)
+    assert not transport.connected, "connected must go False after a transport-level failure"
+
+    clock = Clock()
+    client = MCPClient(now=clock)
+    conn = type("C", (), {"name": "srv", "tools": {}, "tools_listed_at": 0.0})()
+    conn.transport = transport
+    client.registry.register(conn, {})
+    client._configured["srv"] = {"transport": "http", "url": "https://x/mcp"}
+
+    attempts = []
+
+    async def fake_connect(name, config):
+        attempts.append(name)
+
+    client.connect = fake_connect
+
+    await client.maintain()
+    assert attempts == ["srv"], "a dead HttpTransport must trigger a reconnect"
+    await transport.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_maintenance_before_disconnect(monkeypatch):
+    """Mirrors the reviewer's probe: a tick blocked mid-reconnect must be
+    cancelled and awaited before disconnect_all() runs, so it can never
+    resume past its await and re-register a connection after teardown.
+    """
+    import asyncio
+
+    from baal_agent import tools
+
+    monkeypatch.setattr(tools, "_MCP_MAINTENANCE_INTERVAL", 0.0)
+    monkeypatch.setattr(tools, "_mcp_maintenance_task", None)
+
+    client = MCPClient(now=Clock())
+
+    # An already-connected server: proves disconnect_all still tears down
+    # real connections once the maintenance task is out of the way.
+    closed = []
+
+    class LiveTransport:
+        connected = True
+
+        async def close(self):
+            closed.append("live")
+
+    live_conn = type("C", (), {"name": "live", "tools": {}, "tools_listed_at": 0.0})()
+    live_conn.transport = LiveTransport()
+    client.registry.register(live_conn, {})
+    client._configured["live"] = {"transport": "http", "url": "https://live/mcp"}
+
+    # A dead server whose reconnect is in flight when shutdown starts.
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def slow_connect(name, config):
+        started.set()
+        await never.wait()
+        # Only reachable if the tick outlives cancellation — must not happen.
+        conn = type("C", (), {"name": name, "tools": {}, "tools_listed_at": 0.0})()
+        conn.transport = type("T", (), {"connected": True})()
+        client.registry.register(conn, {})
+
+    client.connect = slow_connect
+    client._configured["srv"] = {"transport": "http", "url": "https://x/mcp"}
+
+    monkeypatch.setattr(tools, "_mcp_client", client)
+    await tools.start_mcp_maintenance()
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    await tools.shutdown_mcp()
+
+    assert tools._mcp_maintenance_task is None, "maintenance task still pending after shutdown"
+    assert "srv" not in client.registry.servers, (
+        "a tick that outlived cancellation re-registered a server after teardown"
+    )
+    assert client.registry.servers == {}
+    assert closed == ["live"], "disconnect_all never tore down the live server"

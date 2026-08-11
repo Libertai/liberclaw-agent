@@ -638,3 +638,51 @@ async def test_json_response_malformed_body_raises_mcp_error():
     with pytest.raises(MCPError):
         await t.send_request("tools/list", {}, 5.0)
     await t.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_goes_false_after_transport_level_failure():
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    t = transport_with(handler)
+    assert t.connected
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    assert not t.connected
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_stays_true_after_a_server_error_status():
+    """A 4xx/5xx is a server response, not a transport failure — marking
+    the transport unhealthy for one would tear down and rebuild a
+    perfectly good connection over a single bad status code."""
+
+    def handler(request):
+        return httpx.Response(500, text="internal error")
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    assert t.connected
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_connected_recovers_after_a_later_successful_response():
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return json_rpc_result(request, {"ok": True})
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    assert not t.connected
+    await t.send_request("tools/list", {}, 5.0)
+    assert t.connected
+    await t.close()
