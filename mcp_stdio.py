@@ -131,7 +131,7 @@ class StdioTransport(Transport):
             raise MCPError(f"write failed: {e}") from e
 
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            result = await asyncio.wait_for(future, timeout=timeout)
         except TimeoutError:
             self._pending.pop(req_id, None)
             logger.warning(f"MCP request '{method}' to '{self._command}' timed out")
@@ -139,6 +139,13 @@ class StdioTransport(Transport):
         except MCPError as e:
             logger.warning(f"MCP request '{method}' to '{self._command}' failed: {e}")
             raise
+
+        # A JSON-RPC response with a null/missing "result" is a malformed
+        # reply, not success — callers rely on send_request never returning
+        # None so they can treat a dict result as a given.
+        if result is None:
+            raise MCPError(f"request '{method}' returned no result")
+        return result
 
     async def send_notification(self, method: str, params: dict) -> None:
         """Send a JSON-RPC notification (no response expected)."""

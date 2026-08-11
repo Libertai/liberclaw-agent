@@ -94,3 +94,55 @@ async def test_disconnect_stops_the_subprocess():
     process = conn.transport._process
     await client.disconnect_all()
     assert process.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_tools_list_null_result_leaves_connection_open():
+    """A malformed tools/list response is a soft failure: the server already
+    initialized fine, so the connection survives with zero tools and no error
+    recorded — same as an empty tools list."""
+    client = MCPClient()
+    await client.connect("probe", stdio_config(env={
+        "PATH": "/usr/bin:/bin", "FAKE_MCP_TOOLS_LIST_MODE": "null",
+    }))
+    try:
+        health = client.get_health()
+        server = next(s for s in health["servers"] if s["name"] == "probe")
+        assert server["connected"] is True
+        assert server["tool_count"] == 0
+        assert server["error"] is None
+    finally:
+        await client.disconnect_all()
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_entry_disconnects_and_records_error():
+    """Unlike a null tools/list result, a non-dict entry in "tools" means the
+    server sent garbage — that's a hard failure: record the error and tear
+    down rather than leaving a half-registered connection running."""
+    client = MCPClient()
+    await client.connect("probe", stdio_config(env={
+        "PATH": "/usr/bin:/bin", "FAKE_MCP_TOOLS_LIST_MODE": "bad_entry",
+    }))
+    health = client.get_health()
+    server = next(s for s in health["servers"] if s["name"] == "probe")
+    assert server["connected"] is False
+    assert server["error"]
+    # _disconnect_server pops the entry and awaits transport.close(), which
+    # blocks until the subprocess is reaped — so by the time connect()
+    # returned, nothing was left running.
+    assert "probe" not in client._servers
+
+
+@pytest.mark.asyncio
+async def test_non_string_arg_records_error_without_orphaning_process():
+    """A non-str entry in args makes create_subprocess_exec raise TypeError,
+    not FileNotFoundError/OSError — must still be recorded as a connect
+    failure rather than escaping connect() uncaught."""
+    client = MCPClient()
+    await client.connect("probe", stdio_config(args=["-u", FIXTURE, 5]))
+    health = client.get_health()
+    server = next(s for s in health["servers"] if s["name"] == "probe")
+    assert server["connected"] is False
+    assert server["error"]
+    assert "probe" not in client._servers

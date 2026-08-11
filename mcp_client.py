@@ -148,7 +148,7 @@ class MCPClient:
 
             # Send initialized notification (no response expected)
             await transport.send_notification("notifications/initialized", {})
-        except MCPError as e:
+        except Exception as e:
             self._errors[name] = str(e)
             logger.error(f"MCP server '{name}' connection failed: {e}")
             await self._disconnect_server(name)
@@ -162,24 +162,31 @@ class MCPClient:
             logger.warning(f"MCP server '{name}' tools/list returned nothing")
             return
 
-        tools_list = tools_result.get("tools", [])
-        for tool_def in tools_list:
-            tool_name = tool_def.get("name", "")
-            namespaced = f"mcp_{name}_{tool_name}"
-            info = MCPToolInfo(
-                server_name=name,
-                original_name=tool_name,
-                namespaced_name=namespaced,
-                description=tool_def.get("description", ""),
-                input_schema=tool_def.get("inputSchema", {}),
-            )
-            conn.tools[namespaced] = info
-            self._tools[namespaced] = info
+        # A malformed tools list (bad shape from a misbehaving server) is a
+        # harder failure than an empty one — record it and disconnect.
+        try:
+            tools_list = tools_result.get("tools", [])
+            for tool_def in tools_list:
+                tool_name = tool_def.get("name", "")
+                namespaced = f"mcp_{name}_{tool_name}"
+                info = MCPToolInfo(
+                    server_name=name,
+                    original_name=tool_name,
+                    namespaced_name=namespaced,
+                    description=tool_def.get("description", ""),
+                    input_schema=tool_def.get("inputSchema", {}),
+                )
+                conn.tools[namespaced] = info
+                self._tools[namespaced] = info
 
-        logger.info(
-            f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
-        )
-        self._errors.pop(name, None)
+            logger.info(
+                f"MCP server '{name}' connected: {len(conn.tools)} tools discovered"
+            )
+            self._errors.pop(name, None)
+        except Exception as e:
+            self._errors[name] = str(e)
+            logger.error(f"MCP server '{name}' connection failed: {e}")
+            await self._disconnect_server(name)
 
     async def disconnect_all(self) -> None:
         """Disconnect from all servers."""

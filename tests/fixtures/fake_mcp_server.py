@@ -5,12 +5,17 @@ readline() hang until its timeout instead of returning promptly.
 """
 
 import json
+import os
 import sys
 
 TOOLS = [
     {"name": "alpha", "description": "first", "inputSchema": {"type": "object"}},
     {"name": "beta", "description": "second", "inputSchema": {"type": "object"}},
 ]
+
+# Malformed tools/list responses, selected via env var so a test can spawn a
+# server that misbehaves in one specific way.
+TOOLS_LIST_MODE = os.environ.get("FAKE_MCP_TOOLS_LIST_MODE")
 
 
 def reply(msg_id, result):
@@ -35,11 +40,16 @@ def main():
         elif method == "notifications/initialized":
             continue  # notification: no reply
         elif method == "tools/list":
-            cursor = (msg.get("params") or {}).get("cursor")
-            if cursor is None:
-                reply(msg_id, {"tools": [TOOLS[0]], "nextCursor": "page2"})
+            if TOOLS_LIST_MODE == "null":
+                reply(msg_id, None)
+            elif TOOLS_LIST_MODE == "bad_entry":
+                reply(msg_id, {"tools": ["not-a-dict"]})
             else:
-                reply(msg_id, {"tools": [TOOLS[1]]})
+                cursor = (msg.get("params") or {}).get("cursor")
+                if cursor is None:
+                    reply(msg_id, {"tools": [TOOLS[0]], "nextCursor": "page2"})
+                else:
+                    reply(msg_id, {"tools": [TOOLS[1]]})
         elif method == "tools/call":
             name = msg["params"]["name"]
             reply(msg_id, {"content": [{"type": "text", "text": f"called {name}"}]})
