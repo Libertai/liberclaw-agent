@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -223,4 +225,132 @@ async def test_interleaved_ping_is_answered():
     assert await t.send_request("tools/list", {}, 5.0) == {"v": 5}
     replies = [p for p in posts if p.get("id") == "p1" and "result" in p]
     assert replies and replies[0]["result"] == {}
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_interleaved_unknown_method_gets_method_not_found():
+    posts = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        posts.append(body)
+        if body.get("method") == "tools/list":
+            req = json.dumps(
+                {"jsonrpc": "2.0", "id": "p2", "method": "sampling/createMessage"}
+            )
+            payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 7}})
+            return sse(f"data: {req}\n\n", f"data: {payload}\n\n")
+        return httpx.Response(202)
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 7}
+    replies = [p for p in posts if p.get("id") == "p2" and "error" in p]
+    assert replies and replies[0]["error"]["code"] == -32601
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_request_id_collision_with_server_ping():
+    # A server-initiated request allocates from its own id space, independent
+    # of ours. If ours happens to start at the same value, only the presence
+    # of "method" (never on a response) may distinguish it from our answer.
+    posts = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        posts.append(body)
+        if body.get("method") == "tools/list":
+            ping = json.dumps({"jsonrpc": "2.0", "id": body["id"], "method": "ping"})
+            payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 6}})
+            return sse(f"data: {ping}\n\n", f"data: {payload}\n\n")
+        return httpx.Response(202)
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 6}
+    replies = [p for p in posts if "result" in p and p.get("result") == {}]
+    assert replies
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_skips_non_object_payload():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 8}})
+        return sse("data: 5\n\n", f"data: {payload}\n\n")
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 8}
+    await t.close()
+
+
+class _RaisingStream(httpx.AsyncByteStream):
+    """A stream whose body read fails, simulating a mid-response network drop."""
+
+    async def __aiter__(self):
+        raise httpx.ReadError("boom")
+        yield b""  # pragma: no cover
+
+
+@pytest.mark.asyncio
+async def test_error_body_read_failure_raises_mcp_error():
+    def handler(request):
+        return httpx.Response(500, stream=_RaisingStream())
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError, match="500"):
+        await t.send_request("tools/list", {}, 5.0)
+    await t.close()
+
+
+class _BrokenSseStream(httpx.AsyncByteStream):
+    """An SSE body that drops mid-stream, simulating a connection reset."""
+
+    async def __aiter__(self):
+        yield b": keep-alive\n\n"
+        raise httpx.ReadError("boom")
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_read_error_raises_mcp_error():
+    def handler(request):
+        return httpx.Response(
+            200, headers={"Content-Type": "text/event-stream"}, stream=_BrokenSseStream()
+        )
+
+    t = transport_with(handler)
+    with pytest.raises(MCPError):
+        await t.send_request("tools/list", {}, 5.0)
+    await t.close()
+
+
+class _DribblingSseStream(httpx.AsyncByteStream):
+    """An SSE body that never ends, emitting only keep-alives."""
+
+    async def __aiter__(self):
+        while True:
+            await asyncio.sleep(0.05)
+            yield b": keep-alive\n\n"
+
+
+@pytest.mark.asyncio
+async def test_sse_timeout_bounds_a_dribbling_stream():
+    # httpx's own read timeout resets on every chunk, so a stream that never
+    # stops emitting keep-alives would hang forever without the transport's
+    # own asyncio.timeout bounding the whole wait.
+    def handler(request):
+        body = json.loads(request.content.decode())
+        if body.get("method") == "notifications/cancelled":
+            return httpx.Response(202)
+        return httpx.Response(
+            200, headers={"Content-Type": "text/event-stream"}, stream=_DribblingSseStream()
+        )
+
+    t = transport_with(handler)
+    start = time.monotonic()
+    with pytest.raises(MCPError, match="timed out"):
+        await t.send_request("tools/list", {}, 0.3)
+    elapsed = time.monotonic() - start
+    assert 0.2 <= elapsed < 2.0
     await t.close()

@@ -138,11 +138,20 @@ class HttpTransport(Transport):
         try:
             async with asyncio.timeout(timeout):
                 async for msg in _sse_messages(response.aiter_lines()):
+                    if not isinstance(msg, dict):
+                        # _sse_messages guarantees valid JSON, not a JSON object.
+                        continue
+                    # A response never carries "method" — only a server->client
+                    # request/notification does. JSON-RPC ids are per-requestor,
+                    # so a bare id match doesn't identify a response: the server's
+                    # own id space can collide with ours (e.g. both start at 1).
+                    if "method" in msg:
+                        if msg.get("id") is not None:
+                            await self._reply_to_interleaved_request(msg)
+                        continue
                     if msg.get("id") == req_id:
                         return msg
-                    if msg.get("id") is not None and "method" in msg:
-                        await self._reply_to_interleaved_request(msg)
-                    # else: a notification, or a reply to someone else's id — ignore
+                    # else: a reply to someone else's id — ignore
         except TimeoutError:
             logger.warning(f"MCP request '{method}' timed out waiting on SSE stream")
             # Best effort: a failure to notify the server must never mask the
@@ -156,6 +165,8 @@ class HttpTransport(Transport):
                     f"MCP server failed to receive cancellation for '{method}'"
                 )
             raise MCPError(f"request '{method}' timed out") from None
+        except httpx.HTTPError as e:
+            raise MCPError(f"SSE stream for '{method}' failed: {e}") from e
 
         raise MCPError(f"SSE stream for '{method}' ended without a matching response")
 
@@ -222,9 +233,13 @@ class HttpTransport(Transport):
             if response.status_code == 200:
                 return response
 
-            await response.aread()
+            try:
+                await response.aread()
+            except httpx.HTTPError as e:
+                raise MCPError(f"request '{method}' failed: HTTP {response.status_code}: {e}") from e
+            finally:
+                await response.aclose()
             text = response.text[:_MAX_ERROR_BODY_LEN]
-            await response.aclose()
             raise MCPError(
                 f"request '{method}' failed: HTTP {response.status_code}: {text}"
             )
