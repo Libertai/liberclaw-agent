@@ -28,7 +28,6 @@ def stdio_config(**overrides):
     return config
 
 
-@pytest.mark.xfail(strict=True, reason="tools/list pagination lands in Task 4")
 @pytest.mark.asyncio
 async def test_connect_registers_namespaced_tools():
     client = MCPClient()
@@ -146,3 +145,56 @@ async def test_non_string_arg_records_error_without_orphaning_process():
     assert server["connected"] is False
     assert server["error"]
     assert "probe" not in client.registry.servers
+
+
+@pytest.mark.asyncio
+async def test_paginated_tools_list_registers_every_page():
+    client = MCPClient()
+    await client.connect("probe", stdio_config())
+    try:
+        names = {d["function"]["name"] for d in client.get_tool_definitions()}
+        assert names == {"mcp_probe_alpha", "mcp_probe_beta"}
+    finally:
+        await client.disconnect_all()
+
+
+@pytest.mark.asyncio
+async def test_unsupported_protocol_version_disconnects():
+    client = MCPClient()
+    config = stdio_config()
+    config["env"] = {**config["env"], "FAKE_PROTOCOL": "2026-07-28"}
+    await client.connect("probe", config)
+    health = client.get_health()
+    server = next(s for s in health["servers"] if s["name"] == "probe")
+    assert server["connected"] is False
+    assert "2026-07-28" in server["error"]
+
+
+@pytest.mark.asyncio
+async def test_server_without_tools_capability_registers_none():
+    client = MCPClient()
+    config = stdio_config()
+    config["env"] = {**config["env"], "FAKE_NO_TOOLS": "1"}
+    await client.connect("probe", config)
+    try:
+        assert client.get_tool_definitions() == []
+        health = client.get_health()
+        server = next(s for s in health["servers"] if s["name"] == "probe")
+        assert "tools" in (server["error"] or "")
+    finally:
+        await client.disconnect_all()
+
+
+@pytest.mark.asyncio
+async def test_tool_metadata_is_bounded(monkeypatch):
+    from baal_agent import mcp_client as mc
+
+    client = MCPClient()
+    raw = {"tools": [
+        {"name": "ok", "description": "x" * 5000, "inputSchema": {}},
+        {"name": "bad name!", "description": "d", "inputSchema": {}},
+    ]}
+    registered = client._tools_from_list_result("probe", raw)
+    assert "mcp_probe_ok" in registered
+    assert len(registered["mcp_probe_ok"].description) <= 1024 + len("[MCP: probe] ")
+    assert not any("bad name" in k for k in registered)

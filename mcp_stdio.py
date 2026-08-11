@@ -135,6 +135,17 @@ class StdioTransport(Transport):
         except TimeoutError:
             self._pending.pop(req_id, None)
             logger.warning(f"MCP request '{method}' to '{self._command}' timed out")
+            # Best effort: a failure to notify the server must never mask the
+            # timeout itself.
+            try:
+                await self.send_notification(
+                    "notifications/cancelled", {"requestId": req_id}
+                )
+            except Exception:
+                logger.warning(
+                    f"MCP server '{self._command}' failed to send cancellation "
+                    f"for '{method}'"
+                )
             raise MCPError(f"request '{method}' timed out")
         except MCPError as e:
             logger.warning(f"MCP request '{method}' to '{self._command}' failed: {e}")

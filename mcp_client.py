@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -19,6 +20,16 @@ logger = logging.getLogger(__name__)
 # server doesn't stall every chat turn (each call has a 60s timeout).
 _CIRCUIT_THRESHOLD = 3
 _CIRCUIT_COOLDOWN = 60.0
+
+# Tool metadata (name, description) comes from the remote server and lands in
+# the system prompt via get_tool_definitions() — the spec requires treating it
+# as untrusted unless the server is trusted, so it's bounded before use.
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_MAX_TOOL_DESCRIPTION_LEN = 1024
+_MAX_TOOLS_PER_SERVER = 128
+# tools/list page size is server-chosen; this bounds a server that echoes the
+# same cursor forever rather than terminating pagination.
+_MAX_TOOLS_LIST_PAGES = 50
 
 
 @dataclass
@@ -54,6 +65,13 @@ class MCPServerConnection:
 
 class MCPClient:
     """Connects to MCP servers and registers their tools."""
+
+    # Protocol versions this client's handshake and tool-call shapes support.
+    # Per spec, an unrecognized version in the server's initialize response
+    # means the client SHOULD disconnect rather than guess compatibility.
+    _SUPPORTED_PROTOCOL_VERSIONS = frozenset(
+        {"2025-06-18", "2025-03-26", "2024-11-05"}
+    )
 
     def __init__(self):
         self.registry = ToolRegistry()
@@ -141,12 +159,18 @@ class MCPClient:
             # _disconnect_server find and close this connection.
             self.registry.register(conn, {})
 
-            # Initialize the server
-            await transport.send_request("initialize", {
-                "protocolVersion": "2024-11-05",
+            # Initialize the server. Empty capabilities is deliberate: it's
+            # what makes omitting sampling/roots/elicitation conformant —
+            # don't declare a capability this client can't service.
+            init_result = await transport.send_request("initialize", {
+                "protocolVersion": "2025-06-18",
                 "capabilities": {},
                 "clientInfo": {"name": "baal-agent", "version": "1.0.0"},
             })
+
+            version = init_result.get("protocolVersion")
+            if version not in self._SUPPORTED_PROTOCOL_VERSIONS:
+                raise MCPError(f"unsupported protocol version {version}")
 
             # Send initialized notification (no response expected)
             await transport.send_notification("notifications/initialized", {})
@@ -156,29 +180,38 @@ class MCPClient:
             await self._disconnect_server(name)
             return
 
-        # Discover tools. A failure here leaves the connection open with zero
-        # tools rather than tearing down a server that initialized fine.
-        try:
-            tools_result = await transport.send_request("tools/list", {})
-        except MCPError:
-            logger.warning(f"MCP server '{name}' tools/list returned nothing")
+        # No tools capability: stay connected (already registered with zero
+        # tools above) rather than treat it as a handshake failure.
+        if "tools" not in init_result.get("capabilities", {}):
+            self._errors[name] = str(MCPError("server does not offer tools"))
+            logger.warning(f"MCP server '{name}' initialized without a tools capability")
             return
 
-        # A malformed tools list (bad shape from a misbehaving server) is a
-        # harder failure than an empty one — record it and disconnect.
+        # Discover tools, paginating until the server stops returning a
+        # cursor. A request failure here leaves the connection open with zero
+        # tools rather than tearing down a server that initialized fine.
         try:
-            tools_list = tools_result.get("tools", [])
-            tools = {}
-            for tool_def in tools_list:
-                tool_name = tool_def.get("name", "")
-                namespaced = f"mcp_{name}_{tool_name}"
-                tools[namespaced] = MCPToolInfo(
-                    server_name=name,
-                    original_name=tool_name,
-                    namespaced_name=namespaced,
-                    description=tool_def.get("description", ""),
-                    input_schema=tool_def.get("inputSchema", {}),
+            tools: dict[str, MCPToolInfo] = {}
+            cursor = None
+            for _ in range(_MAX_TOOLS_LIST_PAGES):
+                params = {"cursor": cursor} if cursor else {}
+                try:
+                    tools_result = await transport.send_request("tools/list", params)
+                except MCPError:
+                    logger.warning(f"MCP server '{name}' tools/list returned nothing")
+                    return
+                tools.update(self._tools_from_list_result(name, tools_result))
+                cursor = tools_result.get("nextCursor")
+                if not cursor:
+                    break
+
+            if len(tools) > _MAX_TOOLS_PER_SERVER:
+                logger.warning(
+                    f"MCP server '{name}' offered more than {_MAX_TOOLS_PER_SERVER} "
+                    f"tools; keeping the first {_MAX_TOOLS_PER_SERVER}"
                 )
+                tools = dict(list(tools.items())[:_MAX_TOOLS_PER_SERVER])
+
             self.registry.register(conn, tools)
 
             logger.info(
@@ -189,6 +222,38 @@ class MCPClient:
             self._errors[name] = str(e)
             logger.error(f"MCP server '{name}' connection failed: {e}")
             await self._disconnect_server(name)
+
+    def _tools_from_list_result(
+        self, server_name: str, result: dict
+    ) -> dict[str, MCPToolInfo]:
+        """Build namespaced tools from one tools/list page.
+
+        Drops names failing the identifier pattern and truncates descriptions
+        — untrusted metadata from the server, bounded before it reaches the
+        prompt. The per-server tool count cap is enforced by the caller, which
+        accumulates across pages.
+        """
+        tools: dict[str, MCPToolInfo] = {}
+        dropped = False
+        for tool_def in result.get("tools", []):
+            tool_name = tool_def.get("name", "")
+            if not _TOOL_NAME_RE.match(tool_name):
+                dropped = True
+                continue
+            namespaced = f"mcp_{server_name}_{tool_name}"
+            tools[namespaced] = MCPToolInfo(
+                server_name=server_name,
+                original_name=tool_name,
+                namespaced_name=namespaced,
+                description=tool_def.get("description", "")[:_MAX_TOOL_DESCRIPTION_LEN],
+                input_schema=tool_def.get("inputSchema", {}),
+            )
+        if dropped:
+            logger.warning(
+                f"MCP server '{server_name}' offered tool name(s) rejected by "
+                f"the naming pattern; dropped"
+            )
+        return tools
 
     async def disconnect_all(self) -> None:
         """Disconnect from all servers."""

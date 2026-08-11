@@ -17,6 +17,9 @@ TOOLS = [
 # server that misbehaves in one specific way.
 TOOLS_LIST_MODE = os.environ.get("FAKE_MCP_TOOLS_LIST_MODE")
 
+PROTOCOL = os.environ.get("FAKE_PROTOCOL", "2025-06-18")
+CAPABILITIES = {} if os.environ.get("FAKE_NO_TOOLS") else {"tools": {}}
+
 
 def reply(msg_id, result):
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
@@ -33,8 +36,8 @@ def main():
 
         if method == "initialize":
             reply(msg_id, {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": {}},
+                "protocolVersion": PROTOCOL,
+                "capabilities": CAPABILITIES,
                 "serverInfo": {"name": "fake", "version": "1"},
             })
         elif method == "notifications/initialized":
