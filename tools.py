@@ -333,6 +333,8 @@ _shell: PersistentShell | None = None
 _checkpoint_mgr: CheckpointManager | None = None
 _code_executor: CodeExecutor | None = None
 _mcp_client = None  # MCPClient instance, set via start_mcp
+_mcp_maintenance_task: asyncio.Task | None = None
+_MCP_MAINTENANCE_INTERVAL = 30.0
 _inference = None  # InferenceClient instance, for LLM-powered tools
 _model: str = ""  # Model name, for LLM-powered tools
 
@@ -435,9 +437,49 @@ async def start_mcp(mcp_servers_json: str) -> None:
             )
 
 
+async def start_mcp_maintenance() -> None:
+    """Start the background loop that reconnects unreachable MCP servers
+    and refreshes their tool lists on a TTL. No-op if MCP isn't configured.
+    """
+    global _mcp_maintenance_task
+    if _mcp_client is None or _mcp_maintenance_task is not None:
+        return
+
+    async def _loop() -> None:
+        while True:
+            await asyncio.sleep(_MCP_MAINTENANCE_INTERVAL)
+            try:
+                await _mcp_client.maintain()
+            except Exception:
+                import logging as _logging
+
+                _logging.getLogger(__name__).exception("MCP maintenance tick failed")
+
+    _mcp_maintenance_task = asyncio.create_task(_loop())
+
+
+async def stop_mcp_maintenance() -> None:
+    """Stop the maintenance loop. Safe to call even if not started."""
+    global _mcp_maintenance_task
+    if _mcp_maintenance_task is not None:
+        _mcp_maintenance_task.cancel()
+        try:
+            await _mcp_maintenance_task
+        except asyncio.CancelledError:
+            pass
+        _mcp_maintenance_task = None
+
+
 async def shutdown_mcp() -> None:
-    """Disconnect from all MCP servers. Safe to call even if not started."""
+    """Disconnect from all MCP servers. Safe to call even if not started.
+
+    Stops the maintenance loop first: cancel-and-await guarantees no tick
+    is mid-flight, so disconnect_all() never races a tick that would resume
+    past its await and re-register a connection (a fresh subprocess, for
+    stdio) after teardown.
+    """
     global _mcp_client
+    await stop_mcp_maintenance()
     if _mcp_client is not None:
         await _mcp_client.disconnect_all()
         _mcp_client = None

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from baal_agent.mcp_http import HttpTransport
@@ -31,6 +33,11 @@ _MAX_TOOLS_PER_SERVER = 128
 # tools/list page size is server-chosen; this bounds a server that echoes the
 # same cursor forever rather than terminating pagination.
 _MAX_TOOLS_LIST_PAGES = 50
+
+# Maintenance loop: reconnect backoff and tool-list refresh cadence.
+_RECONNECT_BACKOFF_START = 30.0
+_RECONNECT_BACKOFF_MAX = 300.0
+_TOOLS_TTL = 300.0
 
 
 @dataclass
@@ -74,18 +81,27 @@ class MCPClient:
         {"2025-06-18", "2025-03-26", "2024-11-05"}
     )
 
-    def __init__(self):
+    def __init__(self, now: Callable[[], float] | None = None):
         self.registry = ToolRegistry()
         self._configured: dict[str, dict] = {}  # server name -> config
         self._errors: dict[str, str] = {}
         # Circuit breaker state per server.
         self._failure_counts: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}
+        # Injected so tests assert schedule, not real time. The maintenance
+        # loop and the circuit breaker share this clock.
+        self._now = now or time.monotonic
+        # Reconnect backoff state per unconnected server.
+        self._retry_at: dict[str, float] = {}
+        self._backoff: dict[str, float] = {}
+        self._maintain_lock = asyncio.Lock()
+        self._maintaining = False
+        self._closed = False
 
     def _circuit_state(self, server_name: str) -> tuple[bool, float]:
         """Return (open, seconds_remaining) for a server."""
         until = self._circuit_open_until.get(server_name, 0.0)
-        now = time.monotonic()
+        now = self._now()
         if until > now:
             return True, until - now
         if until:
@@ -102,7 +118,7 @@ class MCPClient:
         self._failure_counts[server_name] = count
         if count >= _CIRCUIT_THRESHOLD:
             self._circuit_open_until[server_name] = (
-                time.monotonic() + _CIRCUIT_COOLDOWN
+                self._now() + _CIRCUIT_COOLDOWN
             )
             logger.warning(
                 "MCP server %r tripped the circuit breaker after %d "
@@ -218,12 +234,13 @@ class MCPClient:
         # tools rather than tearing down a server that initialized fine.
         try:
             try:
-                tools = await self._list_all_tools(name, transport)
+                tools = await self._list_tools_for(conn)
             except MCPError:
                 logger.warning(f"MCP server '{name}' tools/list returned nothing")
                 return
 
             self.registry.register(conn, tools)
+            conn.tools_listed_at = self._now()
 
             logger.info(
                 f"MCP server '{name}' connected: {len(tools)} tools discovered"
@@ -263,6 +280,104 @@ class MCPClient:
             )
             tools = dict(list(tools.items())[:_MAX_TOOLS_PER_SERVER])
         return tools
+
+    async def _list_tools_for(
+        self, conn: MCPServerConnection
+    ) -> dict[str, MCPToolInfo]:
+        """Paginated tools/list for an existing connection.
+
+        Thin wrapper over _list_all_tools so connect() and the maintenance
+        refresh share one pagination path, and tests can stub the
+        connection-level call without touching (name, transport) plumbing.
+        """
+        return await self._list_all_tools(conn.name, conn.transport)
+
+    def _next_backoff(self, current: float) -> float:
+        return min(max(current * 2, _RECONNECT_BACKOFF_START), _RECONNECT_BACKOFF_MAX)
+
+    async def maintain(self) -> None:
+        """Reconnect unreachable servers with backoff, refresh tool lists
+        past their TTL.
+
+        This is the first background caller into MCP request paths — every
+        prior call came from a chat turn. self._maintaining is checked
+        before the lock so an overlapping tick (loop tick racing another
+        loop tick, or a manual call) returns immediately rather than
+        queueing behind one already running.
+        """
+        if self._maintaining:
+            return
+        async with self._maintain_lock:
+            if self._maintaining:
+                return
+            self._maintaining = True
+            try:
+                await self._reconnect_unreachable()
+                if self._closed:
+                    return
+                await self._refresh_stale_tools()
+            finally:
+                self._maintaining = False
+
+    async def _reconnect_unreachable(self) -> None:
+        for name, config in list(self._configured.items()):
+            if self._closed:
+                return
+            if name in self.registry.servers:
+                continue
+            is_open, _ = self._circuit_state(name)
+            if is_open:
+                continue
+            if self._now() < self._retry_at.get(name, 0.0):
+                continue
+
+            # Unconditional: a prior failed attempt can leave a transport
+            # half-open (registered before initialize, per _connect_transport's
+            # own teardown), and skipping this orphans that httpx.AsyncClient
+            # or subprocess on every retry cycle.
+            await self._disconnect_server(name)
+            if self._closed:
+                return
+            try:
+                await self.connect(name, config)
+            except Exception as e:
+                logger.warning("MCP server %r reconnect failed: %s", name, e)
+            if self._closed:
+                return
+
+            if name in self.registry.servers:
+                self._retry_at.pop(name, None)
+                self._backoff.pop(name, None)
+            else:
+                backoff = self._next_backoff(self._backoff.get(name, 0.0))
+                self._backoff[name] = backoff
+                self._retry_at[name] = self._now() + backoff
+
+    async def _refresh_stale_tools(self) -> None:
+        for name, conn in list(self.registry.servers.items()):
+            if self._closed:
+                return
+            if not conn.transport.connected:
+                continue
+            if self._now() - conn.tools_listed_at <= _TOOLS_TTL:
+                continue
+            is_open, _ = self._circuit_state(name)
+            if is_open:
+                continue
+
+            try:
+                tools = await self._list_tools_for(conn)
+            except Exception as e:
+                # Keep the current tools and leave tools_listed_at untouched
+                # so the next tick retries — one blip must not empty the
+                # model's tool set mid-conversation.
+                logger.warning("MCP server %r tool refresh failed: %s", name, e)
+                continue
+            if self._closed:
+                return
+
+            if self.registry.replace_tools(conn, tools):
+                conn.tools_listed_at = self._now()
 
     async def _reinit_server(
         self, name: str, transport: Transport, conn: MCPServerConnection
@@ -324,7 +439,14 @@ class MCPClient:
         return tools
 
     async def disconnect_all(self) -> None:
-        """Disconnect from all servers."""
+        """Disconnect from all servers.
+
+        Sets _closed first so a maintain() call still in flight (e.g. not
+        reached by the maintenance task's own cancel-and-await, such as a
+        direct call) bails at its next check instead of reconnecting or
+        re-registering a server after teardown.
+        """
+        self._closed = True
         for name in list(self.registry.servers.keys()):
             await self._disconnect_server(name)
 
