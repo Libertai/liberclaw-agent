@@ -148,3 +148,79 @@ async def test_same_origin_redirect_followed():
     t = transport_with(handler)
     assert await t.send_request("tools/list", {}, 5.0) == {"followed": True}
     await t.close()
+
+
+def sse(*events: str) -> httpx.Response:
+    return httpx.Response(
+        200, headers={"Content-Type": "text/event-stream"}, text="".join(events)
+    )
+
+
+@pytest.mark.asyncio
+async def test_sse_response_returns_matching_id():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 1}})
+        return sse(f"data: {payload}\n\n")
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 1}
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_ignores_comments_and_other_fields():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 2}})
+        return sse(": keep-alive\n\n", "event: message\nid: 7\nretry: 100\n", f"data: {payload}\n\n")
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 2}
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_joins_multiline_data_into_one_document():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 3}})
+        half = len(payload) // 2
+        return sse(f"data: {payload[:half]}\ndata: {payload[half:]}\n\n")
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 3}
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_sse_skips_interleaved_notification():
+    def handler(request):
+        body = json.loads(request.content.decode())
+        note = json.dumps({"jsonrpc": "2.0", "method": "notifications/progress", "params": {}})
+        payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 4}})
+        return sse(f"data: {note}\n\n", f"data: {payload}\n\n")
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 4}
+    await t.close()
+
+
+@pytest.mark.asyncio
+async def test_interleaved_ping_is_answered():
+    posts = []
+
+    def handler(request):
+        body = json.loads(request.content.decode())
+        posts.append(body)
+        if body.get("method") == "tools/list":
+            ping = json.dumps({"jsonrpc": "2.0", "id": "p1", "method": "ping"})
+            payload = json.dumps({"jsonrpc": "2.0", "id": body["id"], "result": {"v": 5}})
+            return sse(f"data: {ping}\n\n", f"data: {payload}\n\n")
+        return httpx.Response(202)
+
+    t = transport_with(handler)
+    assert await t.send_request("tools/list", {}, 5.0) == {"v": 5}
+    replies = [p for p in posts if p.get("id") == "p1" and "result" in p]
+    assert replies and replies[0]["result"] == {}
+    await t.close()
