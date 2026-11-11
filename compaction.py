@@ -14,23 +14,19 @@ from baal_agent.inference import InferenceClient
 
 logger = logging.getLogger(__name__)
 
-# Context budget per model (tokens). These are compaction budgets, not the
-# models' advertised windows: deep-claw and claw-large now resolve to models
-# with 1M and 524K windows, and compacting at 75% of those would send very
-# large prompts on every turn of a long conversation.
-_MODEL_CONTEXT_SIZES = {
-    "qwen3-coder-next": 200_000,
-    "glm-4.7": 200_000,
-    "hermes-3-8b-tee": 200_000,
-    "claw-flash": 200_000,
-    "claw-core": 200_000,
-    "deep-claw": 200_000,
-    "claw-large": 262_144,
-}
-_DEFAULT_CONTEXT_SIZE = 200_000
+# Context budget (tokens) used to decide when to compact. This is deliberately
+# NOT the model's advertised context window: the hosted aliases advertise
+# windows from 262K up to 1M tokens, and compaction triggers at
+# `compaction_threshold` (75% by default) of the budget, so budgeting to the
+# advertised window would send very large prompts on every turn of a long
+# conversation. Every model id gets the same budget; set MAX_CONTEXT_TOKENS to
+# override it for a deployment (for example, for a model with a smaller window).
+CONTEXT_BUDGET_TOKENS = 200_000
 
 
-# Known model vision capabilities (mirrors baal_core.models + Aleph catalog).
+# Whether each known model id accepts image input. The branded aliases are
+# resolved by the inference provider, so this records what each one accepted
+# when last checked (2026-11-12); unknown ids are assumed to accept images.
 _MODEL_VISION: dict[str, bool] = {
     "qwen3-coder-next": True,
     "glm-4.7": True,
@@ -48,10 +44,15 @@ def model_supports_vision(model: str) -> bool:
 
 
 def get_context_limit(model: str, configured_max: int) -> int:
-    """Return the context token limit for the given model."""
+    """Return the compaction budget (tokens) for the given model.
+
+    An explicit ``configured_max`` (MAX_CONTEXT_TOKENS) wins; otherwise every
+    model shares CONTEXT_BUDGET_TOKENS, so ``model`` does not change the
+    result today. This is not the model's advertised window.
+    """
     if configured_max > 0:
         return configured_max
-    return _MODEL_CONTEXT_SIZES.get(model, _DEFAULT_CONTEXT_SIZE)
+    return CONTEXT_BUDGET_TOKENS
 
 
 _IMAGE_TOKEN_ESTIMATE = 1000

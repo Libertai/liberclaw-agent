@@ -26,7 +26,7 @@ class AgentSettings(BaseSettings):
     workspace_path: str = "/opt/baal-agent/workspace"
     owner_chat_id: str = ""  # Telegram chat ID for subagent pending message delivery
     heartbeat_interval: int = 1800  # seconds (0 = disabled)
-    max_context_tokens: int = 0  # 0 = auto-detect from model name
+    max_context_tokens: int = 0  # 0 = default compaction budget
     max_images_per_request: int = (
         4  # cap images sent to inference (0 = no cap); older ones dropped
     )
