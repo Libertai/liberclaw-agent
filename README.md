@@ -124,7 +124,7 @@ All settings via environment variables:
 
 ### Models
 
-`MODEL` is passed to LibertAI as-is. The branded aliases are resolved to a concrete model by LibertAI, not by this code, so what they point at can change without an agent release. As of 2026-11-12:
+`MODEL` is passed to LibertAI as-is. The branded aliases are resolved to a concrete model by LibertAI, not by this code, so what they point at can change without an agent release. As of 2026-11-11:
 
 | Alias | Resolves to | Advertised context | Input |
 |-------|-------------|--------------------|-------|

@@ -26,7 +26,7 @@ CONTEXT_BUDGET_TOKENS = 200_000
 
 # Whether each known model id accepts image input. The branded aliases are
 # resolved by the inference provider, so this records what each one accepted
-# when last checked (2026-11-12); unknown ids are assumed to accept images.
+# when last checked (2026-11-11); unknown ids are assumed to accept images.
 _MODEL_VISION: dict[str, bool] = {
     "qwen3-coder-next": True,
     "glm-4.7": True,
