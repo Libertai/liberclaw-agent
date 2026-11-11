@@ -14,7 +14,10 @@ from baal_agent.inference import InferenceClient
 
 logger = logging.getLogger(__name__)
 
-# Known model context window sizes (tokens).
+# Context budget per model (tokens). These are compaction budgets, not the
+# models' advertised windows: deep-claw and claw-large now resolve to models
+# with 1M and 524K windows, and compacting at 75% of those would send very
+# large prompts on every turn of a long conversation.
 _MODEL_CONTEXT_SIZES = {
     "qwen3-coder-next": 200_000,
     "glm-4.7": 200_000,
@@ -35,7 +38,7 @@ _MODEL_VISION: dict[str, bool] = {
     "claw-flash": True,
     "claw-core": True,
     "deep-claw": True,
-    "claw-large": False,
+    "claw-large": True,
 }
 
 
