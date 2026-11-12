@@ -87,8 +87,9 @@ def _capabilities() -> list[str]:
     """Capabilities advertised on /health and /info.
 
     `vision` is present when the configured model supports image inputs;
-    `vision_delegated` is present for non-vision models (images are
-    auto-described via claw-flash with a vision_query tool for follow-ups).
+    `vision_delegated` is present for models marked text-only (images are
+    auto-described by the vision delegation model, with a vision_query tool
+    for follow-ups).
     `browser` appears only when the browser tool is actually usable
     (enabled + chromium installed), so old/free agents simply omit it
     without needing an AGENT_VERSION bump.
@@ -314,10 +315,12 @@ def _prune_old_subagent_runs():
 
 # ── Vision delegation ────────────────────────────────────────────────
 #
-# Non-vision models (claw-large) can't process image_url blocks. When such a
-# model receives images, claw-flash describes each one and the image block is
-# replaced with a [Image N: <summary>] text placeholder. The original blocks
-# are stashed so the vision_query tool can ask follow-up questions.
+# A model that compaction.model_supports_vision marks as text-only can't
+# process image_url blocks. When such a model receives images, the model named
+# by settings.vision_delegation_model describes each one and the image block
+# is replaced with a [Image N: <summary>] text placeholder. The original
+# blocks are stashed so the vision_query tool can ask follow-up questions.
+# Models that accept images get them unchanged.
 
 _vision_image_stash: dict[str, dict] = {}
 # chat_id -> {"next_id": int, "images": [{"id": int, "blocks": list, "summary": str}]}
@@ -349,7 +352,7 @@ async def _delegate_vision(messages: list[dict], chat_id: str) -> list[dict]:
     # images were either already delegated in a prior turn (and stored as
     # text placeholders in the DB) or will be stripped by compaction.
     # Processing all messages would re-describe every historical image on
-    # every turn, costing one claw-flash call per image per turn.
+    # every turn, costing one delegation-model call per image per turn.
     last_user_idx = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user":
@@ -1457,7 +1460,7 @@ async def _run_chat_background(
             dynamic_context=dynamic_context,
         )
 
-        # Delegate image description to claw-flash for non-vision models
+        # Text-only models: have the delegation model describe new images
         for ev in await _delegate_vision(messages, chat_id):
             await _emit(run, ev)
 

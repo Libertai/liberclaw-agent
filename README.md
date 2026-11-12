@@ -27,7 +27,8 @@ When deployed to a VM, the agent receives chat messages over SSE and can autonom
 
 - **Agentic loop**: Tool calls are executed in a loop until the model produces a final text response or hits the iteration limit
 - **SSE streaming**: Chat responses stream as server-sent events with keepalives to survive reverse proxies
-- **Context compaction**: When conversation history exceeds the model's context window, older messages are summarized by the LLM while recent messages are preserved
+- **Context compaction**: When conversation history passes 75% of the agent's context budget (200,000 tokens by default, deliberately smaller than the models' advertised windows), older messages are summarized by the LLM while recent messages are preserved
+- **Image input**: Images go straight to models that accept them. For a model marked text-only, a second model (`VISION_DELEGATION_MODEL`) describes each image and a `vision_query` tool answers follow-up questions
 - **Memory**: Persistent file-based memory at `workspace/memory/MEMORY.md` (long-term) and daily notes
 - **Skills**: Markdown skill files at `workspace/skills/*/SKILL.md` — summaries are injected into context, full content loaded on demand
 - **Subagents**: Spawn typed background workers for parallel tasks with their own tool sets (no further spawning)
@@ -60,7 +61,7 @@ pip install fastapi uvicorn pydantic-settings openai httpx aiosqlite
 
 AGENT_NAME=test \
 SYSTEM_PROMPT="You are a helpful assistant." \
-MODEL=qwen3-coder-next \
+MODEL=claw-large \
 LIBERTAI_API_KEY=your-key \
 AGENT_SECRET=your-secret \
 WORKSPACE_PATH=/tmp/agent-workspace \
@@ -110,15 +111,32 @@ All settings via environment variables:
 |----------|---------|-------------|
 | `AGENT_NAME` | `Agent` | Display name |
 | `SYSTEM_PROMPT` | `You are a helpful assistant.` | Custom instructions |
-| `MODEL` | — | LibertAI model to use |
+| `MODEL` | `claw-large` | LibertAI model to use (see [Models](#models)) |
+| `VISION_DELEGATION_MODEL` | `claw-flash` | Model that describes images for a text-only `MODEL` |
 | `LIBERTAI_API_KEY` | — | API key for inference |
 | `AGENT_SECRET` | — | Bearer token for auth |
 | `WORKSPACE_PATH` | `/opt/baal-agent/workspace` | Root directory for files |
 | `OWNER_CHAT_ID` | — | Chat ID for subagent pending message delivery |
 | `HEARTBEAT_INTERVAL` | `1800` | Seconds between heartbeat checks (0 to disable) |
-| `MAX_TOOL_ITERATIONS` | `150` | Max tool calls per turn |
-| `MAX_CONTEXT_TOKENS` | `0` | Context limit (0 = auto-detect from model) |
+| `MAX_TOOL_ITERATIONS` | `300` | Max tool calls per turn |
+| `MAX_CONTEXT_TOKENS` | `0` | Compaction budget in tokens (0 = the 200,000-token default) |
 | `INFERENCE_TIMEOUT` | `300` | Seconds before inference timeout |
+
+### Models
+
+`MODEL` is passed to LibertAI as-is. The branded aliases are resolved to a concrete model by LibertAI, not by this code, so what they point at can change without an agent release. As of 2026-11-11:
+
+| Alias | Resolves to | Advertised context | Input |
+|-------|-------------|--------------------|-------|
+| `claw-flash` | `qwen3.6-35b-a3b` | 262,144 tokens | text + image |
+| `claw-core` | `qwen3.8-27b` | 262,144 tokens | text + image |
+| `deep-claw` | `deepseek-v4.1-flash` | 1,048,576 tokens | text + image |
+| `claw-large` (default) | `glm-5.3-flash` | 524,288 tokens | text + image |
+
+The agent keeps two facts of its own in `compaction.py`:
+
+- **Image input per model id.** All four aliases accept images. The legacy ids `qwen3-coder-next` and `glm-4.7` do too; `hermes-3-8b-tee` is text-only and gets image descriptions from `VISION_DELEGATION_MODEL`. Unknown ids are assumed to accept images.
+- **The compaction budget.** 200,000 tokens for every model, whatever its advertised window. Compaction starts at 75% of the budget (minus a small reserve for the reply), so budgeting to a 1M window would send very large prompts on every turn. Set `MAX_CONTEXT_TOKENS` to change it.
 
 ### MCP servers
 
