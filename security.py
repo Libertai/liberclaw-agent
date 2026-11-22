@@ -37,6 +37,9 @@ _DANGEROUS_PATTERNS = [
         r"/proc/\d+/environ",            # /proc/<pid>/environ
         r"/proc/self/environ",           # /proc/self/environ
         r"/run/secrets",                 # secrets directory
+        r"/etc/ssh/",                    # sshd config, host keys, deploy keys
+        r"\bsshd_config\b",
+        r"authorized_keys",
     ]
 ]
 
